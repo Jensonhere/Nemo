@@ -1,0 +1,1881 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:voicegpt/core/modules/intent_recognition_module.dart';
+import 'package:voicegpt/core/modules/text_qa_module.dart';
+import 'package:voicegpt/core/modules/image_analysis_module.dart';
+import 'package:voicegpt/core/modules/emotion_recognition_module.dart';
+import 'package:voicegpt/core/modules/action_command_module.dart';
+import 'package:voicegpt/core/modules/ui_animation_module.dart';
+import 'package:voicegpt/core/modules/user_detection_module.dart';
+import 'package:voicegpt/core/modules/environ_monitor_module.dart';
+import 'package:voicegpt/core/modules/plan_executor_controller.dart';
+import 'package:voicegpt/core/llm/llm_router.dart';
+import 'package:voicegpt/core/llm/llm_planner.dart';
+import 'package:voicegpt/core/llm/planner_expression_catalog.dart';
+import 'package:voicegpt/core/motion/motion_step_bluetooth.dart';
+import 'package:voicegpt/core/services/voice_tts_factory.dart';
+import 'package:voicegpt/core/services/voice_tts_service.dart';
+import 'package:voicegpt/core/llm/conversation_context_pack.dart';
+import 'package:voicegpt/core/services/ambient_context_cache.dart';
+import 'package:voicegpt/core/services/device_context_service.dart';
+import 'package:voicegpt/core/services/local_music_service.dart';
+import 'package:voicegpt/core/utils/input_language_gate.dart';
+import 'package:voicegpt/core/services/camera_resource_manager.dart'
+    show CameraTaskPriority;
+import 'package:voicegpt/core/config/debug_runtime_flags.dart';
+
+/// 连续对话控制器
+/// 统一管理连续对话模式的主流程，协调各个功能模块
+class ConversationController extends ChangeNotifier {
+  static final ConversationController _instance =
+      ConversationController._internal();
+  factory ConversationController() => _instance;
+  ConversationController._internal();
+
+  // 语音通知器引用（用于启动语音识别）
+  dynamic _speechNotifier;
+
+  // 对话退出回调
+  Function()? _onConversationExit;
+
+  // 各功能模块
+  final IntentRecognitionModule _intentModule = IntentRecognitionModule();
+  final TextQAModule _textQAModule = TextQAModule();
+  final LlmRouter _llmRouter = LlmRouter();
+  final LlmPlanner _llmPlanner = LlmPlanner();
+  final PlanExecutorController _planExecutor = PlanExecutorController();
+  final ImageAnalysisModule _imageModule = ImageAnalysisModule();
+  final EmotionRecognitionModule _emotionModule = EmotionRecognitionModule();
+  final ActionCommandModule _actionModule = ActionCommandModule();
+  final UIAnimationModule _uiModule = UIAnimationModule();
+  final UserDetectionModule _userDetectionModule = UserDetectionModule();
+  final EnvironMonitorModule _environModule = EnvironMonitorModule();
+  late VoiceTtsService _ttsService;
+
+  // 连续对话状态
+  bool _isInConversationMode = false;
+  bool _isProcessingUserInput = false;
+  bool _isTtsPlaying = false;
+  bool _isComplexTaskExecuting = false;
+  bool _plannerStopRequested = false;
+  String _lastAppliedPlannerExpression = '';
+  final List<String> _plannerCapturedImagePaths = [];
+  bool _plannerDidBatchAnalyze = false;
+  String _lastRouterDecision = '';
+  String _lastPlannerPlanDisplay = '';
+  bool _forceEnglishTeachingMode = false;
+  bool _ttsInterruptInFlight = false;
+  Timer? _conversationTimeoutTimer;
+
+  // 30秒超时设置
+  static const Duration _conversationTimeout = Duration(seconds: 30);
+  /// Planner 单步墙钟：进入具体 step 后等待其执行完成，超时仅作最终兜底。
+  static const Duration _plannerStepTimeoutQuick = Duration(seconds: 120);
+  static const Duration _plannerStepTimeoutBluetooth = Duration(seconds: 20);
+  static const Duration _plannerStepTimeoutVision = Duration(seconds: 240);
+  /// 蓝牙步内与动作并行的短口播分支上限（勿过长，避免与 5s 整步冲突）。
+  static const int _plannerVisionTtsMaxChars = 600;
+
+  bool _planExecutorListenerAttached = false;
+
+  /// 腾讯云 TTS 音色 ID；见腾讯云语音合成文档
+  static const int _tencentVoiceType = 101028;
+
+  // 对话历史和上下文
+  String _lastUserInput = "";
+
+  /// 最近若干轮「用户/小航」文本，供 C 层注入（最多约 4 轮）
+  final List<String> _dialogTurnLines = [];
+
+  /// 上一轮处理结束时间，用于「距上次交互」描述
+  DateTime? _lastInteractionTime;
+  DateTime? _continuousInputWindowStart;
+  DateTime? _lastInputAt;
+  int _continuousInputCount = 0;
+
+  static const Duration _continuousInputWindowLimit = Duration(minutes: 2);
+  static const Duration _continuousInputGapReset = Duration(seconds: 8);
+  static const int _continuousInputCountLimit = 18;
+
+  /// 状态访问器
+  bool get isInConversationMode => _isInConversationMode;
+  bool get isProcessingUserInput => _isProcessingUserInput;
+  bool get isTtsPlaying => _isTtsPlaying;
+  bool get forceEnglishTeachingMode => _forceEnglishTeachingMode;
+  bool get isComplexTaskExecuting => _isComplexTaskExecuting;
+  String get lastRouterDecision => _lastRouterDecision;
+  /// scene=Agent 且 complexity=C 时 Planner 的多行展示（接在 Router 调试条之后）；否则为空。
+  String get lastPlannerPlanDisplay => _lastPlannerPlanDisplay;
+  PlanExecutionState get planExecutionState => _planExecutor.state;
+  int get planTotalSteps => _planExecutor.totalSteps;
+  int get planCurrentStep => _planExecutor.currentStep;
+  String get planLastError => _planExecutor.lastError;
+
+  void setForceEnglishTeachingMode(bool enabled) {
+    if (_forceEnglishTeachingMode == enabled) return;
+    _forceEnglishTeachingMode = enabled;
+    print('🌐 强制英文教学模式: ${enabled ? "开启" : "关闭"}');
+    _notifySpeechUi();
+    notifyListeners();
+  }
+
+  /// 当前 TTS 是否为本机后端（始终为腾讯云云端时为 `false`；需在 [initialize] 之后访问）
+  bool get isTtsLocalBackend => _ttsService.isLocalBackend;
+  String get lastUserInput => _lastUserInput;
+
+  /// 初始化连续对话控制器
+  Future<void> initialize() async {
+    print("🎤 初始化连续对话控制器");
+
+    // 初始化各个模块
+    await _intentModule.initialize();
+
+    const tencentAppId = int.fromEnvironment('TENCENT_TTS_APP_ID', defaultValue: 0);
+    const tencentSecretId =
+        String.fromEnvironment('TENCENT_TTS_SECRET_ID', defaultValue: 'AKIDxoT0OaZLuGOJ1d2EE4h7A1wfDfz63pRs');
+    const tencentSecretKey =
+        String.fromEnvironment('TENCENT_TTS_SECRET_KEY', defaultValue: 'HTbZK1Ys12uc7RZWItJdnlrnYCeuztb7');
+    _ttsService = await VoiceTtsServiceFactory.create(
+      tencentAppId: tencentAppId,
+      tencentSecretId: tencentSecretId,
+      tencentSecretKey: tencentSecretKey,
+      tencentVoiceType: _tencentVoiceType,
+    );
+
+    // 设置UI动画回调
+    _uiModule.initialize();
+
+    if (DebugRuntimeFlags.enableEnvironmentMonitoring) {
+      _initializeEnvironMonitorModule();
+    } else {
+      print(
+        '════════ 已跳过环境监测模块初始化（DebugRuntimeFlags.enableEnvironmentMonitoring=false）════════',
+      );
+    }
+
+    AmbientContextCache.instance.configure(
+      isAmbientRefreshAllowed: () =>
+          !isInConversationMode &&
+          !isProcessingUserInput &&
+          !isTtsPlaying,
+    );
+    try {
+      await AmbientContextCache.instance
+          .primeFromIpNow()
+          .timeout(const Duration(seconds: 4));
+    } catch (e) {
+      print('⚠️ 启动阶段 IP 缓存预热超时/失败: $e');
+    }
+    unawaited(AmbientContextCache.instance.refreshNow(force: true));
+    AmbientContextCache.instance
+        .startPeriodic(const Duration(minutes: 30));
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 5), () async {
+        if (!isInConversationMode) {
+          LocalMusicService.instance.scheduleRescan();
+        }
+      }),
+    );
+
+    if (!_planExecutorListenerAttached) {
+      _planExecutor.addListener(_onPlanExecutorChanged);
+      _planExecutorListenerAttached = true;
+    }
+
+    print("✅ 连续对话控制器初始化完成");
+  }
+
+  void _onPlanExecutorChanged() {
+    notifyListeners();
+    _notifySpeechUi();
+  }
+
+  /// 初始化环境监测模块
+  void _initializeEnvironMonitorModule() {
+    if (!DebugRuntimeFlags.enableEnvironmentMonitoring) return;
+    try {
+      print("🌍 开始初始化环境监测模块（延迟配置，不阻塞主线程）");
+
+      // 设置依赖服务
+      _environModule.setTTSService(_ttsService);
+      _environModule.setUIModule(_uiModule);
+
+      // 设置状态回调
+      _environModule.setStateCallbacks(
+        isAnswering: () => _isProcessingUserInput,
+        isTtsPlaying: () => _isTtsPlaying,
+        onWakeWordRestart: () {
+          // 重启唤醒词检测的回调
+          if (_speechNotifier != null) {
+            try {
+              // 调用speech notifier的重启唤醒词方法
+              _speechNotifier.restartWakeWordDetection?.call();
+              print("🎤 通过ConversationController重启唤醒词检测");
+            } catch (e) {
+              print("❌ 重启唤醒词检测失败: $e");
+            }
+          }
+        },
+        onGestureDetectionStart: () {
+          // 启动手势检测的回调
+          if (_speechNotifier != null) {
+            try {
+              _speechNotifier.startGestureRecognition?.call();
+              print("👋 通过ConversationController启动手势检测");
+            } catch (e) {
+              print("❌ 启动手势检测失败: $e");
+            }
+          }
+        },
+      );
+
+      print("✅ 环境监测模块配置完成（不占用麦克风资源）");
+    } catch (e) {
+      print("❌ 环境监测模块初始化失败: $e");
+    }
+  }
+
+  /// 设置蓝牙服务
+  void setBluetoothService(dynamic bluetoothService) {
+    _actionModule.initializeBluetoothService(bluetoothService);
+    _userDetectionModule.initializeBluetoothService(bluetoothService);
+    _environModule.setBluetoothService(bluetoothService);
+    print("🔗 连续对话控制器：已设置所有模块的蓝牙服务");
+  }
+
+  /// 设置语音通知器引用
+  void setSpeechNotifier(dynamic speechNotifier) {
+    _speechNotifier = speechNotifier;
+    print("🔗 连续对话控制器已设置语音通知器引用");
+  }
+
+  /// [Consumer] 只监听 [SpeechNotifierSimplified] 时，依赖本控制器的状态需由此刷新。
+  void _notifySpeechUi() {
+    final n = _speechNotifier;
+    if (n is ChangeNotifier) {
+      n.notifyListeners();
+    }
+  }
+
+  /// TTS 播放期间 Sherpa KWS 命中后调用；随后 `_speakText` 的 `finally` 会拉起主 ASR。
+  Future<void> interruptConversationTtsFromKws(String keyword) async {
+    if (!_isTtsPlaying) {
+      print("🛑 [TTS打断] 跳过：当前未在播放 TTS (keyword=$keyword)");
+      return;
+    }
+    if (_ttsInterruptInFlight) {
+      print("🛑 [TTS打断] 跳过：已有打断在处理 (keyword=$keyword)");
+      return;
+    }
+    _ttsInterruptInFlight = true;
+    try {
+      print(
+          "🛑 [TTS打断] 执行 stop() keyword=$keyword inConversation=$_isInConversationMode");
+      await _ttsService.stop();
+    } catch (e) {
+      print("❌ [TTS打断] stop 失败: $e");
+    } finally {
+      _ttsInterruptInFlight = false;
+      await LocalMusicService.instance.resumeAfterTtsIfPaused();
+    }
+  }
+
+  /// 对话内 TTS 前：恢复 Sherpa 麦克风（VoIP+AEC 路径由通知器侧已配置）。
+  Future<void> prepareSherpaBargeInForConversationTts() async {
+    try {
+      if (!_isInConversationMode) return;
+      if (_speechNotifier != null &&
+          _speechNotifier.prepareSherpaBargeInForConversationTts != null) {
+        print("🎧 [TTS打断] 调用 prepareSherpaBargeInForConversationTts");
+        await _speechNotifier.prepareSherpaBargeInForConversationTts();
+      }
+    } catch (e) {
+      print("⚠️ [TTS打断] prepareSherpa 失败: $e");
+    }
+  }
+
+  /// 设置对话退出回调
+  void setConversationExitCallback(Function() callback) {
+    _onConversationExit = callback;
+    print("🔗 连续对话控制器已设置退出回调");
+  }
+
+  /// 进入连续对话模式
+  Future<void> enterConversationMode() async {
+    if (_isInConversationMode) {
+      print("⚠️ 已在连续对话模式中");
+      return;
+    }
+
+    print("🎤 进入连续对话模式");
+    _isInConversationMode = true;
+    _resetContinuousInputGuard();
+
+    // 设置UI模式
+    _uiModule.setProgramMode(ProgramMode.conversation);
+
+    // 唤醒直出「说话」态，避免先闪「思考」再等首句 TTS（与 onPlaybackStarted 对齐出声）
+    _uiModule.handleWakeUpDirectlyToSpeaking();
+
+    // 播放欢迎语音（语音识别和超时计时器将在TTS完成后启动）
+    await _speakText(
+      "你好，请说",
+      ttsExpression: TtsAlignedExpression.textChatSpeaking,
+    );
+
+    // 启动用户监测（并行执行，不阻塞主流程）
+    _startUserDetectionInBackground();
+
+    // 注意：语音识别和30秒超时计时器现在在TTS播放完成后启动（_speakText的finally块中）
+
+    notifyListeners();
+    print("✅ 连续对话模式已启动");
+  }
+
+  /// 后台启动用户监测
+  void _startUserDetectionInBackground() {
+    print("🔍 启动后台用户监测");
+
+    // 异步执行用户监测，不阻塞主对话流程
+    Future.microtask(() async {
+      try {
+        final result = await _userDetectionModule.startUserDetection();
+        print("🔍 用户监测完成: $result");
+      } catch (e) {
+        print("❌ 用户监测失败: $e");
+      }
+    });
+  }
+
+  /// 处理用户输入
+  Future<void> processUserInput(String userInput) async {
+    if (!_isInConversationMode) {
+      print("⚠️ 不在连续对话模式，忽略用户输入");
+      return;
+    }
+
+    if (_isImmediateStopCommand(userInput)) {
+      await _handleImmediateStopCommand(userInput);
+      return;
+    }
+
+    if (_isProcessingUserInput && _isComplexTaskExecuting) {
+      await _interruptComplexTaskForNewInput(userInput);
+    }
+
+    if (_isProcessingUserInput) {
+      print("⏳ 正在处理用户输入，忽略新输入");
+      return;
+    }
+
+    // 单字环境 ASR 噪声：视为未输入——不占处理位、不记轮次、不取消 30s 计时器、不播「没听清」。
+    if (isSingleHanAsrNoise(userInput)) {
+      print('🔇 环境噪声单字已忽略: ${userInput.trim()}');
+      return;
+    }
+
+    print("💬 处理用户输入: $userInput");
+    // 与进入连续对话时启动的「720° 机身找用户」并行；用户已开口则取消扫描，避免聊天中途突然转圈。
+    _userDetectionModule.stopUserDetection();
+
+    _isProcessingUserInput = true;
+    _planExecutor.reset();
+    _notifySpeechUi();
+    _lastUserInput = userInput;
+    _recordContinuousInput(userInput);
+
+    final turnSw = Stopwatch()..start();
+    try {
+      if (_shouldForceExitForContinuousInput()) {
+        await _handleContinuousInputSafetyExit();
+        return;
+      }
+
+      // 检查是否为退出指令：先走一轮温暖告别，再退出
+      if (_isExitCommand(userInput)) {
+        await _handleExitIntent(userInput);
+        return;
+      }
+
+      _uiModule.showThinkingAwaitingModel();
+
+      // 取消当前的30秒计时器（用户开始说话，暂停计时）
+      _conversationTimeoutTimer?.cancel();
+      print("🔄 收到用户输入，取消超时计时器（计时将在TTS完成后重新启动）");
+
+      if (_isLikelyInvalidInput(userInput)) {
+        print(
+          '🔕 一级路由：无效输入，不走大模型: '
+          '${userInput.trim().length <= 2 ? userInput.trim() : "…"}',
+        );
+        await _speakText(
+          "没听清，您再说一遍？",
+          ttsExpression: TtsAlignedExpression.textChatSpeaking,
+        );
+        return;
+      }
+
+      _pushDialogLine('用户：$userInput');
+
+      if (_forceEnglishTeachingMode ||
+          InputLanguageGate.isEnglishTeachingScene(userInput)) {
+        print(
+          _forceEnglishTeachingMode
+              ? '🌐 强制英文教学模式：锁定英语教学场景（跳过意图链路）'
+              : '🌐 英文/中英混排门控：走英语教学场景（等同对话链路，专属 prompt）',
+        );
+        await _handleTextQA(
+          userInput,
+          sceneIntent: IntentType.dialogue,
+          englishTeachingScene: true,
+        );
+        return;
+      }
+
+      final routerPack = await _buildRouterContextPack(userInput);
+      final routerDecision = await _llmRouter.route(
+        userInput: userInput,
+        contextPack: routerPack,
+        replyLengthMode: _replyLengthModeHint(),
+      );
+      _lastRouterDecision = routerDecision.rawJson;
+      _lastPlannerPlanDisplay = '';
+      print('🧭 [Router] $_lastRouterDecision');
+      _notifySpeechUi();
+      notifyListeners();
+
+      if (routerDecision.scene == RouterScene.agent &&
+          routerDecision.complexity == RouterComplexity.c) {
+        _isComplexTaskExecuting = true;
+        _notifySpeechUi();
+        notifyListeners();
+        try {
+          await _runPlannerLlmForDisplayOnly(userInput);
+        } finally {
+          _isComplexTaskExecuting = false;
+          _notifySpeechUi();
+          notifyListeners();
+        }
+        return;
+      }
+
+      if (!routerDecision.needTools) {
+        final directReply = routerDecision.dialogueReply.trim();
+        if (directReply.isNotEmpty) {
+          await _speakText(
+            directReply,
+            ttsExpression: TtsAlignedExpression.textChatSpeaking,
+            recordAssistantForTurns: directReply,
+          );
+          _textQAModule.recordRouterDirectTurn(userInput, directReply);
+        } else if (routerDecision.scene == RouterScene.companion) {
+          await _handleTextQA(userInput, sceneIntent: IntentType.comfort);
+        } else {
+          await _handleTextQA(userInput, sceneIntent: IntentType.dialogue);
+        }
+        return;
+      }
+
+      _isComplexTaskExecuting =
+          routerDecision.scene == RouterScene.agent ||
+          routerDecision.complexity == RouterComplexity.c;
+      if (_isComplexTaskExecuting) {
+        _notifySpeechUi();
+        notifyListeners();
+      }
+
+      if (await _tryExecuteRouterMotionStep(routerDecision, userInput)) {
+        return;
+      }
+
+      if (routerDecision.needTools &&
+          routerDecision.scene == RouterScene.visionVlm &&
+          routerDecision.complexity == RouterComplexity.b) {
+        print('📷 [Router] VisionVlm+B → 图像分析（跳过 BERT 意图）');
+        await _handleImageAnalysis(userInput);
+        return;
+      }
+
+      // 意图识别
+      final intentSw = Stopwatch()..start();
+      final intentResult = await _intentModule.predictIntent(userInput);
+      intentSw.stop();
+      print(
+        '⏱️ [ConvStage][意图识别] ${intentSw.elapsedMilliseconds}ms → $intentResult',
+      );
+
+      if (!intentResult.isValid) {
+        // 意图识别置信度低，默认进入文本问答（普通问答场景）
+        print("⚠️ 意图识别置信度低，进入文本问答模式");
+        await _handleTextQA(userInput, sceneIntent: IntentType.dialogue);
+        return;
+      }
+
+      // 根据意图分发到不同模块（六类 + unknown，与 BERT 标签一致）
+      switch (intentResult.intent) {
+        case IntentType.comfort:
+          await _handleEmotionRecognition(userInput);
+          break;
+
+        case IntentType.image:
+          await _handleImageAnalysis(userInput);
+          break;
+
+        case IntentType.command:
+          await _handleTextQA(userInput, sceneIntent: IntentType.command);
+          break;
+
+        case IntentType.dialogue:
+          await _handleTextQA(userInput, sceneIntent: IntentType.dialogue);
+          break;
+
+        case IntentType.apiCall:
+          await _handleTextQA(userInput, sceneIntent: IntentType.apiCall);
+          break;
+
+        case IntentType.idle:
+          await _handleTextQA(userInput, sceneIntent: IntentType.idle);
+          break;
+
+        case IntentType.unknown:
+          await _handleTextQA(userInput, sceneIntent: IntentType.unknown);
+          break;
+      }
+    } catch (e) {
+      print("❌ 处理用户输入失败: $e");
+      await _speakText(
+        "抱歉，我现在无法处理您的请求，请重试",
+        ttsExpression: TtsAlignedExpression.textChatSpeaking,
+        recordAssistantForTurns: "抱歉，我现在无法处理您的请求，请重试",
+      );
+    } finally {
+      turnSw.stop();
+      print(
+        '⏱️ [ConvStage][本轮用户输入总墙钟] ${turnSw.elapsedMilliseconds}ms '
+        '(processUserInput 起至处理结束，含意图/TTS 等)',
+      );
+      _lastInteractionTime = DateTime.now();
+      _isComplexTaskExecuting = false;
+      _isProcessingUserInput = false;
+      _notifySpeechUi();
+      notifyListeners();
+    }
+  }
+
+  /// Agent + C：调用 Planner LLM，并按 step 顺序执行（蓝牙/TTS 步内表情与口播与动作并行；视觉步先识别再播结论）。
+  Future<void> _runPlannerLlmForDisplayOnly(String userInput) async {
+    _plannerStopRequested = false;
+    _lastAppliedPlannerExpression = '';
+    _plannerCapturedImagePaths.clear();
+    _plannerDidBatchAnalyze = false;
+    // 复杂任务执行期间保持 ASR 常开，便于随时语音打断。
+    await _startVoiceRecognition();
+    var planFailed = false;
+    var failureHint = '';
+    try {
+      final result = await _llmPlanner.plan(userGoal: userInput);
+      if (result.steps.isEmpty) {
+        print('[Plan] (无有效步骤) raw=${result.rawContent}');
+        _lastPlannerPlanDisplay =
+            '[Plan] (无有效步骤)\n${result.rawContent.trim()}';
+      } else {
+        final buf = StringBuffer();
+        for (var i = 0; i < result.steps.length; i++) {
+          final s = result.steps[i];
+          final pt = s.parallelTts == null || s.parallelTts!.isEmpty
+              ? ''
+              : ' parallel_tts=${s.parallelTts}';
+          final line =
+              '[Plan] step${i + 1} action=${s.action} expression=${s.expression} reply=${s.reply}$pt';
+          print(line);
+          buf.writeln(line);
+        }
+        _lastPlannerPlanDisplay = buf.toString().trimRight();
+
+        await _planExecutor.executeSteps(
+          result.steps,
+          timeoutForStep: _plannerStepTimeoutFor,
+          runStep: _runPlannerStep,
+        );
+        if (_planExecutor.state == PlanExecutionState.done &&
+            !_plannerDidBatchAnalyze &&
+            _plannerCapturedImagePaths.length >= 2) {
+          final fallbackResult = await _imageModule.processMultiImageAnalysis(
+            '请结合我刚刚旋转采集的多角度图片，做一次综合分析并给出结论。',
+            List<String>.from(_plannerCapturedImagePaths),
+            conversationContext: _getConversationContext(),
+          );
+          _plannerCapturedImagePaths.clear();
+          _plannerDidBatchAnalyze = true;
+          if (!fallbackResult.success) {
+            throw Exception(
+              '视觉/VLM 失败: ${fallbackResult.error ?? fallbackResult.response}',
+            );
+          }
+          var toSpeak = fallbackResult.response.trim();
+          toSpeak = _truncatePlannerVisionTts(toSpeak);
+          if (toSpeak.isNotEmpty) {
+            await _speakPlannerText(toSpeak);
+          }
+        }
+        planFailed = _planExecutor.state == PlanExecutionState.failed;
+        if (planFailed) {
+          failureHint = _plannerFailureHint(_planExecutor.lastError);
+        }
+      }
+    } catch (e, st) {
+      print('[Plan] 请求失败: $e\n$st');
+      _lastPlannerPlanDisplay = '[Plan] 错误: $e';
+      planFailed = true;
+      failureHint = _plannerFailureHint(e.toString());
+    }
+    if (planFailed && failureHint.isNotEmpty) {
+      await _speakText(
+        failureHint,
+        ttsExpression: TtsAlignedExpression.textChatSpeaking,
+        recordAssistantForTurns: failureHint,
+      );
+      _notifySpeechUi();
+      notifyListeners();
+      return;
+    }
+    await _resumeListeningAfterPlanner(forceTtsStop: planFailed);
+    _notifySpeechUi();
+    notifyListeners();
+  }
+
+  String _plannerFailureHint(String rawError) {
+    final e = rawError.trim();
+    if (e.isEmpty) {
+      return '任务执行失败，已退出当前任务。';
+    }
+    if (e.contains('蓝牙未连接') || e.contains('机器人未连接')) {
+      return '蓝牙未连接，任务已停止。请先连接机器人后再试。';
+    }
+    if (e.contains('任务已被停止')) {
+      return '已停止当前任务。';
+    }
+    if (e.contains('视觉/VLM 连接超时') ||
+        (e.contains('视觉/VLM') && e.contains('超时'))) {
+      return '视觉服务连接超时，任务已停止。请检查网络或服务状态后再试。';
+    }
+    if (e.contains('视觉/VLM 失败')) {
+      return '视觉分析失败，任务已停止。请稍后重试。';
+    }
+    if (e.contains('Planner 分支') && e.contains('超过')) {
+      return '任务步骤执行超时，已停止当前任务。';
+    }
+    return '任务执行失败：$e';
+  }
+
+  Duration _plannerStepTimeoutFor(PlannerStep step) {
+    if (step.action == '视觉/VLM') return _plannerStepTimeoutVision;
+    if (step.action == '蓝牙动作') return _plannerStepTimeoutBluetooth;
+    return _plannerStepTimeoutQuick;
+  }
+
+  Future<void> _resumeListeningAfterPlanner({bool forceTtsStop = false}) async {
+    if (!_isInConversationMode) return;
+    if (forceTtsStop && _isTtsPlaying) {
+      try {
+        await _ttsService.stop();
+      } catch (_) {}
+      _isTtsPlaying = false;
+      notifyListeners();
+    }
+    if (_isTtsPlaying) return;
+    _uiModule.onTtsCompleted();
+    try {
+      await _startVoiceRecognition();
+    } catch (e, st) {
+      print("⚠️ Planner 完成后启动语音识别失败，重试一次: $e\n$st");
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      try {
+        await _startVoiceRecognition();
+      } catch (e2, st2) {
+        print("❌ Planner 完成后二次启动语音识别仍失败: $e2\n$st2");
+      }
+    }
+    _startConversationTimeout();
+  }
+
+  Future<void> _runPlannerStep(PlannerStep step) async {
+    if (_plannerStopRequested) {
+      throw Exception('任务已被停止');
+    }
+    switch (step.action) {
+      case '蓝牙动作':
+        final cue = (step.parallelTts?.trim().isNotEmpty ?? false)
+            ? step.parallelTts!.trim()
+            : '好。';
+        await Future.wait<void>([
+          _applyPlannerStepExpression(step),
+          () async {
+            final actionResult =
+                await _actionModule.processActionCommand(
+              step.reply,
+              playCommandAnimation: false,
+            );
+            print(
+              '[PlanExec][蓝牙] success=${actionResult.success} '
+              'response=${actionResult.response}',
+            );
+            if (!actionResult.success) {
+              final msg = actionResult.response.trim();
+              if (msg.contains('不理解这个动作指令') || msg.contains('未识别')) {
+                print('[PlanExec][蓝牙] 未识别动作，跳过本 step: ${step.reply}');
+                return;
+              }
+              throw Exception(
+                '蓝牙动作失败: ${actionResult.error ?? actionResult.response}',
+              );
+            }
+          }(),
+          _speakPlannerText(cue),
+        ]);
+        return;
+      case '视觉/VLM':
+        if (_isVisionBatchAnalyzeStep(step) &&
+            _plannerCapturedImagePaths.length >= 2) {
+          late final dynamic imageResult;
+          await Future.wait<void>([
+            _applyPlannerStepExpression(step),
+            () async {
+              imageResult = await _imageModule.processMultiImageAnalysis(
+                step.reply,
+                List<String>.from(_plannerCapturedImagePaths),
+                conversationContext: _getConversationContext(),
+              );
+            }(),
+          ]);
+          _plannerCapturedImagePaths.clear();
+          _plannerDidBatchAnalyze = true;
+          print(
+            '[PlanExec][视觉联合] success=${imageResult.success} '
+            'resp=${imageResult.response.length > 30 ? '${imageResult.response.substring(0, 30)}…' : imageResult.response}',
+          );
+          if (!imageResult.success) {
+            throw Exception(
+              '视觉/VLM 失败: ${imageResult.error ?? imageResult.response}',
+            );
+          }
+          var toSpeak = imageResult.response.trim();
+          if (toSpeak.isEmpty) {
+            toSpeak = step.reply.trim();
+          }
+          toSpeak = _truncatePlannerVisionTts(toSpeak);
+          if (toSpeak.isNotEmpty) {
+            await _speakPlannerText(toSpeak);
+          }
+          return;
+        }
+
+        if (_isVisionCaptureOnlyStep(step)) {
+          final shotPath = await _imageModule.captureImageOnly(
+            cameraCapturePriority: CameraTaskPriority.high,
+          );
+          _plannerCapturedImagePaths.add(shotPath);
+          print('[PlanExec][视觉采集] 已采集: $shotPath, total=${_plannerCapturedImagePaths.length}');
+          await _applyPlannerStepExpression(step);
+          return;
+        }
+        late final dynamic imageResult;
+        await Future.wait<void>([
+          _applyPlannerStepExpression(step),
+          () async {
+            imageResult = await _imageModule
+                .processImageAnalysis(
+              step.reply,
+              conversationContext: _getConversationContext(),
+              cameraCapturePriority: CameraTaskPriority.high,
+            );
+          }(),
+        ]);
+        print(
+          '[PlanExec][视觉] success=${imageResult.success} '
+          'resp=${imageResult.response.length > 30 ? '${imageResult.response.substring(0, 30)}…' : imageResult.response}',
+        );
+        if (!imageResult.success) {
+          throw Exception(
+            '视觉/VLM 失败: ${imageResult.error ?? imageResult.response}',
+          );
+        }
+        var toSpeak = imageResult.response.trim();
+        if (toSpeak.isEmpty) {
+          toSpeak = step.reply.trim();
+        }
+        toSpeak = _truncatePlannerVisionTts(toSpeak);
+        if (toSpeak.isNotEmpty) {
+          await _speakPlannerText(toSpeak);
+        }
+        return;
+      case 'TTS 播报':
+        await Future.wait<void>([
+          _applyPlannerStepExpression(step),
+          _speakPlannerText(step.reply),
+        ]);
+        return;
+      default:
+        print('[PlanExec] 未知 action=${step.action}，仅表情');
+        await _applyPlannerStepExpression(step);
+        return;
+    }
+  }
+
+  bool _isVisionCaptureOnlyStep(PlannerStep step) {
+    if (step.action != '视觉/VLM') return false;
+    final t = step.reply.replaceAll(RegExp(r'\s+'), '').toLowerCase();
+    const hints = ['仅拍照', '只拍照', '采集', '先拍', '不分析', '不做分析'];
+    return hints.any(t.contains);
+  }
+
+  bool _isVisionBatchAnalyzeStep(PlannerStep step) {
+    if (step.action != '视觉/VLM') return false;
+    final t = step.reply.replaceAll(RegExp(r'\s+'), '').toLowerCase();
+    const hints = ['一起分析', '统一分析', '联合分析', '综合分析', '多图', '四张图', '汇总分析'];
+    return hints.any(t.contains);
+  }
+
+  String _truncatePlannerVisionTts(String s) {
+    if (s.length <= _plannerVisionTtsMaxChars) return s;
+    return '${s.substring(0, _plannerVisionTtsMaxChars)}…';
+  }
+
+  bool _isImmediateStopCommand(String raw) {
+    if (_isExitCommand(raw)) return false;
+    final s = raw.replaceAll(RegExp(r'\s+'), '').toLowerCase();
+    if (s.isEmpty) return false;
+    const hints = [
+      '停止',
+      '停下',
+      '停住',
+      '停',
+      '别动',
+      '不要动',
+      '马上停',
+      '立刻停',
+      '紧急停止',
+      'emergencystop',
+      'stop',
+    ];
+    return hints.any((k) => s.contains(k));
+  }
+
+  Future<void> _handleImmediateStopCommand(String userInput) async {
+    print('🛑 高优先级停止命令: $userInput');
+    _plannerStopRequested = true;
+    try {
+      await _ttsService.stop();
+    } catch (e) {
+      print('⚠️ 停止 TTS 失败: $e');
+    }
+    await _actionModule.stopAllActions();
+    _isTtsPlaying = false;
+    _isComplexTaskExecuting = false;
+    _isProcessingUserInput = false;
+    _notifySpeechUi();
+    notifyListeners();
+    await _speakText(
+      '已收到停止指令，当前动作已停止。',
+      ttsExpression: TtsAlignedExpression.textChatSpeaking,
+      recordAssistantForTurns: '已收到停止指令，当前动作已停止。',
+    );
+  }
+
+  Future<void> _interruptComplexTaskForNewInput(String userInput) async {
+    print('🛑 复杂任务被新语音打断，切换到新输入: $userInput');
+    _plannerStopRequested = true;
+    try {
+      await _ttsService.stop();
+    } catch (e) {
+      print('⚠️ 打断复杂任务时停止 TTS 失败: $e');
+    }
+    await _actionModule.stopAllActions();
+    _isTtsPlaying = false;
+    _isComplexTaskExecuting = false;
+    _isProcessingUserInput = false;
+    _notifySpeechUi();
+    notifyListeners();
+  }
+
+  Future<void> _applyPlannerStepExpression(PlannerStep step) async {
+    var expr = PlannerExpressionCatalog.canonicalize(step.expression);
+    // 若连续两步给到同一表情，执行层自动轮换一个，确保每步都有明显切换。
+    if (_lastAppliedPlannerExpression == expr) {
+      final labels = PlannerExpressionCatalog.allowedLabels;
+      final idx = labels.indexOf(expr);
+      if (idx >= 0) {
+        expr = labels[(idx + 1) % labels.length];
+      } else {
+        expr = '眨眼';
+      }
+    }
+    _lastAppliedPlannerExpression = expr;
+    _uiModule.applyPlannerExpressionLabel(expr);
+  }
+
+  Future<void> _speakPlannerText(String raw) async {
+    final text = raw.trim();
+    if (text.isEmpty) return;
+    _isTtsPlaying = true;
+    _notifySpeechUi();
+    notifyListeners();
+    try {
+      print('[PlanExec][TTS] $text');
+      await _ttsService.speak(
+        text,
+        onPlaybackStarted: null,
+      );
+    } catch (e) {
+      print('[PlanExec][TTS] 失败: $e');
+    } finally {
+      _isTtsPlaying = false;
+      _notifySpeechUi();
+      notifyListeners();
+    }
+  }
+
+  /// Router 单轴 B 类：`motion_step` → 解析 → 单条蓝牙；不调 command 场景主 LLM。
+  Future<bool> _tryExecuteRouterMotionStep(
+    RouterDecision d,
+    String userInput,
+  ) async {
+    if (!d.needTools) return false;
+    if (d.scene != RouterScene.bluetoothMotion && d.scene != RouterScene.toolUse) {
+      return false;
+    }
+    if (d.complexity != RouterComplexity.b) return false;
+    if (!MotionStepBluetooth.isSimpleCardinalMotionQuery(userInput)) {
+      return false;
+    }
+    final raw = d.motionStep?.trim() ?? '';
+    if (raw.isEmpty) return false;
+
+    final action = MotionStepBluetooth.parseMotionStepToBluetooth(raw);
+    if (action == null) {
+      print('⚠️ [MotionStep] 无法解析 motion_step="$raw"，回退意图链路');
+      return false;
+    }
+    print('🎯 [MotionStep] 执行单步 ${action.name} value=${action.value}');
+
+    if (!_actionModule.isBluetoothConnected) {
+      const msg = '机器人未连接';
+      await _speakText(
+        msg,
+        ttsExpression: TtsAlignedExpression.textChatSpeaking,
+        recordAssistantForTurns: msg,
+      );
+      _textQAModule.recordRouterDirectTurn(userInput, msg);
+      return true;
+    }
+
+    final spokenLine = d.dialogueReply.trim().isNotEmpty
+        ? d.dialogueReply.trim()
+        : MotionStepBluetooth.spokenAckFor(action);
+    await _speakText(
+      spokenLine,
+      ttsExpression: TtsAlignedExpression.actionCommandSpeaking,
+      recordAssistantForTurns: spokenLine,
+    );
+
+    final outcome =
+        await _actionModule.applyStructuredBluetoothActions([action]);
+    if (outcome.skippedDisconnected) {
+      await _speakText(
+        '机器人未连接',
+        ttsExpression: TtsAlignedExpression.textChatSpeaking,
+        recordAssistantForTurns: '机器人未连接',
+      );
+    } else if (outcome.linearInterrupted) {
+      final cliff = outcome.obstacleType == 0x03 ||
+          outcome.obstacleType == 0x04;
+      final safety = cliff ? '要掉下去啦' : '马上碰撞啦';
+      await _speakText(
+        safety,
+        ttsExpression: TtsAlignedExpression.emotionSpeaking,
+        emotionUiLabel: '愤怒',
+        recordAssistantForTurns: safety,
+      );
+    }
+
+    _textQAModule.recordRouterDirectTurn(userInput, spokenLine);
+    return true;
+  }
+
+  /// 处理情绪识别
+  Future<void> _handleEmotionRecognition(String userInput) async {
+    print("😊 进入情绪识别模块");
+
+    try {
+      final result = await _emotionModule.processEmotionRecognition(userInput,
+          conversationContext: _getConversationContext());
+
+      final emoLabel = EmotionRecognitionModule.emotionToUiLabel(result.emotion);
+      if (result.success) {
+        await _speakText(
+          result.response,
+          ttsExpression: TtsAlignedExpression.emotionSpeaking,
+          emotionUiLabel: emoLabel,
+          recordAssistantForTurns: result.response,
+        );
+      } else {
+        await _speakText(
+          "我能感受到您的情绪，让我来陪陪您吧",
+          ttsExpression: TtsAlignedExpression.emotionSpeaking,
+          emotionUiLabel: emoLabel,
+          recordAssistantForTurns: "我能感受到您的情绪，让我来陪陪您吧",
+        );
+      }
+    } catch (e) {
+      print("❌ 情绪识别处理失败: $e");
+      await _speakText(
+        "我理解您的感受",
+        ttsExpression: TtsAlignedExpression.emotionSpeaking,
+        emotionUiLabel: '中性',
+        recordAssistantForTurns: "我理解您的感受",
+      );
+    }
+  }
+
+  /// 处理图片分析
+  Future<void> _handleImageAnalysis(String userInput) async {
+    print("📷 进入图片分析模块");
+
+    try {
+      final result = await _imageModule.processImageAnalysis(
+        userInput,
+        conversationContext: _getConversationContext(),
+        cameraCapturePriority: CameraTaskPriority.high,
+      );
+
+      if (result.success) {
+        await _speakText(
+          result.response,
+          ttsExpression: TtsAlignedExpression.imageObserveSpeaking,
+          recordAssistantForTurns: result.response,
+        );
+      } else {
+        await _speakText(
+          "抱歉，我现在无法分析图片",
+          ttsExpression: TtsAlignedExpression.textChatSpeaking,
+          recordAssistantForTurns: "抱歉，我现在无法分析图片",
+        );
+      }
+    } catch (e) {
+      print("❌ 图片分析处理失败: $e");
+      await _speakText(
+        "图片分析遇到问题，请重试",
+        ttsExpression: TtsAlignedExpression.textChatSpeaking,
+        recordAssistantForTurns: "图片分析遇到问题，请重试",
+      );
+    }
+  }
+
+  /// 从增量 token 缓冲区中提取可播报句段；未闭合尾巴保留在 [buf]。
+  List<String> _extractReadySpeechChunks(StringBuffer buf) {
+    final s = buf.toString();
+    if (s.isEmpty) return const <String>[];
+    final out = <String>[];
+    var start = 0;
+    // 更激进的切分：逗号类也可触发，缩短首句等待。
+    bool isBreakChar(String ch) => '。！？.!?\n,，;；'.contains(ch);
+    for (var i = 0; i < s.length; i++) {
+      final ch = s[i];
+      if (!isBreakChar(ch)) continue;
+      final seg = s.substring(start, i + 1).trim();
+      if (seg.isNotEmpty) out.add(seg);
+      start = i + 1;
+    }
+    final tail = s.substring(start);
+    buf
+      ..clear()
+      ..write(tail);
+    // 极长无标点时按 24 字强行吐出，优先首句时延。
+    if (buf.length >= 24) {
+      final forced = buf.toString().substring(0, 24).trim();
+      if (forced.isNotEmpty) {
+        out.add(forced);
+      }
+      final rest = buf.toString().substring(24);
+      buf
+        ..clear()
+        ..write(rest);
+    }
+    return out;
+  }
+
+  /// 处理文本问答
+  Future<void> _handleTextQA(
+    String userInput, {
+    IntentType sceneIntent = IntentType.dialogue,
+    bool englishTeachingScene = false,
+  }) async {
+    print(
+      "💬 进入文本问答模块 scene=$sceneIntent "
+      'englishTeaching=$englishTeachingScene',
+    );
+
+    try {
+      if (sceneIntent == IntentType.command && !_actionModule.isBluetoothConnected) {
+        await _speakText(
+          '机器人未连接',
+          ttsExpression: TtsAlignedExpression.textChatSpeaking,
+          recordAssistantForTurns: '机器人未连接',
+        );
+        return;
+      }
+
+      if (sceneIntent == IntentType.apiCall &&
+          LocalMusicService.isPlayMusicCommand(userInput)) {
+        await LocalMusicService.instance.ensureInitialized();
+        if (LocalMusicService.isSpecificSongRequest(userInput)) {
+          await _speakText(
+            '抱歉，这首歌暂时不能播放。受版权和应用权限限制，目前我只能播放应用内置的那一首音乐。',
+            ttsExpression: TtsAlignedExpression.textChatSpeaking,
+            recordAssistantForTurns:
+                '抱歉，这首歌暂时不能播放。受版权和应用权限限制，目前我只能播放应用内置的那一首音乐。',
+          );
+          return;
+        }
+        final title = await LocalMusicService.instance.playRandomTrack();
+        if (title == null) {
+          LocalMusicService.instance.scheduleRescan();
+          await _speakText(
+            '抱歉，我暂时没找到应用内置音乐资源。请确认 mp3 已放在 assets/music 下并已加入资源清单。',
+            ttsExpression: TtsAlignedExpression.textChatSpeaking,
+            recordAssistantForTurns:
+                '抱歉，我暂时没找到应用内置音乐资源。请确认 mp3 已放在 assets/music 下并已加入资源清单。',
+          );
+        } else {
+          await _speakText(
+            '好的，正在播放内置音乐：$title',
+            ttsExpression: TtsAlignedExpression.textChatSpeaking,
+            recordAssistantForTurns: '好的，正在播放内置音乐：$title',
+          );
+        }
+        return;
+      }
+
+      final tts = _ttsService;
+      final supportsStream = tts.supportsInputStreaming;
+      // command 场景模型输出整段 JSON，流式会把未闭合 JSON 送进 TTS，故强制整段模式
+      final useStream =
+          supportsStream && sceneIntent != IntentType.command;
+      final deviceCtxMode = sceneIntent == IntentType.command
+          ? DeviceContextFetchMode.none
+          : sceneIntent == IntentType.apiCall
+              ? DeviceContextFetchMode.cachedAmbient
+              : DeviceContextService.fetchModeForQuery(userInput);
+      TextQAResult result;
+      if (useStream) {
+        final qaSw = Stopwatch()..start();
+        var firstEnqueueLogged = false;
+        var firstPlayLogged = false;
+        final innerPlayback = _playbackStartedVisualCallback(
+          TtsAlignedExpression.textChatSpeaking,
+          null,
+        );
+
+        if (_isInConversationMode) {
+          _isTtsPlaying = true;
+          notifyListeners();
+        }
+        try {
+          await prepareSherpaBargeInForConversationTts();
+          await LocalMusicService.instance.pauseForTts();
+
+          final swTtsInit = Stopwatch()..start();
+          await tts.startInputStream(
+            onPlaybackStarted: () {
+              if (!firstPlayLogged) {
+                print(
+                  '⏱️ [ConvStage][TTS·首帧出声] 距本问答开始 '
+                  '${qaSw.elapsedMilliseconds}ms',
+                );
+                firstPlayLogged = true;
+              }
+              innerPlayback?.call();
+            },
+          );
+          swTtsInit.stop();
+          print(
+            '⏱️ [ConvStage][TTS·会话初始化] startInputStream '
+            '${swTtsInit.elapsedMilliseconds}ms',
+          );
+
+          final pending = StringBuffer();
+          final swLlm = Stopwatch()..start();
+          result = await _textQAModule.handleTextQAStream(
+            userInput,
+            [],
+            sceneIntent: sceneIntent,
+            englishTeachingScene: englishTeachingScene,
+            contextPack: _buildContextPack(),
+            replyLengthMode: _replyLengthModeHint(),
+            deviceContextMode: deviceCtxMode,
+            onDelta: (delta) async {
+              pending.write(delta);
+              final chunks = _extractReadySpeechChunks(pending);
+              for (final c in chunks) {
+                if (!firstEnqueueLogged) {
+                  print(
+                    '⏱️ [ConvStage][TTS·首次入队] 距本问答开始 '
+                    '${qaSw.elapsedMilliseconds}ms 段长=${c.length}字',
+                  );
+                  firstEnqueueLogged = true;
+                }
+                unawaited(tts.pushInputText(c));
+              }
+            },
+          );
+          swLlm.stop();
+          print(
+            '⏱️ [ConvStage][本问答·LLM+onDelta阶段] '
+            '${swLlm.elapsedMilliseconds}ms',
+          );
+
+          final swTail = Stopwatch()..start();
+          final tail = pending.toString().trim();
+          if (tail.isNotEmpty) {
+            await tts.pushInputText(tail);
+          }
+          swTail.stop();
+          print(
+            '⏱️ [ConvStage][TTS·尾段推送] await push 尾段 '
+            '${swTail.elapsedMilliseconds}ms',
+          );
+
+          final swFinish = Stopwatch()..start();
+          await tts.finishInputStream();
+          swFinish.stop();
+          qaSw.stop();
+          print(
+            '⏱️ [ConvStage][TTS·收尾播完] finishInputStream '
+            '${swFinish.elapsedMilliseconds}ms '
+            '本问答合计=${qaSw.elapsedMilliseconds}ms',
+          );
+        } finally {
+          if (_isInConversationMode) {
+            _isTtsPlaying = false;
+            notifyListeners();
+          }
+          await LocalMusicService.instance.resumeAfterTtsIfPaused();
+        }
+        // 流式播报已结束：与 [_speakText] 一致，先切聆听脸再起麦，降低「思考中」卡死感
+        _isProcessingUserInput = false;
+        _notifySpeechUi();
+        if (_isInConversationMode) {
+          _uiModule.onTtsCompleted();
+          try {
+            await _startVoiceRecognition();
+          } catch (e, st) {
+            print("⚠️ 流式后启动语音识别失败，将重试: $e\n$st");
+            await Future<void>.delayed(const Duration(milliseconds: 300));
+            try {
+              await _startVoiceRecognition();
+            } catch (e2, st2) {
+              print("❌ 流式后语音识别二次启动仍失败: $e2\n$st2");
+            }
+          }
+          _startConversationTimeout();
+        }
+      } else {
+        final swQa = Stopwatch()..start();
+        result = await _textQAModule.handleTextQA(
+          userInput,
+          [],
+          sceneIntent: sceneIntent,
+          englishTeachingScene: englishTeachingScene,
+          contextPack: _buildContextPack(),
+          replyLengthMode: _replyLengthModeHint(),
+          deviceContextMode: deviceCtxMode,
+        );
+        swQa.stop();
+        print(
+          '⏱️ [ConvStage][本问答·整段LLM+解析] ${swQa.elapsedMilliseconds}ms '
+          '（细项见上文 [TextQA·整段]）',
+        );
+        final swTtsRound = Stopwatch()..start();
+        await _speakText(
+          result.response,
+          ttsExpression: sceneIntent == IntentType.command
+              ? TtsAlignedExpression.actionCommandSpeaking
+              : TtsAlignedExpression.textChatSpeaking,
+          recordAssistantForTurns: result.response,
+        );
+        swTtsRound.stop();
+        print(
+          '⏱️ [ConvStage][本问答·speakText总墙钟] ${swTtsRound.elapsedMilliseconds}ms '
+          '（含准备打断；纯 TTS 见上文 [TTS合成与播放]）',
+        );
+      }
+      final structured = result.structured;
+      final allowBluetoothActions = sceneIntent == IntentType.command;
+      var chainOutcome = const BluetoothChainOutcome();
+      if (allowBluetoothActions &&
+          structured != null &&
+          structured.bluetoothActions.isNotEmpty) {
+        chainOutcome = await _actionModule.applyStructuredBluetoothActions(
+          structured.bluetoothActions,
+        );
+      } else if (!allowBluetoothActions &&
+          structured != null &&
+          structured.bluetoothActions.isNotEmpty) {
+        print('⚠️ 忽略非指令场景下的蓝牙动作建议，避免误触发');
+      }
+
+      if (sceneIntent == IntentType.command) {
+        if (chainOutcome.skippedDisconnected) {
+          await _speakText(
+            '机器人未连接',
+            ttsExpression: TtsAlignedExpression.textChatSpeaking,
+            recordAssistantForTurns: '机器人未连接',
+          );
+        } else if (chainOutcome.linearInterrupted) {
+          final cliff = chainOutcome.obstacleType == 0x03 ||
+              chainOutcome.obstacleType == 0x04;
+          final safety = cliff ? '要掉下去啦' : '马上碰撞啦';
+          await _speakText(
+            safety,
+            ttsExpression: TtsAlignedExpression.emotionSpeaking,
+            emotionUiLabel: '愤怒',
+            recordAssistantForTurns: safety,
+          );
+        }
+      }
+
+      if (useStream && result.response.trim().isNotEmpty) {
+        _pushDialogLine('小航：${result.response.trim()}');
+      }
+    } catch (e) {
+      print("❌ 文本问答处理失败: $e");
+      await _speakText(
+        "抱歉，我现在无法回答您的问题",
+        ttsExpression: TtsAlignedExpression.textChatSpeaking,
+        recordAssistantForTurns: "抱歉，我现在无法回答您的问题",
+      );
+    }
+  }
+
+  /// 处理“结束对话”意图：先生成并播报一句温暖告别，再退出连续对话模式。
+  Future<void> _handleExitIntent(String userInput) async {
+    print("🚪 命中退出意图，先生成告别语再退出");
+    _conversationTimeoutTimer?.cancel();
+    _uiModule.showThinkingAwaitingModel();
+
+    var farewell = "希望你今天也顺顺利利，我先退出了。";
+    try {
+      final result = await _textQAModule.handleTextQA(
+        '$userInput。请只回复一句温暖且简短的告别语，表达“希望你愉快，我先退出了”这类意思。',
+        [],
+        sceneIntent: IntentType.dialogue,
+        contextPack: _buildContextPack(),
+        replyLengthMode: '待机',
+        deviceContextMode: DeviceContextFetchMode.none,
+      );
+      final t = result.response.trim();
+      if (t.isNotEmpty) {
+        farewell = t;
+      }
+    } catch (e) {
+      print("⚠️ 退出告别语生成失败，使用默认文案: $e");
+    }
+
+    await _speakText(
+      farewell,
+      ttsExpression: TtsAlignedExpression.textChatSpeaking,
+      recordAssistantForTurns: farewell,
+      transitionToListeningAfterTts: false,
+    );
+
+    // 退出前不再重复播报固定退出语，避免二次播报
+    await _exitConversationMode(speakExitLine: false);
+  }
+
+  /// 与 TTS 播放器 `PlayerState.playing` 对齐的一次性表情切换（非 none 时）。
+  VoidCallback? _playbackStartedVisualCallback(
+    TtsAlignedExpression expression,
+    String? emotionUiLabel,
+  ) {
+    if (expression == TtsAlignedExpression.none) return null;
+    return () {
+      _uiModule.applyExpressionAlignedWithTts(
+        expression,
+        emotionUiLabel: emotionUiLabel,
+      );
+    };
+  }
+
+  /// 语音合成
+  Future<void> _speakText(
+    String text, {
+    TtsAlignedExpression ttsExpression = TtsAlignedExpression.none,
+    String? emotionUiLabel,
+    String? recordAssistantForTurns,
+    bool transitionToListeningAfterTts = true,
+  }) async {
+    if (text.isEmpty) return;
+
+    _isTtsPlaying = true;
+    notifyListeners();
+
+    try {
+      print("🔊 TTS播放: $text");
+
+      // 勿用英文常用词做子串过滤（如 chat/message/content/model），否则正常英文回复会被整段跳过
+      if (_shouldSkipTtsAsLikelyDebug(text)) {
+        print("⚠️ 检测到可能的调试信息，跳过播报: $text");
+        return;
+      }
+
+      await prepareSherpaBargeInForConversationTts();
+      await LocalMusicService.instance.pauseForTts();
+
+      // 表情在播放器进入 playing 时切换，贴近首帧出声（与云端 TTS 行为一致）
+      final ttsSw = Stopwatch()..start();
+      await _ttsService.speak(
+        text,
+        onPlaybackStarted:
+            _playbackStartedVisualCallback(ttsExpression, emotionUiLabel),
+      );
+      ttsSw.stop();
+      print(
+        '⏱️ [ConvStage][TTS合成与播放] ${ttsSw.elapsedMilliseconds}ms '
+        'len=${text.length}字',
+      );
+
+      if (recordAssistantForTurns != null &&
+          recordAssistantForTurns.trim().isNotEmpty) {
+        _pushDialogLine('小航：${recordAssistantForTurns.trim()}');
+      }
+
+      print("✅ TTS播放完成");
+    } catch (e) {
+      print("❌ TTS播放失败: $e");
+    } finally {
+      // 音频已结束时立即清「播报中」并切聆听脸，再拉麦克风；避免 speak() 已返回但
+      // await _startVoiceRecognition() 期间 UI 仍显示播报中/说话嘴型过久，或听写未起导致 30s 超时退出。
+      if (_isInConversationMode) {
+        _isTtsPlaying = false;
+        notifyListeners();
+        if (transitionToListeningAfterTts) {
+          _uiModule.onTtsCompleted();
+        }
+        _isProcessingUserInput = false;
+        _notifySpeechUi();
+
+        print("🎙️ TTS播放完成，启动语音识别监听");
+        try {
+          await _startVoiceRecognition();
+        } catch (e, st) {
+          print("⚠️ 启动语音识别失败，300ms 后重试一次: $e\n$st");
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          try {
+            await _startVoiceRecognition();
+          } catch (e2, st2) {
+            print("❌ 语音识别二次启动仍失败: $e2\n$st2");
+          }
+        }
+        print("⏰ TTS播放完成，现在启动30秒超时计时器");
+        _startConversationTimeout();
+      } else {
+        _isTtsPlaying = false;
+        notifyListeners();
+        if (transitionToListeningAfterTts) {
+          _uiModule.onTtsCompleted();
+        }
+      }
+
+      await LocalMusicService.instance.resumeAfterTtsIfPaused();
+      notifyListeners();
+    }
+  }
+
+  /// 启动语音识别
+  Future<void> _startVoiceRecognition() async {
+    try {
+      print("🎙️ 启动语音识别监听");
+
+      if (_speechNotifier != null &&
+          _speechNotifier.startVoiceRecognition != null) {
+        // 调用SpeechNotifierSimplified的语音识别启动方法
+        await _speechNotifier.startVoiceRecognition();
+        print("✅ 已通知语音通知器启动语音识别");
+      } else {
+        print("⚠️ 语音通知器引用未设置，无法启动语音识别");
+      }
+    } catch (e) {
+      print("❌ 启动语音识别失败: $e");
+    }
+  }
+
+  /// 停止语音识别
+  Future<void> _stopVoiceRecognition({bool resumeSherpaKws = true}) async {
+    try {
+      if (_speechNotifier != null &&
+          _speechNotifier.stopVoiceRecognition != null) {
+        await _speechNotifier.stopVoiceRecognition(
+            resumeSherpaKws: resumeSherpaKws);
+        print("🔇 语音识别已停止");
+      }
+    } catch (e) {
+      print("❌ 停止语音识别失败: $e");
+    }
+  }
+
+  Future<void> _resumeSherpaAfterConversationExit() async {
+    try {
+      if (_speechNotifier != null &&
+          _speechNotifier.resumeSherpaWakeListeningAfterExit != null) {
+        await _speechNotifier.resumeSherpaWakeListeningAfterExit();
+      }
+    } catch (e) {
+      print("❌ 恢复唤醒监听失败: $e");
+    }
+  }
+
+  /// 启动30秒超时计时器
+  void _startConversationTimeout() {
+    _conversationTimeoutTimer?.cancel();
+
+    // 修复：确保只在TTS播放完成且在对话模式中才启动计时器
+    if (_isTtsPlaying) {
+      print("🔊 TTS播放中，延迟启动超时计时器");
+      return;
+    }
+
+    if (!_isInConversationMode) {
+      print("⚠️ 不在连续对话模式，不启动超时计时器");
+      return;
+    }
+
+    _conversationTimeoutTimer = Timer(_conversationTimeout, () {
+      print("⏰ 连续对话30秒超时，自动退出");
+      _exitConversationMode().catchError((Object e, StackTrace st) {
+        print("❌ 超时退出对话异常: $e\n$st");
+      });
+    });
+
+    print("⏰ 30秒超时计时器已启动（TTS播放完成后）");
+  }
+
+  /// 检查是否为退出指令
+  bool _isExitCommand(String text) {
+    final exitCommands = [
+      '就这样吧',
+      '先这样吧',
+      '就到这吧',
+      '结束',
+      '结束吧',
+      '退出',
+      '退出吧',
+      '我要休息了',
+      '再见',
+      '拜拜',
+      '停止对话',
+      '结束对话',
+      '不说了',
+      '睡觉',
+      '休息',
+      '滚',
+      '滚蛋',
+      '闭嘴',
+    ];
+
+    final lowerText = text.toLowerCase();
+    return exitCommands.any((cmd) => lowerText.contains(cmd));
+  }
+
+  /// 获取对话上下文（供情绪/图像等模块注入）
+  String _getConversationContext() {
+    if (_dialogTurnLines.isEmpty) return '';
+    return _dialogTurnLines.join('\n');
+  }
+
+  void _pushDialogLine(String line) {
+    final t = line.trim();
+    if (t.isEmpty) return;
+    _dialogTurnLines.add(t);
+    while (_dialogTurnLines.length > 8) {
+      _dialogTurnLines.removeAt(0);
+    }
+  }
+
+  /// 仅拦截明显调试串；英文里常出现 chat/model/message 等词，不可做简单 [String.contains]。
+  bool _shouldSkipTtsAsLikelyDebug(String text) {
+    if (text.contains('utterance_')) return true;
+    if (text.contains('🎤') || text.contains('✅') || text.contains('❌')) {
+      return true;
+    }
+    if (RegExp(r'\bTTS\b').hasMatch(text)) return true;
+    final t = text.trim();
+    if (RegExp(r'^\d{12,}$').hasMatch(t)) return true;
+    final tl = text.trimLeft();
+    if (tl.startsWith('{') &&
+        tl.contains('"choices"') &&
+        (tl.contains('"usage"') || tl.contains('"finish_reason"'))) {
+      return true;
+    }
+    return false;
+  }
+
+  /// 单字汉字且不在白名单：多为环境噪声误识别（如「饭」）；白名单保留应答语气词供意图区分。
+  static const Set<String> _asrSingleHanKeep = {
+    '嗯', '唔', '呣', '哼', '哦', '噢', '喔', '啊', '呃', '欸', '诶',
+    '唉', '嘿', '哟', '嗨',
+    '对', '好', '行', '是', '可', '要', '成',
+  };
+
+  /// 仅一个 CJK 汉字且不在 [_asrSingleHanKeep] 时视为 ASR 垃圾，在 [_isLikelyInvalidInput] 中过滤。
+  static bool isSingleHanAsrNoise(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty) return false;
+    final it = t.runes.iterator;
+    if (!it.moveNext()) return false;
+    final r = it.current;
+    if (it.moveNext()) return false;
+    if (r < 0x4e00 || r > 0x9fff) return false;
+    return !_asrSingleHanKeep.contains(String.fromCharCode(r));
+  }
+
+  bool _isLikelyInvalidInput(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty) return true;
+    if (t.length <= 1 && RegExp(r'^[^\u4e00-\u9fff\w]$').hasMatch(t)) {
+      return true;
+    }
+    if (RegExp(r'^[\s\.,;:!?，。！？、…]+$').hasMatch(t)) return true;
+    return false;
+  }
+
+  ConversationContextPack _buildContextPack() {
+    return ConversationContextPack(
+      recentTurnLines: List<String>.from(_dialogTurnLines),
+      userEmotionFromVa: null,
+      deviceStateLine: '基座电量与传感器详情：待硬件上报',
+      environmentSummary: null,
+      idleSinceDescription: _describeIdleSince(),
+    );
+  }
+
+  /// Router 用：天气/地理问法注入**仅后台缓存**（不在 Router 轮内阻塞 HTTP）；
+  /// 由 Router 直接生成 dialogue_reply，时间类用本地块；普通闲聊可附带软缓存。
+  Future<ConversationContextPack> _buildRouterContextPack(String userInput) async {
+    final base = _buildContextPack();
+    String? deviceBlock;
+    final mode = DeviceContextService.fetchModeForQuery(userInput);
+    try {
+      final svc = DeviceContextService();
+      switch (mode) {
+        case DeviceContextFetchMode.full:
+          deviceBlock = AmbientContextCache.instance.buildPromptBlock();
+          break;
+        case DeviceContextFetchMode.localTimeOnly:
+          deviceBlock = svc.getLocalTimeContextBlock();
+          break;
+        case DeviceContextFetchMode.cachedAmbient:
+          deviceBlock = AmbientContextCache.instance.buildPromptBlock();
+          break;
+        case DeviceContextFetchMode.none:
+          final soft = AmbientContextCache.instance.buildPromptBlock().trim();
+          if (soft.isNotEmpty) {
+            deviceBlock = soft;
+          }
+          break;
+      }
+    } catch (e) {
+      print('⚠️ Router 设备上下文拉取失败: $e');
+    }
+    return ConversationContextPack(
+      recentTurnLines: base.recentTurnLines,
+      userEmotionFromVa: base.userEmotionFromVa,
+      deviceStateLine: base.deviceStateLine,
+      environmentSummary: base.environmentSummary,
+      deviceContextBlock: deviceBlock,
+      idleSinceDescription: base.idleSinceDescription,
+    );
+  }
+
+  String _describeIdleSince() {
+    final t = _lastInteractionTime;
+    if (t == null) return '';
+    final sec = DateTime.now().difference(t).inSeconds;
+    if (sec < 10) return '距上次交互约数秒内';
+    if (sec < 60) return '距上次交互约 $sec 秒';
+    if (sec < 3600) return '距上次交互约 ${sec ~/ 60} 分钟';
+    return '距上次交互超过一小时';
+  }
+
+  /// 行走中 / 待机等，供 D 层长度策略
+  String _replyLengthModeHint() {
+    if (_actionModule.isProcessing) return '行走中';
+    if (_ttsInterruptInFlight) return '打断恢复';
+    return '待机';
+  }
+
+  void _recordContinuousInput(String raw) {
+    final now = DateTime.now();
+    final t = raw.trim();
+    if (t.isEmpty) return;
+    final last = _lastInputAt;
+    if (last == null || now.difference(last) > _continuousInputGapReset) {
+      _continuousInputWindowStart = now;
+      _continuousInputCount = 1;
+    } else {
+      _continuousInputCount += 1;
+    }
+    _lastInputAt = now;
+  }
+
+  bool _shouldForceExitForContinuousInput() {
+    final start = _continuousInputWindowStart;
+    final last = _lastInputAt;
+    if (start == null || last == null) return false;
+    if (_continuousInputCount < _continuousInputCountLimit) return false;
+    return last.difference(start) >= _continuousInputWindowLimit;
+  }
+
+  Future<void> _handleContinuousInputSafetyExit() async {
+    print('🧯 命中连续输入保护：高频对话超过阈值，准备安全退出');
+    await _speakText(
+      "我先帮你停一下，避免持续收音过久。休息一下后再唤醒我，我们继续。",
+      ttsExpression: TtsAlignedExpression.textChatSpeaking,
+      recordAssistantForTurns: "我先帮你停一下，避免持续收音过久。休息一下后再唤醒我，我们继续。",
+      transitionToListeningAfterTts: false,
+    );
+    await _exitConversationMode(speakExitLine: false);
+  }
+
+  void _resetContinuousInputGuard() {
+    _continuousInputWindowStart = null;
+    _lastInputAt = null;
+    _continuousInputCount = 0;
+  }
+
+  /// 退出连续对话模式
+  Future<void> _exitConversationMode({bool speakExitLine = true}) async {
+    if (!_isInConversationMode) return;
+
+    print("🚪 退出连续对话模式");
+    _isInConversationMode = false;
+    _isProcessingUserInput = false;
+    _resetContinuousInputGuard();
+
+    // 取消超时计时器
+    _conversationTimeoutTimer?.cancel();
+
+    // 停止用户监测
+    _userDetectionModule.stopUserDetection();
+
+    // 停止 VOSK；勿在此处恢复 sherpa（否则会与下方退出 TTS 同时占用麦克风，易 native 闪退）
+    await _stopVoiceRecognition(resumeSherpaKws: false);
+
+    // 重置UI模式
+    _uiModule.setProgramMode(ProgramMode.idle);
+
+    try {
+      final n = _speechNotifier;
+      if (n != null) {
+        // ignore: avoid_dynamic_calls
+        n.resetSpeechDisplayToWakePrompt();
+        // ignore: avoid_dynamic_calls
+        n.clearDuplexTtsBargeInMode();
+      }
+    } catch (_) {}
+
+    // 播放退出语音（播完后再恢复唤醒）
+    if (speakExitLine) {
+    await _speakText("我先休息了");
+    }
+
+    // 清理状态
+    _lastUserInput = "";
+    // _textQAModule.resetHistory(); // 暂不实现
+
+    // 触发退出回调，启动120秒环境监测计时器
+    if (_onConversationExit != null) {
+      _onConversationExit!();
+      print("🔄 触发对话退出回调，启动120秒环境监测计时器");
+    }
+
+    notifyListeners();
+
+    await _resumeSherpaAfterConversationExit();
+
+    print("✅ 已退出连续对话模式");
+  }
+
+  /// 强制停止当前活动
+  Future<void> forceStop() async {
+    print("🛑 强制停止连续对话控制器");
+
+    _conversationTimeoutTimer?.cancel();
+    _userDetectionModule.stopUserDetection();
+    await _stopVoiceRecognition();
+
+    try {
+      final n = _speechNotifier;
+      if (n != null) {
+        // ignore: avoid_dynamic_calls
+        n.clearDuplexTtsBargeInMode();
+      }
+    } catch (_) {}
+
+    _isProcessingUserInput = false;
+    _isTtsPlaying = false;
+
+    notifyListeners();
+  }
+
+  // === 环境监测公共接口 ===
+
+  /// 启动环境监测
+  void startEnvironmentMonitoring() {
+    if (!DebugRuntimeFlags.enableEnvironmentMonitoring) {
+      print(
+        '════════ 环境监测已关闭（DebugRuntimeFlags.enableEnvironmentMonitoring=false）════════',
+      );
+      return;
+    }
+    if (!_isInConversationMode) {
+      print("🌍 启动环境监测功能");
+      _environModule.startEnvironmentMonitoring();
+    } else {
+      print("⚠️ 连续对话模式中，无法启动环境监测");
+    }
+  }
+
+  /// 停止环境监测
+  void stopEnvironmentMonitoring() {
+    print("🛑 停止环境监测功能");
+    _environModule.stopEnvironmentMonitoring();
+  }
+
+  /// 获取环境监测状态
+  bool get isEnvironmentMonitoring => _environModule.isMonitoring;
+
+  /// 获取环境监测状态描述
+  String get environmentMonitorStatus => _environModule.monitorStatus;
+
+  /// 释放资源
+  Future<void> dispose() async {
+    print("🗑️ 释放连续对话控制器资源");
+
+    await forceStop();
+
+    AmbientContextCache.instance.dispose();
+
+    // 停止环境监测
+    _environModule.stopEnvironmentMonitoring();
+
+    await _userDetectionModule.dispose();
+    await _imageModule.dispose();
+    await _emotionModule.dispose();
+
+    await _ttsService.release();
+
+    super.dispose();
+  }
+}
