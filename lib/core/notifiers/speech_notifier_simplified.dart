@@ -642,7 +642,11 @@ class SpeechNotifierSimplified with ChangeNotifier {
       await Future<void>.delayed(const Duration(milliseconds: 120));
 
       final qwenClient = QwenCloudAsrClient();
+      print('════════════════ QWEN ASR ENDPOINT ════════════════');
+      print('🌐 [QWEN_ASR_BASE_URL] ${qwenClient.baseUrl}');
+      print('════════════════════════════════════════════════════');
       final qwenUp = await qwenClient.healthz();
+      print('🩺 [QWEN /healthz] ${qwenUp ? "OK" : "FAIL"} @ ${qwenClient.baseUrl}/healthz');
       if (qwenUp) {
         try {
           _qwenAsrRecorder = QwenStreamingAsrRecorder(

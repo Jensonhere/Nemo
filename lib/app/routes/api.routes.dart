@@ -6,5 +6,5 @@ class ApiRoutes {
       "https://xhang.buaa.edu.cn/openai/v1/chat/completions";
   // 视觉API（图像+文本处理）
   static const String visionApiUrl =
-      "http://10.70.247.113:4000/v1/chat/completions";
+      "https://xhang.buaa.edu.cn/openai/v1/chat/completions";
 }

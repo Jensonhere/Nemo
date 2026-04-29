@@ -1,10 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as img;
 import 'package:voicegpt/app/constants/app.keys.dart';
 import 'package:voicegpt/app/routes/api.routes.dart';
 import 'package:voicegpt/core/llm/llm_prompt_layers.dart';
-//import 'package:image/image.dart' as img;//新增，可用于图片体积压缩
 
 class OpenAI {
   final client = http.Client();
@@ -14,6 +14,9 @@ class OpenAI {
 
   /// 默认人格（文本/多模态 system 基底）；结构化对话另见 [generateTextLayered]
   static const String _xiaohangPersona = LlmPromptLayers.systemLayer;
+  static const int _visionImageMaxWidth = 1024;
+  static const int _visionImageTargetBytes = 220 * 1024;
+  static const int _visionBatchMaxImages = 4;
 
   // 重置对话历史
   void resetConversation() {
@@ -34,10 +37,35 @@ class OpenAI {
   }
 
 
-  // 将图片转换为base64
+  // 将图片压缩后再转为 base64，降低公网网关 413 风险
   Future<String> _imageToBase64(String imagePath) async {
-    final bytes = await File(imagePath).readAsBytes();
-    return base64Encode(bytes);
+    final originalBytes = await File(imagePath).readAsBytes();
+    final decoded = img.decodeImage(originalBytes);
+    if (decoded == null) {
+      return base64Encode(originalBytes);
+    }
+
+    img.Image working = decoded;
+    if (working.width > _visionImageMaxWidth) {
+      working = img.copyResize(working, width: _visionImageMaxWidth);
+    }
+
+    var quality = 72;
+    var encoded = img.encodeJpg(working, quality: quality);
+    while (encoded.length > _visionImageTargetBytes && quality > 45) {
+      quality -= 7;
+      encoded = img.encodeJpg(working, quality: quality);
+    }
+
+    final ratio = originalBytes.isEmpty
+        ? 1.0
+        : (originalBytes.length / encoded.length);
+    print(
+      '🗜️ [VISION_IMG] $imagePath 原始=${(originalBytes.length / 1024).toStringAsFixed(1)}KB '
+      '压缩=${(encoded.length / 1024).toStringAsFixed(1)}KB q=$quality '
+      '缩小=${ratio.toStringAsFixed(2)}x',
+    );
+    return base64Encode(encoded);
   }
 
   /*
@@ -241,11 +269,8 @@ class OpenAI {
       }
     ];
 
-    // 添加用户消息到历史
-    addUserMessage(content);
-
-    // 构建完整的消息列表（多模态格式）
-    final messages = _buildMultimodalMessages();
+    // 视觉请求只注入「文本历史 + 当前图片」，避免把历史图片(base64)重复发送触发 413。
+    final messages = _buildMultimodalMessagesWithCurrentUserContent(content);
 
     // 发送到视觉API
     return _sendVisionRequest(messages);
@@ -258,10 +283,20 @@ class OpenAI {
       throw Exception('imagePaths 不能为空');
     }
 
+    final selectedPaths = imagePaths.length > _visionBatchMaxImages
+        ? imagePaths.sublist(imagePaths.length - _visionBatchMaxImages)
+        : imagePaths;
+    if (selectedPaths.length != imagePaths.length) {
+      print(
+        '⚠️ [VISION_BATCH] 图片数量 ${imagePaths.length} 超过上限 $_visionBatchMaxImages，'
+        '仅发送最近 ${selectedPaths.length} 张以避免 413',
+      );
+    }
+
     final content = <Map<String, dynamic>>[
       {"type": "text", "text": prompt},
     ];
-    for (final path in imagePaths) {
+    for (final path in selectedPaths) {
       final imageBase64 = await _imageToBase64(path);
       content.add({
         "type": "image_url",
@@ -269,8 +304,8 @@ class OpenAI {
       });
     }
 
-    addUserMessage(content);
-    final messages = _buildMultimodalMessages();
+    // 批量视觉同样只带当前多图 + 文本历史，避免历史图片累计导致 payload 过大。
+    final messages = _buildMultimodalMessagesWithCurrentUserContent(content);
     return _sendVisionRequest(messages);
   }
 
@@ -305,8 +340,16 @@ class OpenAI {
     return content.toString();
   }
 
-  // 构建多模态消息（优化版）
-  List<Map<String, dynamic>> _buildMultimodalMessages() {
+  /// 构建多模态请求：仅保留最近文本历史，不复用历史中的图片内容。
+  List<Map<String, dynamic>> _buildMultimodalMessagesWithCurrentUserContent(
+      List<Map<String, dynamic>> currentUserContent) {
+    final textOnlyTurns = _conversationHistory
+        .where((msg) => msg['content'] is String)
+        .toList();
+    final recent = textOnlyTurns.length > 8
+        ? textOnlyTurns.sublist(textOnlyTurns.length - 8)
+        : textOnlyTurns;
+
     return [
       {
         "role": "system",
@@ -314,17 +357,13 @@ class OpenAI {
           {"type": "text", "text": _xiaohangPersona}
         ]
       },
-      ..._conversationHistory.map((msg) {
-        final content = msg["content"];
-        return {
-          "role": msg["role"],
-          "content": content is String
-              ? [
-                  {"type": "text", "text": content}
-                ]
-              : content
-        };
-      })
+      ...recent.map((msg) => {
+            "role": msg["role"],
+            "content": [
+              {"type": "text", "text": msg["content"].toString()}
+            ]
+          }),
+      {"role": "user", "content": currentUserContent},
     ];
   }
 
@@ -397,6 +436,8 @@ class OpenAI {
     final visionBytes = utf8.encode(visionBody).length;
 
     final visionSw = Stopwatch()..start();
+    print('════════════════ VISION API CALL ═════════════════');
+    print('🌐 [VISION_API_URL] ${ApiRoutes.visionApiUrl}');
     final response = await client.post(
       Uri.parse(ApiRoutes.visionApiUrl),
       headers: {
@@ -415,12 +456,22 @@ class OpenAI {
     if (response.statusCode == 200) {
       final responseData = jsonDecode(utf8.decode(response.bodyBytes));
       final assistantMessage = responseData['choices'][0]['message']['content'];
+      final preview = assistantMessage.toString().replaceAll('\n', ' ');
+      final shortPreview =
+          preview.length > 80 ? '${preview.substring(0, 80)}…' : preview;
+      print('✅ [VISION_API] 调用成功 status=200 preview="$shortPreview"');
+      print('════════════════════════════════════════════════════');
 
       // 添加助手回复到历史
       addAssistantMessage(assistantMessage);
 
       return responseData;
     } else {
+      print(
+        '❌ [VISION_API] 调用失败 status=${response.statusCode} '
+        'url=${ApiRoutes.visionApiUrl} body=${utf8.decode(response.bodyBytes, allowMalformed: true)}',
+      );
+      print('════════════════════════════════════════════════════');
       throw Exception("视觉请求失败: ${response.statusCode} - ${response.body}");
     }
   }
