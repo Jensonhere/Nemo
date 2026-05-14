@@ -4,7 +4,6 @@ import 'package:lottie/lottie.dart';
 import 'package:provider/provider.dart';
 import 'package:voicegpt/core/notifiers/openai.notifier.dart';
 import 'package:voicegpt/core/notifiers/speech_notifier_simplified.dart';
-import 'package:voicegpt/core/modules/plan_executor_controller.dart';
 import 'package:voicegpt/core/services/fullscreen_service.dart';
 import 'package:voicegpt/core/services/bluetooth_service.dart';
 import 'package:voicegpt/presentation/widgets/connection_permission_status_strip.dart';
@@ -1142,22 +1141,59 @@ class _HomeViewState extends State<HomeView> {
                 ),
                 // 左上角状态信息
                 _buildSpeechTextIndicator(speechNotifier),
-                // 右上角设置按钮
+                // 右上角：多人对话模式 + 设置
                 Positioned(
-                  top: 12,
-                  right: 12,
-                  child: IconButton(
-                    icon: Icon(
-                      Icons.settings,
-                      color: Colors.white,
-                      size: 26,
-                    ),
-                    onPressed: () {
-                      debugPrint('Settings button tapped');
-                      // 预留：后续在这里跳转到注册/登录或设置页
-                    },
+                  top: 8,
+                  right: 8,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        tooltip: '多人对话（按住说话）',
+                        icon: Icon(
+                          speechNotifier.isMultiPersonPushToTalkMode
+                              ? Icons.groups
+                              : Icons.groups_outlined,
+                          color: speechNotifier.isMultiPersonPushToTalkMode
+                              ? Colors.lightBlueAccent
+                              : Colors.white,
+                          size: 26,
+                        ),
+                        onPressed: () {
+                          unawaited(
+                            speechNotifier.setMultiPersonPushToTalkMode(
+                              !speechNotifier.isMultiPersonPushToTalkMode,
+                            ),
+                          );
+                        },
+                      ),
+                      IconButton(
+                        tooltip: '设置',
+                        icon: const Icon(
+                          Icons.settings,
+                          color: Colors.white,
+                          size: 26,
+                        ),
+                        onPressed: () {
+                          debugPrint('Settings button tapped');
+                        },
+                      ),
+                    ],
                   ),
                 ),
+                if (speechNotifier.isMultiPersonPushToTalkMode)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 24,
+                    child: Align(
+                      alignment: Alignment.bottomCenter,
+                      child: _buildMultiPersonPttBar(
+                        context,
+                        speechNotifier,
+                      ),
+                    ),
+                  ),
                 Positioned(
                   top: 52,
                   right: 16,
@@ -1203,6 +1239,80 @@ class _HomeViewState extends State<HomeView> {
     );
   }
 
+  /// 多人对话模式：底部居中按住说话（松手定稿送大模型）。
+  Widget _buildMultiPersonPttBar(
+    BuildContext context,
+    SpeechNotifierSimplified speech,
+  ) {
+    final inChat = speech.isInConversationMode;
+    // 思考中不可按；播报中 isProcessing 仍为 true，须允许按住打断。
+    final canHold = inChat &&
+        (!speech.isProcessingUserInput || speech.isTtsPlaying);
+    final holding = speech.isPttRecordingHold;
+    final arming = speech.isPttFingerPressed && !holding;
+    // 播报与「处理中」可能同时为 true，文案须优先播报态（显示按住说话/打断）。
+    final String label = !inChat
+        ? '请先唤醒小航'
+        : speech.isTtsPlaying
+            ? (arming ? '继续按住以打断' : '按住打断并说话')
+            : speech.isProcessingUserInput
+                ? '处理中…'
+                : holding
+                    ? '松开发送'
+                    : arming
+                        ? '继续按住…'
+                        : '按住说话';
+
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (_) {
+        if (canHold) {
+          unawaited(speech.multiPersonPttTouchDown());
+        }
+      },
+      // 必须在每次抬手时都通知 notifier：快速点按时尚未进入 isPttRecordingHold，
+      // 若用构建期 holding 判断会漏掉 touchUp，导致仍开麦并一直识别。
+      onPointerUp: (_) {
+        unawaited(speech.multiPersonPttTouchUp());
+      },
+      onPointerCancel: (_) {
+        unawaited(speech.multiPersonPttTouchUp());
+      },
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        width: 220,
+        height: 56,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: canHold
+              ? (holding
+                  ? Colors.green.shade800
+                  : arming
+                      ? Colors.amber.shade900
+                      : Colors.white24)
+              : Colors.white10,
+          borderRadius: BorderRadius.circular(28),
+          border: Border.all(
+            color: holding
+                ? Colors.lightGreenAccent
+                : arming
+                    ? Colors.amberAccent
+                    : Colors.white54,
+            width: (holding || arming) ? 2.5 : 1,
+          ),
+        ),
+        child: Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 15,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+  }
+
   // 保留语音文本显示（可选）
   Widget _buildSpeechTextIndicator(SpeechNotifierSimplified notifier) {
     String displayText = notifier.getTextSpeech;
@@ -1221,6 +1331,15 @@ class _HomeViewState extends State<HomeView> {
         // 不应误显示思考中（否则会出现约 1s 思考→聆听的闪烁）。
         displayText = "💬 思考中...";
         textColor = Colors.amber;
+      } else if (notifier.isMultiPersonPushToTalkMode) {
+        if (notifier.isPttRecordingHold) {
+          displayText = "🎙️ 录音中…松开发送";
+        } else if (notifier.isPttFingerPressed) {
+          displayText = "👥 继续按住以开始录音…";
+        } else {
+          displayText = "👥 多人模式：按住下方说话";
+        }
+        textColor = Colors.cyanAccent;
       } else {
         // 聆听中，或 TTS 结束后至麦克风就绪之间的短间隙：统一显示聆听中，与表情 onTtsCompleted 一致
         displayText = "🎤 聆听中...";
@@ -1237,31 +1356,8 @@ class _HomeViewState extends State<HomeView> {
 
     // 获取思考时间标签（已简化，不再支持思考时间显示）
     String thinkingLabel = '';
-    final routerDecision = notifier.lastRouterDecision.trim();
-    final plannerPlan = notifier.lastPlannerPlanDisplay.trim();
-    final pes = notifier.planExecutionState;
-    String planExecStatus = '';
-    if (pes == PlanExecutionState.executing &&
-        notifier.planTotalSteps > 0) {
-      planExecStatus =
-          '🧩 Plan: EXECUTING ${notifier.planCurrentStep}/${notifier.planTotalSteps}';
-    } else if (pes == PlanExecutionState.done &&
-        notifier.planTotalSteps > 0) {
-      planExecStatus =
-          '🧩 Plan: DONE ${notifier.planCurrentStep}/${notifier.planTotalSteps}';
-    } else if (pes == PlanExecutionState.done &&
-        notifier.planTotalSteps == 0) {
-      planExecStatus = '🧩 Plan: DONE';
-    } else if (pes == PlanExecutionState.failed) {
-      var err = notifier.planLastError.trim();
-      if (err.length > 160) {
-        err = '${err.substring(0, 160)}…';
-      }
-      final tot = notifier.planTotalSteps;
-      final cur = notifier.planCurrentStep;
-      final frac = tot > 0 ? '$cur/$tot' : '?';
-      planExecStatus = '🧩 Plan: FAILED $frac — $err';
-    }
+    final asrDisplay = notifier.getTextSpeech.trim();
+    const asrIdlePlaceholder = '等待唤醒词...';
 
     // --- 新增：获取手势识别状态 ---
     String gestureStatusLabel = '';
@@ -1354,56 +1450,21 @@ class _HomeViewState extends State<HomeView> {
                 ),
               ),
             ),
-          if (routerDecision.isNotEmpty)
+          if (asrDisplay.isNotEmpty && asrDisplay != asrIdlePlaceholder)
             Container(
               margin: EdgeInsets.only(top: 8),
-              padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              constraints: BoxConstraints(maxWidth: 380),
-              decoration: BoxDecoration(
-                color: Colors.redAccent.withOpacity(0.88),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Text(
-                "🧭 Router: $routerDecision",
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.white,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-          if (planExecStatus.isNotEmpty)
-            Container(
-              margin: EdgeInsets.only(top: 6),
-              padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              constraints: BoxConstraints(maxWidth: 380),
-              decoration: BoxDecoration(
-                color: Colors.amber.shade900.withOpacity(0.92),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Text(
-                planExecStatus,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.white,
-                  fontWeight: FontWeight.w600,
-                  height: 1.25,
-                ),
-              ),
-            ),
-          if (plannerPlan.isNotEmpty)
-            Container(
-              margin: EdgeInsets.only(top: 6),
               padding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
               constraints: BoxConstraints(maxWidth: 380),
               decoration: BoxDecoration(
-                color: Colors.teal.shade800.withOpacity(0.92),
+                color: Colors.blueGrey.shade800.withOpacity(0.92),
                 borderRadius: BorderRadius.circular(10),
               ),
               child: Text(
-                plannerPlan,
+                '🎙️ 识别：$asrDisplay',
+                maxLines: 8,
+                overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: 12,
+                  fontSize: 13,
                   color: Colors.white,
                   fontWeight: FontWeight.w500,
                   height: 1.35,

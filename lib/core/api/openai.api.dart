@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 import 'package:voicegpt/app/constants/app.keys.dart';
@@ -14,9 +15,16 @@ class OpenAI {
 
   /// 默认人格（文本/多模态 system 基底）；结构化对话另见 [generateTextLayered]
   static const String _xiaohangPersona = LlmPromptLayers.systemLayer;
-  static const int _visionImageMaxWidth = 1024;
-  static const int _visionImageTargetBytes = 220 * 1024;
-  static const int _visionBatchMaxImages = 4;
+
+  /// 公网网关对 HTTPS body 限制较严，视觉请求单独收紧体积。
+  static const int _visionImageMaxWidth = 640;
+  static const int _visionImageMinWidth = 384;
+  static const int _visionImageTargetBytes = 95 * 1024;
+  static const int _visionPromptMaxChars = 6000;
+  static const int _visionHistoryTextTurns = 4;
+  static const int _visionBatchMaxImages = 3;
+  /// system 人格全文可能很长，视觉请求单独截断以减小 JSON。
+  static const int _visionSystemMaxChars = 3800;
 
   // 重置对话历史
   void resetConversation() {
@@ -37,7 +45,13 @@ class OpenAI {
   }
 
 
-  // 将图片压缩后再转为 base64，降低公网网关 413 风险
+  String _truncateVisionUserPrompt(String prompt) {
+    final t = prompt.trim();
+    if (t.length <= _visionPromptMaxChars) return t;
+    return '${t.substring(0, _visionPromptMaxChars)}…';
+  }
+
+  /// 强压缩 JPEG 再 base64，降低公网 413 概率。
   Future<String> _imageToBase64(String imagePath) async {
     final originalBytes = await File(imagePath).readAsBytes();
     final decoded = img.decodeImage(originalBytes);
@@ -45,56 +59,75 @@ class OpenAI {
       return base64Encode(originalBytes);
     }
 
-    img.Image working = decoded;
-    if (working.width > _visionImageMaxWidth) {
-      working = img.copyResize(working, width: _visionImageMaxWidth);
+    var maxW = _visionImageMaxWidth;
+    late Uint8List encoded;
+
+    while (maxW >= _visionImageMinWidth) {
+      img.Image working = decoded;
+      if (working.width > maxW) {
+        working = img.copyResize(working, width: maxW);
+      }
+      var quality = 68;
+      encoded = img.encodeJpg(working, quality: quality);
+      while (encoded.length > _visionImageTargetBytes && quality > 38) {
+        quality -= 6;
+        encoded = img.encodeJpg(working, quality: quality);
+      }
+      if (encoded.length <= _visionImageTargetBytes) break;
+      maxW -= 96;
     }
 
-    var quality = 72;
-    var encoded = img.encodeJpg(working, quality: quality);
-    while (encoded.length > _visionImageTargetBytes && quality > 45) {
-      quality -= 7;
-      encoded = img.encodeJpg(working, quality: quality);
+    if (encoded.isEmpty) {
+      return base64Encode(originalBytes);
     }
 
     final ratio = originalBytes.isEmpty
         ? 1.0
         : (originalBytes.length / encoded.length);
     print(
-      '🗜️ [VISION_IMG] $imagePath 原始=${(originalBytes.length / 1024).toStringAsFixed(1)}KB '
-      '压缩=${(encoded.length / 1024).toStringAsFixed(1)}KB q=$quality '
+      '🗜️ [VISION_IMG] $imagePath 原=${(originalBytes.length / 1024).toStringAsFixed(1)}KB '
+      '出=${(encoded.length / 1024).toStringAsFixed(1)}KB maxW=$maxW '
       '缩小=${ratio.toStringAsFixed(2)}x',
     );
     return base64Encode(encoded);
   }
 
-  /*
-  //新！：将图片压缩体积、转换为base64
-  Future<String> _imageToBase64(String imagePath) async {
-    //读取原始图片文件
-    final originalBytes = await File(imagePath).readAsBytes();
-    //解码为图片对象
-    final originalImage = img.decodeImage(originalBytes);
-    if (originalImage == null) {
-      throw Exception('无法解码图片，可能文件损坏或格式不支持');
-    }
-    //设置压缩参数（可根据需要调整）
-    const int maxWidth = 1024;      // 最大宽度，保持长宽比
-    const int quality = 70;         // JPEG 压缩质量 0-100
-    //如果图片宽度超过 maxWidth，则按比例缩小
-    img.Image resizedImage = originalImage;
-    if (originalImage.width > maxWidth) {
-      // copyResize 会保持原图比例，只指定宽度即可
-      resizedImage = img.copyResize(originalImage, width: maxWidth);
-    }
-    //将图片编码为 JPEG 格式并进行压缩
-    final compressedBytes = img.encodeJpg(resizedImage, quality: quality);
-    //打印压缩前后的文件大小，便于观察效果
-    print('📸 图片压缩: 原大小 ${originalBytes.length} 字节 -> 压缩后 ${compressedBytes.length} 字节 '
-        '(缩小 ${(originalBytes.length / compressedBytes.length).toStringAsFixed(1)} 倍)');
-    //返回 base64 编码的字符串
-    return base64Encode(compressedBytes);
-  }*/
+  List<Map<String, dynamic>> _recentTextOnlyHistoryForVision() {
+    final textOnly = _conversationHistory
+        .where((m) => m['content'] is String)
+        .cast<Map<String, dynamic>>()
+        .toList();
+    if (textOnly.length <= _visionHistoryTextTurns) return textOnly;
+    return textOnly.sublist(textOnly.length - _visionHistoryTextTurns);
+  }
+
+  String _visionSystemText() {
+    final s = _xiaohangPersona;
+    if (s.length <= _visionSystemMaxChars) return s;
+    return '${s.substring(0, _visionSystemMaxChars)}…';
+  }
+
+  List<Map<String, dynamic>> _buildVisionRequestMessages(
+    List<Map<String, dynamic>> currentUserContent,
+  ) {
+    return [
+      {
+        'role': 'system',
+        'content': [
+          {'type': 'text', 'text': _visionSystemText()},
+        ],
+      },
+      ..._recentTextOnlyHistoryForVision().map((msg) {
+        return {
+          'role': msg['role'],
+          'content': [
+            {'type': 'text', 'text': msg['content'].toString()},
+          ],
+        };
+      }),
+      {'role': 'user', 'content': currentUserContent},
+    ];
+  }
 
   // 纯文本生成方法
   // [deviceContext] 可选：当前时间、位置、天气等，用于回答「我在哪」「现在几点」「今天天气」等
@@ -257,23 +290,31 @@ class OpenAI {
   // 图像+文本生成方法
   Future<Map<String, dynamic>> generateImageText(
       String prompt, String imagePath) async {
-    // 将图片转换为base64
+    final promptForApi = _truncateVisionUserPrompt(prompt);
     final imageBase64 = await _imageToBase64(imagePath);
 
-    // 创建多模态消息内容
     final content = [
-      {"type": "text", "text": prompt},
+      {"type": "text", "text": promptForApi},
       {
         "type": "image_url",
         "image_url": {"url": "data:image/jpeg;base64,$imageBase64"}
       }
     ];
 
-    // 视觉请求只注入「文本历史 + 当前图片」，避免把历史图片(base64)重复发送触发 413。
-    final messages = _buildMultimodalMessagesWithCurrentUserContent(content);
-
-    // 发送到视觉API
-    return _sendVisionRequest(messages);
+    final messages = _buildVisionRequestMessages(content);
+    final result = await _sendVisionRequest(
+      messages,
+      recordAssistantToHistory: false,
+    );
+    final assistantRaw = result['choices']?[0]?['message']?['content'];
+    final assistantMessage = assistantRaw?.toString() ?? '';
+    final histUser =
+        '[附图] ${promptForApi.length > 400 ? '${promptForApi.substring(0, 400)}…' : promptForApi}';
+    addUserMessage(histUser);
+    if (assistantMessage.isNotEmpty) {
+      addAssistantMessage(assistantMessage);
+    }
+    return result;
   }
 
   // 多图+文本生成方法（单次请求联合分析）
@@ -283,18 +324,18 @@ class OpenAI {
       throw Exception('imagePaths 不能为空');
     }
 
+    final promptForApi = _truncateVisionUserPrompt(prompt);
     final selectedPaths = imagePaths.length > _visionBatchMaxImages
         ? imagePaths.sublist(imagePaths.length - _visionBatchMaxImages)
         : imagePaths;
     if (selectedPaths.length != imagePaths.length) {
       print(
-        '⚠️ [VISION_BATCH] 图片数量 ${imagePaths.length} 超过上限 $_visionBatchMaxImages，'
-        '仅发送最近 ${selectedPaths.length} 张以避免 413',
+        '⚠️ [VISION_BATCH] 共 ${imagePaths.length} 张，仅发送最近 ${selectedPaths.length} 张以控制体积',
       );
     }
 
     final content = <Map<String, dynamic>>[
-      {"type": "text", "text": prompt},
+      {"type": "text", "text": promptForApi},
     ];
     for (final path in selectedPaths) {
       final imageBase64 = await _imageToBase64(path);
@@ -304,9 +345,21 @@ class OpenAI {
       });
     }
 
-    // 批量视觉同样只带当前多图 + 文本历史，避免历史图片累计导致 payload 过大。
-    final messages = _buildMultimodalMessagesWithCurrentUserContent(content);
-    return _sendVisionRequest(messages);
+    final messages = _buildVisionRequestMessages(content);
+    final result = await _sendVisionRequest(
+      messages,
+      recordAssistantToHistory: false,
+    );
+    final assistantRaw = result['choices']?[0]?['message']?['content'];
+    final assistantMessage = assistantRaw?.toString() ?? '';
+    addUserMessage(
+      '[多图附图×${selectedPaths.length}] '
+      '${promptForApi.length > 280 ? '${promptForApi.substring(0, 280)}…' : promptForApi}',
+    );
+    if (assistantMessage.isNotEmpty) {
+      addAssistantMessage(assistantMessage);
+    }
+    return result;
   }
 
   // 构建纯文本消息（优化版）
@@ -338,33 +391,6 @@ class OpenAI {
           .join(" ");
     }
     return content.toString();
-  }
-
-  /// 构建多模态请求：仅保留最近文本历史，不复用历史中的图片内容。
-  List<Map<String, dynamic>> _buildMultimodalMessagesWithCurrentUserContent(
-      List<Map<String, dynamic>> currentUserContent) {
-    final textOnlyTurns = _conversationHistory
-        .where((msg) => msg['content'] is String)
-        .toList();
-    final recent = textOnlyTurns.length > 8
-        ? textOnlyTurns.sublist(textOnlyTurns.length - 8)
-        : textOnlyTurns;
-
-    return [
-      {
-        "role": "system",
-        "content": [
-          {"type": "text", "text": _xiaohangPersona}
-        ]
-      },
-      ...recent.map((msg) => {
-            "role": msg["role"],
-            "content": [
-              {"type": "text", "text": msg["content"].toString()}
-            ]
-          }),
-      {"role": "user", "content": currentUserContent},
-    ];
   }
 
   // 发送文本请求
@@ -422,8 +448,10 @@ class OpenAI {
 
   // 发送视觉请求
   Future<Map<String, dynamic>> _sendVisionRequest(
-      List<Map<String, dynamic>> messages) async {
-    // 截断历史记录（保留最近的10轮对话）
+    List<Map<String, dynamic>> messages, {
+    bool recordAssistantToHistory = true,
+  }) async {
+    // 截断消息条数（system + 若干 user/assistant + 当前多模态 user）
     if (messages.length > 11) {
       messages = [messages[0], ...messages.sublist(messages.length - 10)];
     }
@@ -462,8 +490,9 @@ class OpenAI {
       print('✅ [VISION_API] 调用成功 status=200 preview="$shortPreview"');
       print('════════════════════════════════════════════════════');
 
-      // 添加助手回复到历史
-      addAssistantMessage(assistantMessage);
+      if (recordAssistantToHistory && assistantMessage.toString().isNotEmpty) {
+        addAssistantMessage(assistantMessage.toString());
+      }
 
       return responseData;
     } else {

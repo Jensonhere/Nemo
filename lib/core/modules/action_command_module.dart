@@ -134,6 +134,39 @@ class ActionCommandModule {
       return _ActionCommandInfo(ActionType.stop, 0);
     }
 
+    // 队列口令「向后转」= 原地调头 180°，勿与直线「向后」混淆（须在泛匹配「向后」之前）
+    if (_containsAny(lowerInput, ['向后转', '向后转体', '后转'])) {
+      return _ActionCommandInfo(ActionType.turnRight, 180);
+    }
+
+    // 朝用户靠近 → 直线前进（与 Router / motion_gate 口语一致）
+    if (_containsAny(lowerInput, [
+      '向我靠近',
+      '朝我靠近',
+      '靠近我',
+      '离我近',
+      '凑近一点',
+      '凑近些',
+      '靠近一点',
+      '靠近一些',
+    ])) {
+      final distance = _parseLinearDistanceMm(
+        userInput,
+        const [
+          '向我靠近',
+          '朝我靠近',
+          '靠近我',
+          '离我近',
+          '凑近一点',
+          '凑近些',
+          '靠近一点',
+          '靠近一些',
+        ],
+        fallbackMm: 280,
+      );
+      return _ActionCommandInfo(ActionType.forward, distance);
+    }
+
     // 前进指令（距离须跟在动词后解析，避免句首日期等抢先匹配）
     if (_containsAny(lowerInput, ['前进', '向前', '往前', '前走', '直行', '前行'])) {
       final distance = _parseLinearDistanceMm(
@@ -210,7 +243,15 @@ class ActionCommandModule {
 
   _ActionCommandInfo? _tryParseSpinTurn(String raw) {
     final t = _asciiDigitsFromFullwidth(raw).toLowerCase();
-    final hasSpinVerb = _containsAny(t, ['旋转', '转动', '自转', '转圈', '转一圈', '原地转']);
+    final hasSpinVerb = _containsAny(t, [
+      '旋转',
+      '转动',
+      '自转',
+      '转圈',
+      '转一圈',
+      '转个圈',
+      '原地转',
+    ]);
     final hasCircle = _containsAny(t, ['一圈', '一周', '圈', '周', '360']);
     if (!hasSpinVerb && !hasCircle) return null;
 

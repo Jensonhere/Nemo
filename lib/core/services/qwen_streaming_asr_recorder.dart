@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:mic_stream/mic_stream.dart';
+import 'package:voicegpt/core/debug/conversation_flow_tracer.dart';
 import 'package:voicegpt/core/services/qwen_cloud_asr_client.dart';
 
 /// 使用麦克风按 0.5s PCM 块调用 Qwen 流式 ASR；静音结束句子时 [onUtteranceFinal]。
@@ -17,6 +18,8 @@ class QwenStreamingAsrRecorder {
     this.androidVoipEchoCapture = false,
     this.isTtsPlaying,
     this.onSpeechDuringTtsBargeIn,
+    this.silenceAutoFinalize = true,
+    this.maxListenMsOverride,
   });
 
   final QwenCloudAsrClient client;
@@ -30,6 +33,12 @@ class QwenStreamingAsrRecorder {
   /// TTS 播放中检测到用户抢话时回调（应异步停 TTS，勿在 PCM 线程内阻塞）。
   final void Function()? onSpeechDuringTtsBargeIn;
 
+  /// 为 false 时不在静音后自动定稿，仅 [finalizeUtteranceForPushToTalk] 松手定稿（多人按住说话）。
+  final bool silenceAutoFinalize;
+
+  /// 非空则替代 [_maxListenMs] 作为超长兜底（秒级按住仍须能结束）。
+  final int? maxListenMsOverride;
+
   static const int sampleRate = 16000;
   /// 0.5s × 16000 × 2 bytes
   static const int chunkBytes = 16000;
@@ -38,7 +47,8 @@ class QwenStreamingAsrRecorder {
   static const double _rmsSilence = 450;
   static const int _silenceEndMs = 1300;
   static const int _minSpeechBeforeEndMs = 350;
-  static const int _maxListenMs = 45000;
+  /// 必须 **小于** 连续对话 30s 超时，否则 VAD 迟迟不定稿时会先被会话超时踢出，用户体感「说了不回复」。
+  static const int _maxListenMs = 22000;
   // 轻量前端增强：近场低音量时抬升语音能量（不依赖 native 音频特效）
   static const double _targetRms = 2200;
   static const double _maxAutoGain = 3.2;
@@ -123,22 +133,27 @@ class QwenStreamingAsrRecorder {
     } else if (rms <= _rmsSilence) {
       _silenceMs += ms;
     } else {
-      _silenceMs = 0;
+      // 灰区 (_rmsSilence, _rmsSpeech)：与强静音一样按整段 ms 计入句尾静音，避免底噪长期卡在中间带导致永不定稿。
+      _silenceMs += ms;
     }
 
     _buf.addAll(enhanced);
 
-    final shouldEnd = _speechSeen &&
+    final maxCap = maxListenMsOverride ?? _maxListenMs;
+    final shouldEnd = silenceAutoFinalize &&
+        _speechSeen &&
         _speechMs >= _minSpeechBeforeEndMs &&
         _silenceMs >= _silenceEndMs;
-    final hitMax = _totalMs >= _maxListenMs;
+    final hitMax = _totalMs >= maxCap;
 
     _asyncTail = _asyncTail
         .then((_) => _flushChunksIfNeeded())
         .then((_) {
           if (_emittedFinal) return Future<void>.value();
           if (shouldEnd || hitMax) {
-            return _finishUtterance();
+            return _finishUtterance(
+              forcedByMaxListen: hitMax && !shouldEnd,
+            );
           }
           return Future<void>.value();
         })
@@ -253,8 +268,13 @@ class QwenStreamingAsrRecorder {
     }
   }
 
-  Future<void> _finishUtterance() async {
+  Future<void> _finishUtterance({bool forcedByMaxListen = false}) async {
     if (_emittedFinal) return;
+    ConversationFlowTracer.asr(
+      forcedByMaxListen
+          ? 'qwen_asr_finish_BEGIN forcedMaxListen totalMs=$_totalMs cap=$_maxListenMs'
+          : '_finishUtterance_begin',
+    );
     _emittedFinal = true;
 
     final sid = _sessionId;
@@ -263,8 +283,14 @@ class QwenStreamingAsrRecorder {
     await _micSub?.cancel();
     _micSub = null;
 
-    if (sid == null) return;
+    // 必须通知上层「本轮听写已结束」，即使服务端 text 为空；否则外层仍认为 _isListening==true
+    // 而麦克风流已取消，后续 startVoiceRecognition 会误判「已在运行」永远无法重开麦。
+    if (sid == null) {
+      onUtteranceFinal('');
+      return;
+    }
 
+    var text = '';
     try {
       if (_buf.isNotEmpty) {
         final rest = Uint8List.fromList(_buf);
@@ -281,13 +307,15 @@ class QwenStreamingAsrRecorder {
       }
 
       final fin = await client.finishSession(sid);
-      final text = fin['text']?.toString().trim() ?? '';
-      if (text.isNotEmpty) {
-        onUtteranceFinal(text);
-      }
+      text = fin['text']?.toString().trim() ?? '';
     } catch (e, st) {
       print('❌ Qwen ASR finish 失败: $e\n$st');
+      text = '';
     }
+    ConversationFlowTracer.asr(
+      '_finishUtterance_callback textLen=${text.length}',
+    );
+    onUtteranceFinal(text);
   }
 
   /// 外部停止（超时退出对话等）：结束会话，不触发 [onUtteranceFinal]。
@@ -310,7 +338,20 @@ class QwenStreamingAsrRecorder {
     }
   }
 
+  /// 多人场景「按住说话」松手：不等待静音超时，串行 flush 后定稿并触发 [onUtteranceFinal]。
+  Future<void> finalizeUtteranceForPushToTalk() async {
+    _asyncTail = _asyncTail.then((_) async {
+      if (_emittedFinal) return;
+      await _flushChunksIfNeeded();
+      if (!_emittedFinal) {
+        await _finishUtterance();
+      }
+    });
+    await _asyncTail;
+  }
+
   Future<void> _abortMicOnly() async {
+    ConversationFlowTracer.asr('_abortMicOnly chunk_error_mic_stopped');
     _emittedFinal = true;
     _sessionId = null;
     await _micSub?.cancel();

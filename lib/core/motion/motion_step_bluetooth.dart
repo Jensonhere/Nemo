@@ -5,9 +5,13 @@ class MotionStepBluetooth {
   MotionStepBluetooth._();
 
   /// 与 Router「单轴 B 类」对齐：仅四向/直线短指令时走 motion_step 快路径。
+  ///
+  /// 须覆盖 ASR 口语（儿化、靠近我）等，否则 Router 已给出 [motion_step] 仍会被会话层拒执行。
   static bool isSimpleCardinalMotionQuery(String raw) {
-    final s = raw.replaceAll(RegExp(r'\s+'), '');
+    var s = raw.replaceAll(RegExp(r'\s+'), '');
     if (s.isEmpty) return false;
+    // 儿化音：「转一圈儿」与「转一圈」等价，便于子串命中
+    s = s.replaceAll('转一圈儿', '转一圈').replaceAll('转个圈儿', '转个圈');
     const keys = [
       '向前',
       '向后',
@@ -24,6 +28,19 @@ class MotionStepBluetooth {
       '左拐',
       '右拐',
       '直行',
+      // 朝用户靠近（Router 常映射为前进）
+      '向我靠近',
+      '朝我靠近',
+      '靠近我',
+      '离我近',
+      '凑近',
+      '过来一点',
+      // 原地转圈（Router 常映射为左转/右转 360）
+      '转一圈',
+      '转个圈',
+      '转圈',
+      '旋转',
+      '原地转',
     ];
     return keys.any(s.contains);
   }

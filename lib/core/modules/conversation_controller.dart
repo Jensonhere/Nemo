@@ -25,6 +25,7 @@ import 'package:voicegpt/core/utils/input_language_gate.dart';
 import 'package:voicegpt/core/services/camera_resource_manager.dart'
     show CameraTaskPriority;
 import 'package:voicegpt/core/config/debug_runtime_flags.dart';
+import 'package:voicegpt/core/debug/conversation_flow_tracer.dart';
 
 /// 连续对话控制器
 /// 统一管理连续对话模式的主流程，协调各个功能模块
@@ -260,7 +261,19 @@ class ConversationController extends ChangeNotifier {
   }
 
   /// TTS 播放期间 Sherpa KWS 命中后调用；随后 `_speakText` 的 `finally` 会拉起主 ASR。
+  /// 多人模式底部按住说话触发的 TTS 打断（与 Sherpa/VAD 打断区分）。
+  static const String kTtsInterruptKeywordMultiPersonPtt = 'multi_person_ptt';
+
   Future<void> interruptConversationTtsFromKws(String keyword) async {
+    try {
+      final sn = _speechNotifier;
+      if (sn != null && sn.skipAutoVoiceRecognitionInConversation == true) {
+        if (keyword != kTtsInterruptKeywordMultiPersonPtt) {
+          print('🛑 [TTS打断] 多人按住说话模式，已禁用 (keyword=$keyword)');
+          return;
+        }
+      }
+    } catch (_) {}
     if (!_isTtsPlaying) {
       print("🛑 [TTS打断] 跳过：当前未在播放 TTS (keyword=$keyword)");
       return;
@@ -274,6 +287,11 @@ class ConversationController extends ChangeNotifier {
       print(
           "🛑 [TTS打断] 执行 stop() keyword=$keyword inConversation=$_isInConversationMode");
       await _ttsService.stop();
+      if (keyword == kTtsInterruptKeywordMultiPersonPtt && _isInConversationMode) {
+        _isTtsPlaying = false;
+        notifyListeners();
+        _notifySpeechUi();
+      }
     } catch (e) {
       print("❌ [TTS打断] stop 失败: $e");
     } finally {
@@ -352,26 +370,39 @@ class ConversationController extends ChangeNotifier {
   /// 处理用户输入
   Future<void> processUserInput(String userInput) async {
     if (!_isInConversationMode) {
+      ConversationFlowTracer.orphan(
+        'processUserInput_IGNORED not_in_conversation_mode',
+      );
       print("⚠️ 不在连续对话模式，忽略用户输入");
       return;
     }
 
     if (_isImmediateStopCommand(userInput)) {
+      ConversationFlowTracer.orphan('processUserInput immediate_stop_command');
       await _handleImmediateStopCommand(userInput);
       return;
     }
 
     if (_isProcessingUserInput && _isComplexTaskExecuting) {
+      ConversationFlowTracer.orphan(
+        'processUserInput interrupt_complex_task_for_new_input',
+      );
       await _interruptComplexTaskForNewInput(userInput);
     }
 
     if (_isProcessingUserInput) {
+      ConversationFlowTracer.orphan(
+        'processUserInput_IGNORED already_processing',
+      );
       print("⏳ 正在处理用户输入，忽略新输入");
       return;
     }
 
     // 单字环境 ASR 噪声：视为未输入——不占处理位、不记轮次、不取消 30s 计时器、不播「没听清」。
     if (isSingleHanAsrNoise(userInput)) {
+      ConversationFlowTracer.orphan(
+        'processUserInput_IGNORED single_han_noise="${userInput.trim()}"',
+      );
       print('🔇 环境噪声单字已忽略: ${userInput.trim()}');
       return;
     }
@@ -386,15 +417,18 @@ class ConversationController extends ChangeNotifier {
     _lastUserInput = userInput;
     _recordContinuousInput(userInput);
 
+    ConversationFlowTracer.beginTurn(userInput);
     final turnSw = Stopwatch()..start();
     try {
       if (_shouldForceExitForContinuousInput()) {
+        ConversationFlowTracer.step('safety_exit_continuous_input');
         await _handleContinuousInputSafetyExit();
         return;
       }
 
       // 检查是否为退出指令：先走一轮温暖告别，再退出
       if (_isExitCommand(userInput)) {
+        ConversationFlowTracer.step('exit_command_matched');
         await _handleExitIntent(userInput);
         return;
       }
@@ -403,6 +437,7 @@ class ConversationController extends ChangeNotifier {
 
       // 取消当前的30秒计时器（用户开始说话，暂停计时）
       _conversationTimeoutTimer?.cancel();
+      ConversationFlowTracer.step('timeout30_cancelled_will_restart_after_tts');
       print("🔄 收到用户输入，取消超时计时器（计时将在TTS完成后重新启动）");
 
       if (_isLikelyInvalidInput(userInput)) {
@@ -410,6 +445,7 @@ class ConversationController extends ChangeNotifier {
           '🔕 一级路由：无效输入，不走大模型: '
           '${userInput.trim().length <= 2 ? userInput.trim() : "…"}',
         );
+        ConversationFlowTracer.step('invalid_input_short_reply');
         await _speakText(
           "没听清，您再说一遍？",
           ttsExpression: TtsAlignedExpression.textChatSpeaking,
@@ -421,6 +457,10 @@ class ConversationController extends ChangeNotifier {
 
       if (_forceEnglishTeachingMode ||
           InputLanguageGate.isEnglishTeachingScene(userInput)) {
+        ConversationFlowTracer.step(
+          'branch_english_teaching',
+          'force=$_forceEnglishTeachingMode',
+        );
         print(
           _forceEnglishTeachingMode
               ? '🌐 强制英文教学模式：锁定英语教学场景（跳过意图链路）'
@@ -434,7 +474,9 @@ class ConversationController extends ChangeNotifier {
         return;
       }
 
+      ConversationFlowTracer.step('router_context_pack_begin');
       final routerPack = await _buildRouterContextPack(userInput);
+      ConversationFlowTracer.step('router_llm_route_begin');
       final routerDecision = await _llmRouter.route(
         userInput: userInput,
         contextPack: routerPack,
@@ -442,12 +484,20 @@ class ConversationController extends ChangeNotifier {
       );
       _lastRouterDecision = routerDecision.rawJson;
       _lastPlannerPlanDisplay = '';
+      final rj = routerDecision.rawJson;
+      final rjShort = rj.length > 160 ? '${rj.substring(0, 160)}…' : rj;
+      ConversationFlowTracer.step(
+        'router_done',
+        'scene=${routerDecision.scene} complexity=${routerDecision.complexity} '
+        'needTools=${routerDecision.needTools} raw=$rjShort',
+      );
       print('🧭 [Router] $_lastRouterDecision');
       _notifySpeechUi();
       notifyListeners();
 
       if (routerDecision.scene == RouterScene.agent &&
           routerDecision.complexity == RouterComplexity.c) {
+        ConversationFlowTracer.step('branch_planner_agent_c');
         _isComplexTaskExecuting = true;
         _notifySpeechUi();
         notifyListeners();
@@ -458,12 +508,18 @@ class ConversationController extends ChangeNotifier {
           _notifySpeechUi();
           notifyListeners();
         }
+        ConversationFlowTracer.step('branch_planner_agent_c_return');
         return;
       }
 
       if (!routerDecision.needTools) {
+        ConversationFlowTracer.step('branch_router_no_tools');
         final directReply = routerDecision.dialogueReply.trim();
         if (directReply.isNotEmpty) {
+          ConversationFlowTracer.step(
+            'router_direct_reply_tts',
+            'len=${directReply.length}',
+          );
           await _speakText(
             directReply,
             ttsExpression: TtsAlignedExpression.textChatSpeaking,
@@ -471,8 +527,10 @@ class ConversationController extends ChangeNotifier {
           );
           _textQAModule.recordRouterDirectTurn(userInput, directReply);
         } else if (routerDecision.scene == RouterScene.companion) {
+          ConversationFlowTracer.step('router_fallback_textqa', 'comfort');
           await _handleTextQA(userInput, sceneIntent: IntentType.comfort);
         } else {
+          ConversationFlowTracer.step('router_fallback_textqa', 'dialogue');
           await _handleTextQA(userInput, sceneIntent: IntentType.dialogue);
         }
         return;
@@ -487,33 +545,43 @@ class ConversationController extends ChangeNotifier {
       }
 
       if (await _tryExecuteRouterMotionStep(routerDecision, userInput)) {
+        ConversationFlowTracer.step('branch_router_motion_done');
         return;
       }
 
       if (routerDecision.needTools &&
           routerDecision.scene == RouterScene.visionVlm &&
           routerDecision.complexity == RouterComplexity.b) {
+        ConversationFlowTracer.step('branch_vision_vlm_b_skip_bert');
         print('📷 [Router] VisionVlm+B → 图像分析（跳过 BERT 意图）');
         await _handleImageAnalysis(userInput);
         return;
       }
 
       // 意图识别
+      ConversationFlowTracer.step('intent_bert_begin');
       final intentSw = Stopwatch()..start();
       final intentResult = await _intentModule.predictIntent(userInput);
       intentSw.stop();
+      ConversationFlowTracer.step(
+        'intent_bert_done',
+        '${intentSw.elapsedMilliseconds}ms valid=${intentResult.isValid} '
+        'label=${intentResult.intent}',
+      );
       print(
         '⏱️ [ConvStage][意图识别] ${intentSw.elapsedMilliseconds}ms → $intentResult',
       );
 
       if (!intentResult.isValid) {
         // 意图识别置信度低，默认进入文本问答（普通问答场景）
+        ConversationFlowTracer.step('intent_low_confidence_textqa_dialogue');
         print("⚠️ 意图识别置信度低，进入文本问答模式");
         await _handleTextQA(userInput, sceneIntent: IntentType.dialogue);
         return;
       }
 
       // 根据意图分发到不同模块（六类 + unknown，与 BERT 标签一致）
+      ConversationFlowTracer.step('intent_dispatch', '${intentResult.intent}');
       switch (intentResult.intent) {
         case IntentType.comfort:
           await _handleEmotionRecognition(userInput);
@@ -543,8 +611,9 @@ class ConversationController extends ChangeNotifier {
           await _handleTextQA(userInput, sceneIntent: IntentType.unknown);
           break;
       }
-    } catch (e) {
-      print("❌ 处理用户输入失败: $e");
+    } catch (e, st) {
+      ConversationFlowTracer.step('processUserInput_catch', '$e');
+      print("❌ 处理用户输入失败: $e\n$st");
       await _speakText(
         "抱歉，我现在无法处理您的请求，请重试",
         ttsExpression: TtsAlignedExpression.textChatSpeaking,
@@ -559,6 +628,9 @@ class ConversationController extends ChangeNotifier {
       _lastInteractionTime = DateTime.now();
       _isComplexTaskExecuting = false;
       _isProcessingUserInput = false;
+      ConversationFlowTracer.endTurn(
+        'procUserInput_finally elapsedMs=${turnSw.elapsedMilliseconds}ms',
+      );
       _notifySpeechUi();
       notifyListeners();
     }
@@ -1041,6 +1113,7 @@ class ConversationController extends ChangeNotifier {
 
   /// 处理图片分析
   Future<void> _handleImageAnalysis(String userInput) async {
+    ConversationFlowTracer.step('image_analysis_enter');
     print("📷 进入图片分析模块");
 
     try {
@@ -1064,6 +1137,7 @@ class ConversationController extends ChangeNotifier {
         );
       }
     } catch (e) {
+      ConversationFlowTracer.step('image_analysis_catch', '$e');
       print("❌ 图片分析处理失败: $e");
       await _speakText(
         "图片分析遇到问题，请重试",
@@ -1112,6 +1186,10 @@ class ConversationController extends ChangeNotifier {
     IntentType sceneIntent = IntentType.dialogue,
     bool englishTeachingScene = false,
   }) async {
+    ConversationFlowTracer.step(
+      'textqa_enter',
+      'scene=$sceneIntent english=$englishTeachingScene',
+    );
     print(
       "💬 进入文本问答模块 scene=$sceneIntent "
       'englishTeaching=$englishTeachingScene',
@@ -1265,18 +1343,26 @@ class ConversationController extends ChangeNotifier {
         }
         // 流式播报已结束：与 [_speakText] 一致，先切聆听脸再起麦，降低「思考中」卡死感
         _isProcessingUserInput = false;
+        ConversationFlowTracer.step(
+          'textqa_stream_path_processing_cleared',
+          'before_onTtsCompleted_and_startAsr',
+        );
         _notifySpeechUi();
         if (_isInConversationMode) {
           _uiModule.onTtsCompleted();
           try {
+            ConversationFlowTracer.step('textqa_stream_startAsr_try');
             await _startVoiceRecognition();
+            ConversationFlowTracer.step('textqa_stream_startAsr_ok');
           } catch (e, st) {
             print("⚠️ 流式后启动语音识别失败，将重试: $e\n$st");
             await Future<void>.delayed(const Duration(milliseconds: 300));
             try {
               await _startVoiceRecognition();
+              ConversationFlowTracer.step('textqa_stream_startAsr_ok_retry');
             } catch (e2, st2) {
               print("❌ 流式后语音识别二次启动仍失败: $e2\n$st2");
+              ConversationFlowTracer.step('textqa_stream_startAsr_fail', '$e2');
             }
           }
           _startConversationTimeout();
@@ -1418,6 +1504,11 @@ class ConversationController extends ChangeNotifier {
   }) async {
     if (text.isEmpty) return;
 
+    ConversationFlowTracer.step(
+      'tts_speak_enter',
+      'len=${text.length} transitionListen=$transitionToListeningAfterTts '
+      'inConvo=$_isInConversationMode',
+    );
     _isTtsPlaying = true;
     notifyListeners();
 
@@ -1426,6 +1517,7 @@ class ConversationController extends ChangeNotifier {
 
       // 勿用英文常用词做子串过滤（如 chat/message/content/model），否则正常英文回复会被整段跳过
       if (_shouldSkipTtsAsLikelyDebug(text)) {
+        ConversationFlowTracer.step('tts_skipped_debug_snippet');
         print("⚠️ 检测到可能的调试信息，跳过播报: $text");
         return;
       }
@@ -1467,18 +1559,24 @@ class ConversationController extends ChangeNotifier {
         _notifySpeechUi();
 
         print("🎙️ TTS播放完成，启动语音识别监听");
+        ConversationFlowTracer.step('tts_finally_before_startAsr');
         try {
           await _startVoiceRecognition();
+          ConversationFlowTracer.step('tts_finally_after_startAsr_ok');
         } catch (e, st) {
           print("⚠️ 启动语音识别失败，300ms 后重试一次: $e\n$st");
+          ConversationFlowTracer.step('tts_startAsr_fail_retry', '$e');
           await Future<void>.delayed(const Duration(milliseconds: 300));
           try {
             await _startVoiceRecognition();
+            ConversationFlowTracer.step('tts_finally_after_startAsr_ok_retry');
           } catch (e2, st2) {
             print("❌ 语音识别二次启动仍失败: $e2\n$st2");
+            ConversationFlowTracer.step('tts_startAsr_fail_final', '$e2');
           }
         }
         print("⏰ TTS播放完成，现在启动30秒超时计时器");
+        ConversationFlowTracer.step('tts_finally_arm_timeout30');
         _startConversationTimeout();
       } else {
         _isTtsPlaying = false;
@@ -1497,6 +1595,7 @@ class ConversationController extends ChangeNotifier {
   Future<void> _startVoiceRecognition() async {
     try {
       print("🎙️ 启动语音识别监听");
+      ConversationFlowTracer.step('_startVoiceRecognition_delegate');
 
       if (_speechNotifier != null &&
           _speechNotifier.startVoiceRecognition != null) {
@@ -1514,6 +1613,9 @@ class ConversationController extends ChangeNotifier {
   /// 停止语音识别
   Future<void> _stopVoiceRecognition({bool resumeSherpaKws = true}) async {
     try {
+      ConversationFlowTracer.orphan(
+        '_stopVoiceRecognition resumeSherpaKws=$resumeSherpaKws',
+      );
       if (_speechNotifier != null &&
           _speechNotifier.stopVoiceRecognition != null) {
         await _speechNotifier.stopVoiceRecognition(
@@ -1542,22 +1644,32 @@ class ConversationController extends ChangeNotifier {
 
     // 修复：确保只在TTS播放完成且在对话模式中才启动计时器
     if (_isTtsPlaying) {
+      ConversationFlowTracer.orphan(
+        'timeout30_arm_skipped ttsStillPlaying=true',
+      );
       print("🔊 TTS播放中，延迟启动超时计时器");
       return;
     }
 
     if (!_isInConversationMode) {
+      ConversationFlowTracer.orphan(
+        'timeout30_arm_skipped notInConversationMode',
+      );
       print("⚠️ 不在连续对话模式，不启动超时计时器");
       return;
     }
 
     _conversationTimeoutTimer = Timer(_conversationTimeout, () {
+      ConversationFlowTracer.orphan(
+        'timeout30_FIRED -> _exitConversationMode',
+      );
       print("⏰ 连续对话30秒超时，自动退出");
       _exitConversationMode().catchError((Object e, StackTrace st) {
         print("❌ 超时退出对话异常: $e\n$st");
       });
     });
 
+    ConversationFlowTracer.orphan('timeout30_timer_ARMED');
     print("⏰ 30秒超时计时器已启动（TTS播放完成后）");
   }
 
@@ -1758,6 +1870,9 @@ class ConversationController extends ChangeNotifier {
   Future<void> _exitConversationMode({bool speakExitLine = true}) async {
     if (!_isInConversationMode) return;
 
+    ConversationFlowTracer.orphan(
+      '_exitConversationMode_BEGIN speakExitLine=$speakExitLine',
+    );
     print("🚪 退出连续对话模式");
     _isInConversationMode = false;
     _isProcessingUserInput = false;

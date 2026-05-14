@@ -15,6 +15,7 @@ import 'package:voicegpt/core/modules/ui_animation_module.dart';
 import 'package:voicegpt/core/services/qwen_cloud_asr_client.dart';
 import 'package:voicegpt/core/services/qwen_streaming_asr_recorder.dart';
 import 'package:voicegpt/core/config/debug_runtime_flags.dart';
+import 'package:voicegpt/core/debug/conversation_flow_tracer.dart';
 
 /// 简化的语音通知器
 /// 只保留核心基础功能：唤醒词检测、环境监测、手势识别基础功能
@@ -79,6 +80,23 @@ class SpeechNotifierSimplified with ChangeNotifier {
   /// 连续对话里 TTS 结束后拉起主 ASR 的短窗口：此时 isListening 仍为 false，但不应显示「思考中/已暂停」。
   bool get isStartingVoiceRecognition => _isStartingVoiceRecognition;
   bool get isReadyToSend => false;
+
+  /// 多人对话：按住说话模式（右上角开关）。开启且已在连续对话中时，关闭连续聆听与 TTS 可打断。
+  bool _multiPersonPushToTalkMode = false;
+  bool _pttRecordingActive = false;
+  /// 手指是否在按住 PTT 区域（与是否已真正开麦区分，避免「点一下异步晚到」卡在录音态）。
+  bool _pttFingerPressed = false;
+  /// 每次按下 / 抬起递增，用于取消未到阈值的「假按下」与在途异步开麦。
+  int _pttHoldGeneration = 0;
+
+  bool get isMultiPersonPushToTalkMode => _multiPersonPushToTalkMode;
+  bool get isPttRecordingHold => _pttRecordingActive;
+  bool get isPttFingerPressed => _pttFingerPressed;
+
+  /// 供 [ConversationController]：此模式下不自动 `startVoiceRecognition`。
+  bool get skipAutoVoiceRecognitionInConversation =>
+      _multiPersonPushToTalkMode && _conversationController.isInConversationMode;
+
   bool get isEnvironmentMonitoring =>
       _conversationController.isEnvironmentMonitoring;
   bool get isGestureRecognitionActive => _isGestureRecognitionActive;
@@ -165,6 +183,214 @@ class SpeechNotifierSimplified with ChangeNotifier {
     notifyListeners();
   }
 
+  /// 右上角「多人对话」开关：开启后仅能通过底部按住说话发语音，TTS 期间不可打断，播完不再自动聆听。
+  Future<void> setMultiPersonPushToTalkMode(bool enabled) async {
+    if (_multiPersonPushToTalkMode == enabled) return;
+    if (!enabled) {
+      _pttHoldGeneration++;
+      _pttFingerPressed = false;
+      if (_pttRecordingActive) {
+        try {
+          await _qwenAsrRecorder?.stopWithoutSubmit();
+        } catch (_) {}
+        _qwenAsrRecorder = null;
+        _listeningViaQwen = false;
+        _pttRecordingActive = false;
+        _isListening = false;
+      }
+    }
+    _multiPersonPushToTalkMode = enabled;
+    if (enabled) {
+      _duplexTtsBargeInEnabled = false;
+      if (_conversationController.isInConversationMode) {
+        try {
+          await stopVoiceRecognition(resumeSherpaKws: false);
+        } catch (_) {}
+      }
+    } else if (_conversationController.isInConversationMode) {
+      try {
+        await startVoiceRecognition();
+      } catch (_) {}
+    }
+    notifyListeners();
+  }
+
+  /// 按住超过该时长才开麦，避免「点一下」误进录音；与微信发语音类似。
+  static const Duration _pttHoldBeforeRecord = Duration(milliseconds: 140);
+
+  /// 底部按住说话：按下后需持续按住 [_pttHoldBeforeRecord] 才真正开麦。
+  Future<void> multiPersonPttTouchDown() async {
+    if (!_multiPersonPushToTalkMode ||
+        !_conversationController.isInConversationMode) {
+      return;
+    }
+    if (_pttRecordingActive) return;
+    // 流式/整段问答期间 isProcessingUserInput 常为 true，但播报中必须允许按住打断 TTS。
+    if (_conversationController.isProcessingUserInput &&
+        !_conversationController.isTtsPlaying) {
+      return;
+    }
+
+    _pttFingerPressed = true;
+    notifyListeners();
+
+    final arm = ++_pttHoldGeneration;
+    try {
+      await Future<void>.delayed(_pttHoldBeforeRecord);
+      if (arm != _pttHoldGeneration) {
+        _pttFingerPressed = false;
+        notifyListeners();
+        return;
+      }
+      if (!_multiPersonPushToTalkMode ||
+          !_conversationController.isInConversationMode) {
+        _pttFingerPressed = false;
+        notifyListeners();
+        return;
+      }
+      if (_conversationController.isProcessingUserInput &&
+          !_conversationController.isTtsPlaying) {
+        _pttFingerPressed = false;
+        notifyListeners();
+        return;
+      }
+
+      ConversationFlowTracer.asr('ptt_hold_threshold_met');
+      if (_conversationController.isTtsPlaying) {
+        ConversationFlowTracer.asr('ptt_interrupt_tts_for_hold');
+        await _conversationController.interruptConversationTtsFromKws(
+          ConversationController.kTtsInterruptKeywordMultiPersonPtt,
+        );
+        if (arm != _pttHoldGeneration) {
+          _pttFingerPressed = false;
+          notifyListeners();
+          return;
+        }
+      }
+
+      if (_isListening) await stopVoiceRecognition(resumeSherpaKws: false);
+      if (arm != _pttHoldGeneration) {
+        _pttFingerPressed = false;
+        notifyListeners();
+        return;
+      }
+
+      _isStartingVoiceRecognition = true;
+      final qwenClient = QwenCloudAsrClient();
+      final qwenUp = await qwenClient.healthz();
+      if (arm != _pttHoldGeneration) {
+        _pttFingerPressed = false;
+        notifyListeners();
+        return;
+      }
+      if (!qwenUp) {
+        print('⚠️ [PTT] Qwen ASR 不可达，无法按住说话');
+        _speechText = '语音服务不可用';
+        _pttFingerPressed = false;
+        notifyListeners();
+        return;
+      }
+      _sherpaKws?.setTtsBargeInVadEnabled(false);
+      await _sherpaKws?.pause();
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      if (arm != _pttHoldGeneration) {
+        _pttFingerPressed = false;
+        notifyListeners();
+        return;
+      }
+
+      _qwenAsrRecorder = QwenStreamingAsrRecorder(
+        client: qwenClient,
+        onPartialText: (String t) {
+          _speechText = t;
+          notifyListeners();
+        },
+        onUtteranceFinal: (String t) {
+          final s = t.trim();
+          ConversationFlowTracer.asr(
+            'ptt_onUtteranceFinal len=${t.length} empty=${s.isEmpty}',
+          );
+          _pttRecordingActive = false;
+          _pttFingerPressed = false;
+          _qwenAsrRecorder = null;
+          _listeningViaQwen = false;
+          _isListening = false;
+          _duplexTtsBargeInEnabled = false;
+          notifyListeners();
+          if (s.isNotEmpty) {
+            unawaited(_processUserInput(s));
+          } else if (!_multiPersonPushToTalkMode) {
+            _scheduleRestartAsrIfConversationIdle();
+          }
+        },
+        androidVoipEchoCapture: _sherpaUseVoipMic,
+        isTtsPlaying: () => false,
+        onSpeechDuringTtsBargeIn: null,
+        silenceAutoFinalize: false,
+        maxListenMsOverride: 180000,
+      );
+      await _qwenAsrRecorder!.start();
+      if (arm != _pttHoldGeneration) {
+        try {
+          await _qwenAsrRecorder?.stopWithoutSubmit();
+        } catch (_) {}
+        _qwenAsrRecorder = null;
+        _listeningViaQwen = false;
+        _isListening = false;
+        _pttFingerPressed = false;
+        notifyListeners();
+        return;
+      }
+      _listeningViaQwen = true;
+      _isListening = true;
+      _pttRecordingActive = true;
+      _duplexTtsBargeInEnabled = false;
+      _uiModule.showConversationListeningFace();
+      notifyListeners();
+      print('✅ [PTT] 已开始录音');
+    } catch (e, st) {
+      print('❌ [PTT] 启动录音失败: $e\n$st');
+      _pttRecordingActive = false;
+      _qwenAsrRecorder = null;
+      _listeningViaQwen = false;
+      _isListening = false;
+      _pttFingerPressed = false;
+      notifyListeners();
+    } finally {
+      _isStartingVoiceRecognition = false;
+    }
+  }
+
+  /// 底部按住说话：松手定稿并送大模型；若在「按住阈值」内松开则取消开麦。
+  Future<void> multiPersonPttTouchUp() async {
+    if (!_pttFingerPressed && !_pttRecordingActive) {
+      return;
+    }
+    _pttHoldGeneration++;
+    final wasRecording = _pttRecordingActive;
+    _pttFingerPressed = false;
+    notifyListeners();
+
+    if (!wasRecording) {
+      ConversationFlowTracer.asr('ptt_touch_up_before_record_cancel');
+      return;
+    }
+    ConversationFlowTracer.asr('ptt_touch_up_finalize');
+    try {
+      await _qwenAsrRecorder?.finalizeUtteranceForPushToTalk();
+    } catch (e, st) {
+      print('❌ [PTT] 定稿失败: $e\n$st');
+      try {
+        await _qwenAsrRecorder?.stopWithoutSubmit();
+      } catch (_) {}
+      _pttRecordingActive = false;
+      _qwenAsrRecorder = null;
+      _listeningViaQwen = false;
+      _isListening = false;
+      notifyListeners();
+    }
+  }
+
   /// 设置界面动画回调
   void setInterfaceServiceCallback(Function(String) callback) {
     _uiModule.initialize(animationCallback: callback);
@@ -219,6 +445,10 @@ class SpeechNotifierSimplified with ChangeNotifier {
 
     if (_conversationController.isInConversationMode &&
         _conversationController.isTtsPlaying) {
+      if (_multiPersonPushToTalkMode) {
+        print('🎧 [KWS] 多人按住说话模式：TTS 期间忽略唤醒/关键词打断');
+        return;
+      }
       print(
           '🎧 [KWS] 对话内 TTS 命中: $k (voipRoute=${AndroidVoipAudioRoute.instance.isVoipRouteEnabled} sherpaVoip=$_sherpaUseVoipMic)');
       unawaited(_handleTtsBargeInKeyword(k));
@@ -257,6 +487,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
   }
 
   Future<void> _handleDuplexTtsBargeInFromVad() async {
+    if (_multiPersonPushToTalkMode) return;
     if (_ttsBargeInBusy) return;
     if (!_conversationController.isInConversationMode ||
         !_conversationController.isTtsPlaying) {
@@ -274,6 +505,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
 
   /// Sherpa 麦克风流上的能量 VAD：不限固定词条，持续人声即打断 TTS。
   void _onSherpaSpeechOnlyBargeIn() {
+    if (_multiPersonPushToTalkMode) return;
     if (_conversationController.isInConversationMode &&
         _conversationController.isTtsPlaying) {
       print(
@@ -286,6 +518,10 @@ class SpeechNotifierSimplified with ChangeNotifier {
   Future<void> prepareSherpaBargeInForConversationTts() async {
     if (!_conversationController.isInConversationMode) {
       print('🎧 [prepareSherpa] 非对话模式，跳过');
+      return;
+    }
+    if (_multiPersonPushToTalkMode) {
+      print('🎧 [prepareSherpa] 多人按住说话：不启用 TTS 前打断监听');
       return;
     }
     if (_duplexTtsBargeInEnabled) {
@@ -352,8 +588,10 @@ class SpeechNotifierSimplified with ChangeNotifier {
           '⏱️ [Pipeline][Wake] Android VoIP+sherpa切换 ${routeSw.elapsedMilliseconds}ms');
     }
 
-    // 唤醒命中后并行预热主 ASR，尽量覆盖「首句欢迎语期间用户立刻开口」场景。
-    unawaited(_prewarmAsrAfterWake());
+    if (!_multiPersonPushToTalkMode) {
+      // 唤醒命中后并行预热主 ASR，尽量覆盖「首句欢迎语期间用户立刻开口」场景。
+      unawaited(_prewarmAsrAfterWake());
+    }
 
     final convSw = Stopwatch()..start();
     await _conversationController.enterConversationMode();
@@ -618,22 +856,67 @@ class SpeechNotifierSimplified with ChangeNotifier {
     stopGestureRecognition();
   }
 
+  /// 句末判定触发但无有效文本时，麦已由 [QwenStreamingAsrRecorder] 关闭，需延迟重开听写。
+  void _scheduleRestartAsrIfConversationIdle() {
+    if (!_conversationController.isInConversationMode) return;
+    if (_multiPersonPushToTalkMode) return;
+    ConversationFlowTracer.asr(
+      'scheduleRestartAsrIfConversationIdle armed delay=180ms',
+    );
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 180), () async {
+      if (!_conversationController.isInConversationMode) return;
+      if (_conversationController.isProcessingUserInput) return;
+      if (_isListening || _isStartingVoiceRecognition) return;
+      ConversationFlowTracer.asr(
+        'scheduleRestartAsrIfConversationIdle firing startVoiceRecognition',
+      );
+      await startVoiceRecognition();
+    }));
+  }
+
   /// 启动语音识别监听
   Future<void> startVoiceRecognition() async {
-    if (_isListening) {
-      if (_conversationController.isInConversationMode && _listeningViaQwen) {
-        _duplexTtsBargeInEnabled = true;
-      }
-      print("🎙️ 语音识别已在运行");
+    if (skipAutoVoiceRecognitionInConversation && !_pttRecordingActive) {
+      ConversationFlowTracer.asr(
+        'startVoiceRecognition SKIP multi_person_push_to_talk',
+      );
+      print('🎙️ 多人按住说话模式：跳过自动连续聆听');
       return;
     }
+    if (_isListening) {
+      final qwenStale = _listeningViaQwen && _qwenAsrRecorder == null;
+      if (!qwenStale) {
+        if (_conversationController.isInConversationMode && _listeningViaQwen) {
+          _duplexTtsBargeInEnabled = true;
+        }
+        ConversationFlowTracer.asr(
+          'startVoiceRecognition SKIP already_listening '
+          'qwen=$_listeningViaQwen duplex=$_duplexTtsBargeInEnabled',
+        );
+        print("🎙️ 语音识别已在运行");
+        return;
+      }
+      ConversationFlowTracer.asr(
+        'startVoiceRecognition STALE_STATE clearing flags and restarting',
+      );
+      print('⚠️ Qwen ASR 假运行：监听标志为真但录音器已释放，将重新启动');
+      _isListening = false;
+      _listeningViaQwen = false;
+    }
     if (_isStartingVoiceRecognition) {
+      ConversationFlowTracer.asr(
+        'startVoiceRecognition SKIP already_starting',
+      );
       print("🎙️ 语音识别启动中，跳过重复请求");
       return;
     }
     _isStartingVoiceRecognition = true;
 
     try {
+      ConversationFlowTracer.asr(
+        'startVoiceRecognition ENTER voipRoute=${AndroidVoipAudioRoute.instance.isVoipRouteEnabled} '
+        'sherpaVoip=$_sherpaUseVoipMic',
+      );
       print(
           "🎙️ 启动语音识别 (voipRoute=${AndroidVoipAudioRoute.instance.isVoipRouteEnabled} sherpaVoip=$_sherpaUseVoipMic)");
 
@@ -657,12 +940,17 @@ class SpeechNotifierSimplified with ChangeNotifier {
             },
             onUtteranceFinal: (String t) {
               final s = t.trim();
+              ConversationFlowTracer.asr(
+                'onUtteranceFinal len=${t.length} trimmedEmpty=${s.isEmpty}',
+              );
               _qwenAsrRecorder = null;
               _listeningViaQwen = false;
               _isListening = false;
               notifyListeners();
               if (s.isNotEmpty) {
                 unawaited(_processUserInput(s));
+              } else {
+                _scheduleRestartAsrIfConversationIdle();
               }
             },
             androidVoipEchoCapture: _sherpaUseVoipMic,
@@ -705,6 +993,9 @@ class SpeechNotifierSimplified with ChangeNotifier {
       }
 
       _isListening = true;
+      ConversationFlowTracer.asr(
+        'startVoiceRecognition OK listening=$_isListening qwen=$_listeningViaQwen',
+      );
       // 仅在非播报阶段切换到「聆听脸」，避免欢迎语/回复开头先闪可爱02再进说话脸。
       if (_conversationController.isInConversationMode &&
           !_conversationController.isTtsPlaying) {
@@ -712,6 +1003,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
       }
       notifyListeners();
     } catch (e) {
+      ConversationFlowTracer.asr('startVoiceRecognition EXCEPTION $e');
       print("❌ 启动语音识别失败: $e");
     } finally {
       _isStartingVoiceRecognition = false;
@@ -725,6 +1017,9 @@ class SpeechNotifierSimplified with ChangeNotifier {
   Future<void> stopVoiceRecognition({bool resumeSherpaKws = true}) async {
     try {
       if (_isListening) {
+        ConversationFlowTracer.asr(
+          'stopVoiceRecognition qwen=$_listeningViaQwen resumeSherpa=$resumeSherpaKws',
+        );
         if (_listeningViaQwen && _qwenAsrRecorder != null) {
           await _qwenAsrRecorder!.stopWithoutSubmit();
           _qwenAsrRecorder = null;
@@ -857,6 +1152,10 @@ class SpeechNotifierSimplified with ChangeNotifier {
   Future<void> _processUserInput(String input) async {
     if (input.isEmpty) return;
 
+    ConversationFlowTracer.asr(
+      '_processUserInput -> conversationController.processUserInput '
+      'len=${input.length}',
+    );
     _speechText = input;
     notifyListeners();
 
