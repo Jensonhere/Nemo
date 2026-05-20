@@ -15,12 +15,18 @@ import 'package:path_provider/path_provider.dart';
 
 /// 图片分析/环境监测模块使用的相机流订阅者 ID（统一由 CameraResourceManager 管理）
 const String _kCameraServiceStreamSubscriberId = 'camera_service';
+const String _kVaPrebufferStreamSubscriberId = 'va_prebuffer';
 
 class CameraService {
   final CameraResourceManager _cameraManager = CameraResourceManager();
 
-  late Interpreter _interpreter;
+  Interpreter? _interpreter;
   bool _isReady = false;
+  bool _isCameraReady = false;
+  Future<void>? _initializeFuture;
+  Future<void>? _cameraReadyFuture;
+  Future<void>? _modelReadyFuture;
+  bool _isModelReady = false;
   List<String> _labels = [];
   String imagePath = '';
 
@@ -42,26 +48,87 @@ class CameraService {
 
   final OpenAI _openAI = OpenAI();
 
-  /// 初始化：加载模型与标签；相机由 CameraResourceManager 统一初始化（在首次 takePicture/订阅流时按需初始化）
+  /// 初始化：仅确保相机可用。模型改为按需懒加载，避免 VA 拍图依赖检测模型资源。
   Future<void> initialize() async {
-    try {
-      _interpreter = await Interpreter.fromAsset(MODEL_PATH);
+    if (_isReady) return;
+    final inFlight = _initializeFuture;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
 
+    final future = () async {
+      try {
+        await _ensureCameraReady();
+        _isReady = true;
+        print('✅ CameraService 相机初始化成功');
+      } catch (e) {
+        print('❌ 初始化失败: $e');
+        rethrow;
+      }
+    }();
+
+    _initializeFuture = future;
+    try {
+      await future;
+    } finally {
+      if (identical(_initializeFuture, future)) {
+        _initializeFuture = null;
+      }
+    }
+  }
+
+  Future<void> _ensureModelReady() async {
+    if (_isModelReady) return;
+    final inFlight = _modelReadyFuture;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final future = () async {
+      _interpreter = await Interpreter.fromAsset(MODEL_PATH);
       final labelData = await rootBundle.loadString(LABELS_PATH);
       _labels = labelData.split('\n').map((label) => label.trim()).toList();
+      _isModelReady = true;
+      print('✅ CameraService 检测模型已就绪');
+    }();
 
-      // 相机不再在此处创建，由 CameraResourceManager 在首次使用时初始化
-      await _cameraManager.initialize(
-        preferredLens: CameraLensDirection.front,
-        resolutionPreset: ResolutionPreset.medium,
-        imageFormatGroup: ImageFormatGroup.yuv420,
-      );
+    _modelReadyFuture = future;
+    try {
+      await future;
+    } finally {
+      if (identical(_modelReadyFuture, future)) {
+        _modelReadyFuture = null;
+      }
+    }
+  }
 
-      _isReady = true;
-      print('✅ 摄像头和模型初始化成功（已接入 CameraResourceManager）');
-    } catch (e) {
-      print('❌ 初始化失败: $e');
-      rethrow;
+  Future<void> _ensureCameraReady() async {
+    if (_isCameraReady) return;
+    final inFlight = _cameraReadyFuture;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final future = _cameraManager
+        .initialize(
+          preferredLens: CameraLensDirection.front,
+          resolutionPreset: ResolutionPreset.medium,
+          imageFormatGroup: ImageFormatGroup.yuv420,
+        )
+        .then((_) {
+          _isCameraReady = true;
+          print('✅ CameraService 相机资源已就绪');
+        });
+    _cameraReadyFuture = future;
+    try {
+      await future;
+    } finally {
+      if (identical(_cameraReadyFuture, future)) {
+        _cameraReadyFuture = null;
+      }
     }
   }
 
@@ -76,7 +143,8 @@ class CameraService {
     Duration timeout = const Duration(seconds: 3),
     bool keepStreamOn = true,
   }) async {
-    if (!_isReady) throw Exception('摄像头未准备好');
+    await initialize();
+    await _ensureModelReady();
 
     try {
       final imageFile = await _cameraManager.takePicture(
@@ -146,6 +214,7 @@ class CameraService {
 
   Future<List<dynamic>> _runInference(Uint8List input) async {
     try {
+      await _ensureModelReady();
       final inputTensor = input.reshape([1, INPUT_SIZE, INPUT_SIZE, 3]);
 
       final outputLocations = Float32List(1 * 10 * 4).reshape([1, 10, 4]);
@@ -153,7 +222,7 @@ class CameraService {
       final outputScores = Float32List(1 * 10).reshape([1, 10]);
       final outputCount = Float32List(1).reshape([1]);
 
-      _interpreter.runForMultipleInputs(
+      _interpreter!.runForMultipleInputs(
         [inputTensor],
         {0: outputLocations, 1: outputClasses, 2: outputScores, 3: outputCount},
       );
@@ -191,8 +260,9 @@ class CameraService {
   }
 
   /// 开始实时检测：订阅 CameraResourceManager 的图像流，在回调中做推理并推流
-  Stream<List<dynamic>> startRealTimeDetection() {
-    if (!_isReady) throw Exception('摄像头未准备好');
+  Future<Stream<List<dynamic>>> startRealTimeDetection() async {
+    await initialize();
+    await _ensureModelReady();
 
     _isStreaming = true;
 
@@ -323,7 +393,7 @@ class CameraService {
     Duration timeout = const Duration(seconds: 3),
     bool keepStreamOn = true,
   }) async {
-    if (!_isReady) throw Exception('摄像头未准备好');
+    await _ensureCameraReady();
     try {
       final imageFile = await _cameraManager.takePicture(
         priority: priority,
@@ -343,6 +413,43 @@ class CameraService {
     } catch (e) {
       throw Exception('拍照失败: $e');
     }
+  }
+
+  /// 供 VA 上传使用：直接返回 JPEG 字节，避免重复落盘增加延时。
+  Future<Uint8List> captureImageBytes({
+    CameraTaskPriority priority = CameraTaskPriority.normal,
+    Duration timeout = const Duration(seconds: 2),
+    bool keepStreamOn = true,
+  }) async {
+    await _ensureCameraReady();
+    try {
+      final imageFile = await _cameraManager.takePicture(
+        priority: priority,
+        timeout: timeout,
+        keepStreamOn: keepStreamOn,
+      );
+      final bytes = await imageFile.readAsBytes();
+      imagePath = imageFile.path;
+      print('📸 [VA] 捕获图像字节成功 bytes=${bytes.length}');
+      return bytes;
+    } catch (e) {
+      throw Exception('拍照字节获取失败: $e');
+    }
+  }
+
+  Uint8List? getLatestStreamFrameJpegBytes({
+    Duration maxAge = const Duration(milliseconds: 450),
+  }) {
+    return _cameraManager.getLatestFrameJpegBytes(maxAge: maxAge);
+  }
+
+  Future<Stream<CameraImage>> subscribeVaPrebufferStream() async {
+    await _ensureCameraReady();
+    return _cameraManager.subscribeImageStream(_kVaPrebufferStreamSubscriberId);
+  }
+
+  Future<void> unsubscribeVaPrebufferStream() async {
+    await _cameraManager.unsubscribeImageStream(_kVaPrebufferStreamSubscriberId);
   }
 
   Future<bool> detectGestureByVisionModel() async {
@@ -427,8 +534,14 @@ class CameraService {
       if (_isStreaming) {
         stopRealTimeDetection();
       }
-      _interpreter.close();
+      if (_interpreter != null) {
+        _interpreter!.close();
+        _interpreter = null;
+      }
       _isReady = false;
+      _isCameraReady = false;
+      _isModelReady = false;
+      _modelReadyFuture = null;
       _onHumanDetectedCallback = null;
     } catch (e) {
       print('CameraService dispose error: $e');

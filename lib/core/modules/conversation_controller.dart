@@ -368,7 +368,20 @@ class ConversationController extends ChangeNotifier {
   }
 
   /// 处理用户输入
-  Future<void> processUserInput(String userInput) async {
+  Future<RouterDecision> previewRouterDecision(String userInput) async {
+    final routerPack = await _buildRouterContextPack(userInput);
+    return _llmRouter.route(
+      userInput: userInput,
+      contextPack: routerPack,
+      replyLengthMode: _replyLengthModeHint(),
+    );
+  }
+
+  Future<void> processUserInput(
+    String userInput, {
+    Map<String, dynamic>? vaResult,
+    RouterDecision? precomputedRouterDecision,
+  }) async {
     if (!_isInConversationMode) {
       ConversationFlowTracer.orphan(
         'processUserInput_IGNORED not_in_conversation_mode',
@@ -475,13 +488,16 @@ class ConversationController extends ChangeNotifier {
       }
 
       ConversationFlowTracer.step('router_context_pack_begin');
-      final routerPack = await _buildRouterContextPack(userInput);
-      ConversationFlowTracer.step('router_llm_route_begin');
-      final routerDecision = await _llmRouter.route(
-        userInput: userInput,
-        contextPack: routerPack,
-        replyLengthMode: _replyLengthModeHint(),
-      );
+      final routerDecision = precomputedRouterDecision ??
+          await (() async {
+            final routerPack = await _buildRouterContextPack(userInput);
+            ConversationFlowTracer.step('router_llm_route_begin');
+            return _llmRouter.route(
+              userInput: userInput,
+              contextPack: routerPack,
+              replyLengthMode: _replyLengthModeHint(),
+            );
+          })();
       _lastRouterDecision = routerDecision.rawJson;
       _lastPlannerPlanDisplay = '';
       final rj = routerDecision.rawJson;
@@ -514,6 +530,18 @@ class ConversationController extends ChangeNotifier {
 
       if (!routerDecision.needTools) {
         ConversationFlowTracer.step('branch_router_no_tools');
+        if (routerDecision.scene == RouterScene.companion) {
+          ConversationFlowTracer.step(
+            'router_companion_force_textqa_with_va',
+            'hasVa=${vaResult != null}',
+          );
+          await _handleTextQA(
+            userInput,
+            sceneIntent: IntentType.comfort,
+            vaResult: vaResult,
+          );
+          return;
+        }
         final directReply = routerDecision.dialogueReply.trim();
         if (directReply.isNotEmpty) {
           ConversationFlowTracer.step(
@@ -526,12 +554,13 @@ class ConversationController extends ChangeNotifier {
             recordAssistantForTurns: directReply,
           );
           _textQAModule.recordRouterDirectTurn(userInput, directReply);
-        } else if (routerDecision.scene == RouterScene.companion) {
-          ConversationFlowTracer.step('router_fallback_textqa', 'comfort');
-          await _handleTextQA(userInput, sceneIntent: IntentType.comfort);
         } else {
           ConversationFlowTracer.step('router_fallback_textqa', 'dialogue');
-          await _handleTextQA(userInput, sceneIntent: IntentType.dialogue);
+          await _handleTextQA(
+            userInput,
+            sceneIntent: IntentType.dialogue,
+            vaResult: vaResult,
+          );
         }
         return;
       }
@@ -576,7 +605,11 @@ class ConversationController extends ChangeNotifier {
         // 意图识别置信度低，默认进入文本问答（普通问答场景）
         ConversationFlowTracer.step('intent_low_confidence_textqa_dialogue');
         print("⚠️ 意图识别置信度低，进入文本问答模式");
-        await _handleTextQA(userInput, sceneIntent: IntentType.dialogue);
+        await _handleTextQA(
+          userInput,
+          sceneIntent: IntentType.dialogue,
+          vaResult: vaResult,
+        );
         return;
       }
 
@@ -584,7 +617,7 @@ class ConversationController extends ChangeNotifier {
       ConversationFlowTracer.step('intent_dispatch', '${intentResult.intent}');
       switch (intentResult.intent) {
         case IntentType.comfort:
-          await _handleEmotionRecognition(userInput);
+          await _handleEmotionRecognition(userInput, vaResult: vaResult);
           break;
 
         case IntentType.image:
@@ -592,23 +625,43 @@ class ConversationController extends ChangeNotifier {
           break;
 
         case IntentType.command:
-          await _handleTextQA(userInput, sceneIntent: IntentType.command);
+          await _handleTextQA(
+            userInput,
+            sceneIntent: IntentType.command,
+            vaResult: vaResult,
+          );
           break;
 
         case IntentType.dialogue:
-          await _handleTextQA(userInput, sceneIntent: IntentType.dialogue);
+          await _handleTextQA(
+            userInput,
+            sceneIntent: IntentType.dialogue,
+            vaResult: vaResult,
+          );
           break;
 
         case IntentType.apiCall:
-          await _handleTextQA(userInput, sceneIntent: IntentType.apiCall);
+          await _handleTextQA(
+            userInput,
+            sceneIntent: IntentType.apiCall,
+            vaResult: vaResult,
+          );
           break;
 
         case IntentType.idle:
-          await _handleTextQA(userInput, sceneIntent: IntentType.idle);
+          await _handleTextQA(
+            userInput,
+            sceneIntent: IntentType.idle,
+            vaResult: vaResult,
+          );
           break;
 
         case IntentType.unknown:
-          await _handleTextQA(userInput, sceneIntent: IntentType.unknown);
+          await _handleTextQA(
+            userInput,
+            sceneIntent: IntentType.unknown,
+            vaResult: vaResult,
+          );
           break;
       }
     } catch (e, st) {
@@ -1077,12 +1130,17 @@ class ConversationController extends ChangeNotifier {
   }
 
   /// 处理情绪识别
-  Future<void> _handleEmotionRecognition(String userInput) async {
+  Future<void> _handleEmotionRecognition(
+    String userInput, {
+    Map<String, dynamic>? vaResult,
+  }) async {
     print("😊 进入情绪识别模块");
 
     try {
-      final result = await _emotionModule.processEmotionRecognition(userInput,
-          conversationContext: _getConversationContext());
+      final result = await _emotionModule.processEmotionRecognition(
+        userInput,
+        conversationContext: _getConversationContext(),
+      );
 
       final emoLabel = EmotionRecognitionModule.emotionToUiLabel(result.emotion);
       if (result.success) {
@@ -1185,6 +1243,7 @@ class ConversationController extends ChangeNotifier {
     String userInput, {
     IntentType sceneIntent = IntentType.dialogue,
     bool englishTeachingScene = false,
+    Map<String, dynamic>? vaResult,
   }) async {
     ConversationFlowTracer.step(
       'textqa_enter',
@@ -1194,6 +1253,13 @@ class ConversationController extends ChangeNotifier {
       "💬 进入文本问答模块 scene=$sceneIntent "
       'englishTeaching=$englishTeachingScene',
     );
+    if (sceneIntent == IntentType.comfort) {
+      final fusionSummary = vaResult?['fusion_summary'];
+      print(
+        '💞 [Companion] 本轮改走 TextQA+VA '
+        'hasVa=${vaResult != null} fusion=${fusionSummary ?? 'none'}',
+      );
+    }
 
     try {
       if (sceneIntent == IntentType.command && !_actionModule.isBluetoothConnected) {
@@ -1290,7 +1356,7 @@ class ConversationController extends ChangeNotifier {
             [],
             sceneIntent: sceneIntent,
             englishTeachingScene: englishTeachingScene,
-            contextPack: _buildContextPack(),
+            contextPack: _buildContextPack(vaResult: vaResult),
             replyLengthMode: _replyLengthModeHint(),
             deviceContextMode: deviceCtxMode,
             onDelta: (delta) async {
@@ -1374,7 +1440,7 @@ class ConversationController extends ChangeNotifier {
           [],
           sceneIntent: sceneIntent,
           englishTeachingScene: englishTeachingScene,
-          contextPack: _buildContextPack(),
+          contextPack: _buildContextPack(vaResult: vaResult),
           replyLengthMode: _replyLengthModeHint(),
           deviceContextMode: deviceCtxMode,
         );
@@ -1762,10 +1828,25 @@ class ConversationController extends ChangeNotifier {
     return false;
   }
 
-  ConversationContextPack _buildContextPack() {
+  ConversationContextPack _buildContextPack({
+    Map<String, dynamic>? vaResult,
+  }) {
+    final fusionSummary = vaResult?['fusion_summary']?.toString().trim();
+    final vaValuesSummary = vaResult?['values_summary']?.toString().trim();
+    final vaTagsSummary = vaResult?['tags_summary']?.toString().trim();
+    final vaPromptHint = vaResult?['llm_prompt_hint']?.toString().trim();
     return ConversationContextPack(
       recentTurnLines: List<String>.from(_dialogTurnLines),
-      userEmotionFromVa: null,
+      userEmotionFromVa:
+          fusionSummary == null || fusionSummary.isEmpty ? null : fusionSummary,
+      vaValuesSummary:
+          vaValuesSummary == null || vaValuesSummary.isEmpty
+              ? null
+              : vaValuesSummary,
+      vaTagsSummary:
+          vaTagsSummary == null || vaTagsSummary.isEmpty ? null : vaTagsSummary,
+      vaPromptHint:
+          vaPromptHint == null || vaPromptHint.isEmpty ? null : vaPromptHint,
       deviceStateLine: '基座电量与传感器详情：待硬件上报',
       environmentSummary: null,
       idleSinceDescription: _describeIdleSince(),
@@ -1803,6 +1884,9 @@ class ConversationController extends ChangeNotifier {
     return ConversationContextPack(
       recentTurnLines: base.recentTurnLines,
       userEmotionFromVa: base.userEmotionFromVa,
+      vaValuesSummary: base.vaValuesSummary,
+      vaTagsSummary: base.vaTagsSummary,
+      vaPromptHint: base.vaPromptHint,
       deviceStateLine: base.deviceStateLine,
       environmentSummary: base.environmentSummary,
       deviceContextBlock: deviceBlock,

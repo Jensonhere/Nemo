@@ -72,6 +72,7 @@ class CameraResourceManager {
   bool _captureWorkerRunning = false;
   int _captureSeq = 0;
   static const Duration _streamSnapshotMaxAge = Duration(milliseconds: 280);
+  bool _hardwareCaptureInFlight = false;
   
   /// 获取相机控制器（只读，用于UI预览等）
   CameraController? get cameraController => _controller;
@@ -464,7 +465,14 @@ class CameraResourceManager {
   }
 
   Future<XFile> _captureWithHardwareFallback() async {
+    if (_hardwareCaptureInFlight) {
+      throw CameraException(
+        'captureInFlight',
+        'Previous capture has not returned yet.',
+      );
+    }
     bool needResume = false;
+    _hardwareCaptureInFlight = true;
     try {
       if (_isImageStreamRunning) {
         needResume = await _pauseImageStreamTemporarily();
@@ -485,6 +493,8 @@ class CameraResourceManager {
         await _resumeImageStream();
       }
       rethrow;
+    } finally {
+      _hardwareCaptureInFlight = false;
     }
   }
   
@@ -503,6 +513,18 @@ class CameraResourceManager {
       print('⚠️ 最新帧为空');
     }
     return _latestImage;
+  }
+
+  Uint8List? getLatestFrameJpegBytes({
+    Duration maxAge = const Duration(milliseconds: 450),
+  }) {
+    if (!_isImageStreamRunning) return null;
+    final image = _latestImage;
+    final at = _latestImageAt;
+    if (image == null || at == null) return null;
+    final age = DateTime.now().difference(at);
+    if (age > maxAge) return null;
+    return _cameraImageToJpegBytes(image);
   }
 
   /// 获取最新的相机图像（用于需要实时图像的功能）

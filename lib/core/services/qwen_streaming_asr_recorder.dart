@@ -15,6 +15,7 @@ class QwenStreamingAsrRecorder {
     required this.client,
     required this.onPartialText,
     required this.onUtteranceFinal,
+    this.onPcmChunkReadyForSidecar,
     this.androidVoipEchoCapture = false,
     this.isTtsPlaying,
     this.onSpeechDuringTtsBargeIn,
@@ -25,6 +26,7 @@ class QwenStreamingAsrRecorder {
   final QwenCloudAsrClient client;
   final void Function(String text) onPartialText;
   final void Function(String text) onUtteranceFinal;
+  final void Function(Uint8List chunk)? onPcmChunkReadyForSidecar;
   final bool androidVoipEchoCapture;
 
   /// 连续对话内机器人 TTS 是否正在播放（用于同麦打断检测）。
@@ -119,6 +121,7 @@ class QwenStreamingAsrRecorder {
     final n = data.length;
     if (n < 2) return;
     final enhanced = _enhancePcm16Le(data);
+    onPcmChunkReadyForSidecar?.call(Uint8List.fromList(enhanced));
 
     final ms = (enhanced.length ~/ 2) * 1000 ~/ sampleRate;
     _totalMs += ms;

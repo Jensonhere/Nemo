@@ -6,6 +6,15 @@ class ConversationContextPack {
   /// 语音/VA 情绪摘要（安抚场景用）
   final String? userEmotionFromVa;
 
+  /// VA 数值摘要，例如 valence/arousal/dominance
+  final String? vaValuesSummary;
+
+  /// VA 标签摘要
+  final String? vaTagsSummary;
+
+  /// VA 给 LLM 的提示片段
+  final String? vaPromptHint;
+
   /// 设备状态一行话（电量、连接等，暂无数据时可占位）
   final String? deviceStateLine;
 
@@ -21,6 +30,9 @@ class ConversationContextPack {
   ConversationContextPack({
     this.recentTurnLines = const [],
     this.userEmotionFromVa,
+    this.vaValuesSummary,
+    this.vaTagsSummary,
+    this.vaPromptHint,
     this.deviceStateLine,
     this.environmentSummary,
     this.deviceContextBlock,
@@ -37,6 +49,15 @@ class ConversationContextPack {
     }
     if (userEmotionFromVa != null && userEmotionFromVa!.trim().isNotEmpty) {
       sb.writeln('【用户语气/情绪（VA）】${userEmotionFromVa!.trim()}');
+    }
+    if (vaValuesSummary != null && vaValuesSummary!.trim().isNotEmpty) {
+      sb.writeln('【VA数值摘要】${vaValuesSummary!.trim()}');
+    }
+    if (vaTagsSummary != null && vaTagsSummary!.trim().isNotEmpty) {
+      sb.writeln('【VA标签摘要】${vaTagsSummary!.trim()}');
+    }
+    if (vaPromptHint != null && vaPromptHint!.trim().isNotEmpty) {
+      sb.writeln('【VA提示】${vaPromptHint!.trim()}');
     }
     if (deviceStateLine != null && deviceStateLine!.trim().isNotEmpty) {
       sb.writeln('【设备状态】${deviceStateLine!.trim()}');

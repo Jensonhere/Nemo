@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vosk_flutter/vosk_flutter.dart';
@@ -9,11 +10,16 @@ import 'package:voicegpt/core/services/android_voip_audio_route.dart';
 import 'package:voicegpt/core/services/bluetooth_service.dart';
 import 'package:voicegpt/core/services/sherpa_kws_wake_service.dart';
 import 'package:voicegpt/core/services/gesture_service.dart';
+import 'package:voicegpt/core/llm/llm_router.dart';
 import 'package:voicegpt/core/modules/conversation_controller.dart';
+import 'package:voicegpt/core/modules/intent_recognition_module.dart';
 import 'package:voicegpt/core/modules/plan_executor_controller.dart';
 import 'package:voicegpt/core/modules/ui_animation_module.dart';
 import 'package:voicegpt/core/services/qwen_cloud_asr_client.dart';
 import 'package:voicegpt/core/services/qwen_streaming_asr_recorder.dart';
+import 'package:voicegpt/core/services/va_pcm_recorder.dart';
+import 'package:voicegpt/core/services/va_service_config.dart';
+import 'package:voicegpt/core/services/va_session_manager.dart';
 import 'package:voicegpt/core/config/debug_runtime_flags.dart';
 import 'package:voicegpt/core/debug/conversation_flow_tracer.dart';
 
@@ -23,6 +29,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
   // === 核心服务 ===
   final ConversationController _conversationController =
       ConversationController();
+  final IntentRecognitionModule _intentModule = IntentRecognitionModule();
   final UIAnimationModule _uiModule = UIAnimationModule();
   GestureService? _gestureService;
 
@@ -54,10 +61,36 @@ class SpeechNotifierSimplified with ChangeNotifier {
   // === 语音识别（优先 Qwen 云端中英 ASR，失败则 VOSK）===
   SpeechService? _speechService;
   QwenStreamingAsrRecorder? _qwenAsrRecorder;
+  VaSessionManager? _vaSessionManager;
+  VaPcmRecorder? _vaPcmRecorder;
   bool _listeningViaQwen = false;
+  bool _listeningViaVosk = false;
   bool _isListening = false;
   bool _isStartingVoiceRecognition = false;
   final String _voskAssetDir = "assets/cn/vosk-model-small-cn-0.22/";
+
+  static const List<String> _vaVisionKeywords = <String>[
+    '心情',
+    '情绪',
+    '表情',
+    '看起来',
+    '脸色',
+    '状态',
+    '难过',
+    '伤心',
+    '开心',
+    '高兴',
+    '生气',
+    '烦',
+    '不开心',
+    '我现在看起来',
+    '我看起来',
+  ];
+
+  final List<Uint8List> _pendingVaAudioChunks = <Uint8List>[];
+  static const int _maxPendingVaAudioChunks = 120;
+  bool _voskFinalResultConsumed = false;
+  String _lastAcceptedVoskFinalText = '';
 
   static void _logAsrEngineSelection(String engineLabel) {
     const bar =
@@ -70,6 +103,92 @@ class SpeechNotifierSimplified with ChangeNotifier {
     print(bar);
   }
 
+  void _resetPendingVaCapture() {
+    _pendingVaAudioChunks.clear();
+    _voskFinalResultConsumed = false;
+    _lastAcceptedVoskFinalText = '';
+  }
+
+  void _bufferPendingVaAudioChunk(Uint8List chunk) {
+    if (chunk.isEmpty) return;
+    _pendingVaAudioChunks.add(Uint8List.fromList(chunk));
+    if (_pendingVaAudioChunks.length > _maxPendingVaAudioChunks) {
+      _pendingVaAudioChunks.removeAt(0);
+    }
+  }
+
+  List<Uint8List> _coalescePendingVaAudioChunks(
+    List<Uint8List> chunks, {
+    int targetBytes = 128000,
+  }) {
+    if (chunks.isEmpty) return const <Uint8List>[];
+    if (chunks.length == 1) return List<Uint8List>.from(chunks);
+
+    final merged = <Uint8List>[];
+    final current = BytesBuilder(copy: false);
+    for (final chunk in chunks) {
+      if (current.length > 0 && current.length + chunk.length > targetBytes) {
+        merged.add(Uint8List.fromList(current.toBytes()));
+        current.clear();
+      }
+      current.add(chunk);
+    }
+    if (current.length > 0) {
+      merged.add(Uint8List.fromList(current.toBytes()));
+    }
+    return merged;
+  }
+
+  Future<Map<String, dynamic>?> _runDeferredVaIfNeeded(
+    String text,
+    RouterDecision routerDecision,
+  ) async {
+    if (routerDecision.scene != RouterScene.companion) {
+      print('ℹ️ [VA] Router 未命中 Companion，跳过 VA');
+      return null;
+    }
+
+    print('💞 [VA] Router 命中 Companion，开始补跑当前轮 VA');
+    final manager = _vaSessionManager ?? VaSessionManager();
+    _vaSessionManager = manager;
+    try {
+      final vaSid = await manager.startSession();
+      if (vaSid == null) {
+        print('ℹ️ [VA] 延后启动失败，当前轮降级为仅文本陪伴');
+        return null;
+      }
+      final mergedChunks = _coalescePendingVaAudioChunks(_pendingVaAudioChunks);
+      print(
+        '🎧 [VA] 回放当前轮音频 rawChunks=${_pendingVaAudioChunks.length} '
+        'mergedChunks=${mergedChunks.length} sid=$vaSid',
+      );
+      for (final chunk in mergedChunks) {
+        await manager.sendAudioChunk(chunk);
+      }
+      final normalized = text.trim();
+      if (normalized.isNotEmpty) {
+        final hit = _vaVisionKeywords.any((keyword) => normalized.contains(keyword));
+        if (hit) {
+          print('🎯 [VA] Router 后命中视觉增强关键词 transcript="$normalized"');
+          manager.enableVisionEnhancement();
+        }
+      }
+      final uploaded = await manager.uploadCachedImagesForEmotionBranch();
+      print('🖼️ [VA] Router 后统一上传缓存图数量=$uploaded');
+      final vaResult = await manager.finishSession();
+      print('📝 [VA] 当前轮最终结果=${vaResult?['fusion_summary'] ?? 'none'}');
+      return vaResult;
+    } catch (e) {
+      print('❌ [VA] 延后补跑失败: $e');
+      return null;
+    } finally {
+      await manager.reset();
+      if (identical(_vaSessionManager, manager)) {
+        _vaSessionManager = null;
+      }
+    }
+  }
+
   /// Getters
   bool get isInConversationMode => _conversationController.isInConversationMode;
   bool get isProcessingUserInput =>
@@ -80,23 +199,15 @@ class SpeechNotifierSimplified with ChangeNotifier {
   /// 连续对话里 TTS 结束后拉起主 ASR 的短窗口：此时 isListening 仍为 false，但不应显示「思考中/已暂停」。
   bool get isStartingVoiceRecognition => _isStartingVoiceRecognition;
   bool get isReadyToSend => false;
-
-  /// 多人对话：按住说话模式（右上角开关）。开启且已在连续对话中时，关闭连续聆听与 TTS 可打断。
   bool _multiPersonPushToTalkMode = false;
   bool _pttRecordingActive = false;
-  /// 手指是否在按住 PTT 区域（与是否已真正开麦区分，避免「点一下异步晚到」卡在录音态）。
   bool _pttFingerPressed = false;
-  /// 每次按下 / 抬起递增，用于取消未到阈值的「假按下」与在途异步开麦。
   int _pttHoldGeneration = 0;
-
   bool get isMultiPersonPushToTalkMode => _multiPersonPushToTalkMode;
   bool get isPttRecordingHold => _pttRecordingActive;
   bool get isPttFingerPressed => _pttFingerPressed;
-
-  /// 供 [ConversationController]：此模式下不自动 `startVoiceRecognition`。
   bool get skipAutoVoiceRecognitionInConversation =>
       _multiPersonPushToTalkMode && _conversationController.isInConversationMode;
-
   bool get isEnvironmentMonitoring =>
       _conversationController.isEnvironmentMonitoring;
   bool get isGestureRecognitionActive => _isGestureRecognitionActive;
@@ -183,7 +294,6 @@ class SpeechNotifierSimplified with ChangeNotifier {
     notifyListeners();
   }
 
-  /// 右上角「多人对话」开关：开启后仅能通过底部按住说话发语音，TTS 期间不可打断，播完不再自动聆听。
   Future<void> setMultiPersonPushToTalkMode(bool enabled) async {
     if (_multiPersonPushToTalkMode == enabled) return;
     if (!enabled) {
@@ -215,17 +325,14 @@ class SpeechNotifierSimplified with ChangeNotifier {
     notifyListeners();
   }
 
-  /// 按住超过该时长才开麦，避免「点一下」误进录音；与微信发语音类似。
   static const Duration _pttHoldBeforeRecord = Duration(milliseconds: 140);
 
-  /// 底部按住说话：按下后需持续按住 [_pttHoldBeforeRecord] 才真正开麦。
   Future<void> multiPersonPttTouchDown() async {
     if (!_multiPersonPushToTalkMode ||
         !_conversationController.isInConversationMode) {
       return;
     }
     if (_pttRecordingActive) return;
-    // 流式/整段问答期间 isProcessingUserInput 常为 true，但播报中必须允许按住打断 TTS。
     if (_conversationController.isProcessingUserInput &&
         !_conversationController.isTtsPlaying) {
       return;
@@ -268,7 +375,9 @@ class SpeechNotifierSimplified with ChangeNotifier {
         }
       }
 
-      if (_isListening) await stopVoiceRecognition(resumeSherpaKws: false);
+      if (_isListening) {
+        await stopVoiceRecognition(resumeSherpaKws: false);
+      }
       if (arm != _pttHoldGeneration) {
         _pttFingerPressed = false;
         notifyListeners();
@@ -319,8 +428,6 @@ class SpeechNotifierSimplified with ChangeNotifier {
           notifyListeners();
           if (s.isNotEmpty) {
             unawaited(_processUserInput(s));
-          } else if (!_multiPersonPushToTalkMode) {
-            _scheduleRestartAsrIfConversationIdle();
           }
         },
         androidVoipEchoCapture: _sherpaUseVoipMic,
@@ -361,7 +468,6 @@ class SpeechNotifierSimplified with ChangeNotifier {
     }
   }
 
-  /// 底部按住说话：松手定稿并送大模型；若在「按住阈值」内松开则取消开麦。
   Future<void> multiPersonPttTouchUp() async {
     if (!_pttFingerPressed && !_pttRecordingActive) {
       return;
@@ -588,10 +694,8 @@ class SpeechNotifierSimplified with ChangeNotifier {
           '⏱️ [Pipeline][Wake] Android VoIP+sherpa切换 ${routeSw.elapsedMilliseconds}ms');
     }
 
-    if (!_multiPersonPushToTalkMode) {
-      // 唤醒命中后并行预热主 ASR，尽量覆盖「首句欢迎语期间用户立刻开口」场景。
-      unawaited(_prewarmAsrAfterWake());
-    }
+    // 唤醒命中后并行预热主 ASR，尽量覆盖「首句欢迎语期间用户立刻开口」场景。
+    unawaited(_prewarmAsrAfterWake());
 
     final convSw = Stopwatch()..start();
     await _conversationController.enterConversationMode();
@@ -818,7 +922,12 @@ class SpeechNotifierSimplified with ChangeNotifier {
 
     await _qwenAsrRecorder?.stopWithoutSubmit();
     _qwenAsrRecorder = null;
+    await _vaPcmRecorder?.stop(flushRemainder: false);
+    _vaPcmRecorder = null;
+    await _vaSessionManager?.reset();
+    _vaSessionManager = null;
     _listeningViaQwen = false;
+    _listeningViaVosk = false;
 
     if (Platform.isAndroid) {
       _sherpaUseVoipMic = false;
@@ -843,7 +952,12 @@ class SpeechNotifierSimplified with ChangeNotifier {
     _postConversationTimer?.cancel();
     await _qwenAsrRecorder?.stopWithoutSubmit();
     _qwenAsrRecorder = null;
+    await _vaPcmRecorder?.stop(flushRemainder: false);
+    _vaPcmRecorder = null;
+    await _vaSessionManager?.reset();
+    _vaSessionManager = null;
     _listeningViaQwen = false;
+    _listeningViaVosk = false;
     // 注意：不取消健康检查，确保唤醒词始终运行
     await _conversationController.forceStop();
     if (Platform.isAndroid) {
@@ -856,67 +970,23 @@ class SpeechNotifierSimplified with ChangeNotifier {
     stopGestureRecognition();
   }
 
-  /// 句末判定触发但无有效文本时，麦已由 [QwenStreamingAsrRecorder] 关闭，需延迟重开听写。
-  void _scheduleRestartAsrIfConversationIdle() {
-    if (!_conversationController.isInConversationMode) return;
-    if (_multiPersonPushToTalkMode) return;
-    ConversationFlowTracer.asr(
-      'scheduleRestartAsrIfConversationIdle armed delay=180ms',
-    );
-    unawaited(Future<void>.delayed(const Duration(milliseconds: 180), () async {
-      if (!_conversationController.isInConversationMode) return;
-      if (_conversationController.isProcessingUserInput) return;
-      if (_isListening || _isStartingVoiceRecognition) return;
-      ConversationFlowTracer.asr(
-        'scheduleRestartAsrIfConversationIdle firing startVoiceRecognition',
-      );
-      await startVoiceRecognition();
-    }));
-  }
-
   /// 启动语音识别监听
   Future<void> startVoiceRecognition() async {
-    if (skipAutoVoiceRecognitionInConversation && !_pttRecordingActive) {
-      ConversationFlowTracer.asr(
-        'startVoiceRecognition SKIP multi_person_push_to_talk',
-      );
-      print('🎙️ 多人按住说话模式：跳过自动连续聆听');
+    if (_isListening) {
+      if (_conversationController.isInConversationMode && _listeningViaQwen) {
+        _duplexTtsBargeInEnabled = true;
+      }
+      print("🎙️ 语音识别已在运行");
       return;
     }
-    if (_isListening) {
-      final qwenStale = _listeningViaQwen && _qwenAsrRecorder == null;
-      if (!qwenStale) {
-        if (_conversationController.isInConversationMode && _listeningViaQwen) {
-          _duplexTtsBargeInEnabled = true;
-        }
-        ConversationFlowTracer.asr(
-          'startVoiceRecognition SKIP already_listening '
-          'qwen=$_listeningViaQwen duplex=$_duplexTtsBargeInEnabled',
-        );
-        print("🎙️ 语音识别已在运行");
-        return;
-      }
-      ConversationFlowTracer.asr(
-        'startVoiceRecognition STALE_STATE clearing flags and restarting',
-      );
-      print('⚠️ Qwen ASR 假运行：监听标志为真但录音器已释放，将重新启动');
-      _isListening = false;
-      _listeningViaQwen = false;
-    }
     if (_isStartingVoiceRecognition) {
-      ConversationFlowTracer.asr(
-        'startVoiceRecognition SKIP already_starting',
-      );
       print("🎙️ 语音识别启动中，跳过重复请求");
       return;
     }
     _isStartingVoiceRecognition = true;
 
     try {
-      ConversationFlowTracer.asr(
-        'startVoiceRecognition ENTER voipRoute=${AndroidVoipAudioRoute.instance.isVoipRouteEnabled} '
-        'sherpaVoip=$_sherpaUseVoipMic',
-      );
+      _resetPendingVaCapture();
       print(
           "🎙️ 启动语音识别 (voipRoute=${AndroidVoipAudioRoute.instance.isVoipRouteEnabled} sherpaVoip=$_sherpaUseVoipMic)");
 
@@ -924,11 +994,12 @@ class SpeechNotifierSimplified with ChangeNotifier {
       await _sherpaKws?.pause();
       await Future<void>.delayed(const Duration(milliseconds: 120));
 
-      final qwenClient = QwenCloudAsrClient();
-      print('════════════════ QWEN ASR ENDPOINT ════════════════');
-      print('🌐 [QWEN_ASR_BASE_URL] ${qwenClient.baseUrl}');
-      print('════════════════════════════════════════════════════');
-      final qwenUp = await qwenClient.healthz();
+        final qwenClient = QwenCloudAsrClient();
+        print('════════════════ QWEN ASR ENDPOINT ════════════════');
+        print('🌐 [QWEN_ASR_BASE_URL] ${qwenClient.baseUrl}');
+        print('════════════════════════════════════════════════════');
+        print('🌐 [VA_BASE_URL] ${VaServiceConfig.baseUrl}');
+        final qwenUp = await qwenClient.healthz();
       print('🩺 [QWEN /healthz] ${qwenUp ? "OK" : "FAIL"} @ ${qwenClient.baseUrl}/healthz');
       if (qwenUp) {
         try {
@@ -936,22 +1007,40 @@ class SpeechNotifierSimplified with ChangeNotifier {
             client: qwenClient,
             onPartialText: (String t) {
               _speechText = t;
+              if (t.trim().isNotEmpty) {
+                _vaSessionManager ??= VaSessionManager();
+                _vaSessionManager!.beginSpeechWindowImageBuffering();
+              }
               notifyListeners();
             },
-            onUtteranceFinal: (String t) {
+            onUtteranceFinal: (String t) async {
               final s = t.trim();
-              ConversationFlowTracer.asr(
-                'onUtteranceFinal len=${t.length} trimmedEmpty=${s.isEmpty}',
-              );
+              Map<String, dynamic>? vaResult;
+              RouterDecision? routerDecision;
+              if (s.isNotEmpty) {
+                routerDecision =
+                    await _conversationController.previewRouterDecision(s);
+                print('🧭 [Router][ASR后预判] ${routerDecision.rawJson}');
+                vaResult = await _runDeferredVaIfNeeded(s, routerDecision);
+              }
               _qwenAsrRecorder = null;
               _listeningViaQwen = false;
+              _listeningViaVosk = false;
               _isListening = false;
               notifyListeners();
               if (s.isNotEmpty) {
-                unawaited(_processUserInput(s));
-              } else {
-                _scheduleRestartAsrIfConversationIdle();
+                unawaited(
+                  _processUserInput(
+                    s,
+                    vaResult: vaResult,
+                    precomputedRouterDecision: routerDecision,
+                  ),
+                );
               }
+              _resetPendingVaCapture();
+            },
+            onPcmChunkReadyForSidecar: (Uint8List chunk) {
+              _bufferPendingVaAudioChunk(chunk);
             },
             androidVoipEchoCapture: _sherpaUseVoipMic,
             isTtsPlaying: () => _conversationController.isTtsPlaying,
@@ -961,6 +1050,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
           );
           await _qwenAsrRecorder!.start();
           _listeningViaQwen = true;
+          _listeningViaVosk = false;
           if (_conversationController.isInConversationMode) {
             _duplexTtsBargeInEnabled = true;
           }
@@ -970,7 +1060,22 @@ class SpeechNotifierSimplified with ChangeNotifier {
           print('⚠️ Qwen ASR 启动失败，回退 VOSK: $e\n$st');
           _duplexTtsBargeInEnabled = false;
           _qwenAsrRecorder = null;
+          await _vaSessionManager?.reset();
+          _vaSessionManager = null;
           _listeningViaQwen = false;
+          _listeningViaVosk = true;
+          _vaPcmRecorder = VaPcmRecorder(
+            androidVoipEchoCapture: _sherpaUseVoipMic,
+            onChunk: (Uint8List chunk) {
+              _bufferPendingVaAudioChunk(chunk);
+            },
+          );
+          try {
+            await _vaPcmRecorder!.start();
+          } catch (e, st) {
+            print('⚠️ [VA][VOSK] 独立录音器启动失败: $e\n$st');
+            _vaPcmRecorder = null;
+          }
           if (_speechService == null) {
             await _initializeVosk();
           }
@@ -983,6 +1088,19 @@ class SpeechNotifierSimplified with ChangeNotifier {
         print('ℹ️ Qwen ASR 不可达（/healthz），使用 VOSK');
         _duplexTtsBargeInEnabled = false;
         _listeningViaQwen = false;
+        _listeningViaVosk = true;
+        _vaPcmRecorder = VaPcmRecorder(
+          androidVoipEchoCapture: _sherpaUseVoipMic,
+          onChunk: (Uint8List chunk) {
+            _bufferPendingVaAudioChunk(chunk);
+          },
+        );
+        try {
+          await _vaPcmRecorder!.start();
+        } catch (e, st) {
+          print('⚠️ [VA][VOSK] 独立录音器启动失败: $e\n$st');
+          _vaPcmRecorder = null;
+        }
         if (_speechService == null) {
           await _initializeVosk();
         }
@@ -993,9 +1111,6 @@ class SpeechNotifierSimplified with ChangeNotifier {
       }
 
       _isListening = true;
-      ConversationFlowTracer.asr(
-        'startVoiceRecognition OK listening=$_isListening qwen=$_listeningViaQwen',
-      );
       // 仅在非播报阶段切换到「聆听脸」，避免欢迎语/回复开头先闪可爱02再进说话脸。
       if (_conversationController.isInConversationMode &&
           !_conversationController.isTtsPlaying) {
@@ -1003,7 +1118,6 @@ class SpeechNotifierSimplified with ChangeNotifier {
       }
       notifyListeners();
     } catch (e) {
-      ConversationFlowTracer.asr('startVoiceRecognition EXCEPTION $e');
       print("❌ 启动语音识别失败: $e");
     } finally {
       _isStartingVoiceRecognition = false;
@@ -1017,18 +1131,24 @@ class SpeechNotifierSimplified with ChangeNotifier {
   Future<void> stopVoiceRecognition({bool resumeSherpaKws = true}) async {
     try {
       if (_isListening) {
-        ConversationFlowTracer.asr(
-          'stopVoiceRecognition qwen=$_listeningViaQwen resumeSherpa=$resumeSherpaKws',
-        );
         if (_listeningViaQwen && _qwenAsrRecorder != null) {
           await _qwenAsrRecorder!.stopWithoutSubmit();
           _qwenAsrRecorder = null;
+          await _vaPcmRecorder?.stop(flushRemainder: false);
+          _vaPcmRecorder = null;
           _listeningViaQwen = false;
+          _listeningViaVosk = false;
         } else {
           await _speechService?.stop();
+          if (_listeningViaVosk) {
+            await _vaPcmRecorder?.stop(flushRemainder: false);
+            _vaPcmRecorder = null;
+            _listeningViaVosk = false;
+          }
         }
         _isListening = false;
       }
+      _resetPendingVaCapture();
       // 退出对话等场景下 VOSK 可能已停，但仍需恢复唤醒监听
       if (resumeSherpaKws && _isWakeUpActive && _sherpaKws != null) {
         await Future<void>.delayed(const Duration(milliseconds: 400));
@@ -1091,8 +1211,42 @@ class SpeechNotifierSimplified with ChangeNotifier {
           final text = (result['text'] ?? '').toString().trim();
 
           if (text.isNotEmpty) {
+            final normalizedText = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+            if (_voskFinalResultConsumed) {
+              print('ℹ️ [VOSK] 忽略重复 final="$normalizedText"');
+              return;
+            }
+            if (_lastAcceptedVoskFinalText == normalizedText) {
+              print('ℹ️ [VOSK] 忽略同文重复 final="$normalizedText"');
+              _voskFinalResultConsumed = true;
+              return;
+            }
+            _voskFinalResultConsumed = true;
+            _lastAcceptedVoskFinalText = normalizedText;
+            _vaSessionManager ??= VaSessionManager();
+            _vaSessionManager!.beginSpeechWindowImageBuffering();
+            Map<String, dynamic>? vaResult;
+            RouterDecision? routerDecision;
+            if (_listeningViaVosk) {
+              try {
+                await _vaPcmRecorder?.stop(flushRemainder: true);
+                _vaPcmRecorder = null;
+                routerDecision =
+                    await _conversationController.previewRouterDecision(text);
+                print('🧭 [Router][VOSK后预判] ${routerDecision.rawJson}');
+                vaResult = await _runDeferredVaIfNeeded(text, routerDecision);
+              } catch (e, st) {
+                print('❌ [VA][VOSK] 延后补跑异常: $e\n$st');
+              } finally {
+                _resetPendingVaCapture();
+              }
+            }
             print("🎤 语音识别结果: $text");
-            await _processUserInput(text);
+            await _processUserInput(
+              text,
+              vaResult: vaResult,
+              precomputedRouterDecision: routerDecision,
+            );
           }
         } catch (e, st) {
           print("❌ VOSK onResult 处理异常: $e\n$st");
@@ -1106,6 +1260,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
           final text = (result['partial'] ?? '').toString().trim();
           if (text.isNotEmpty) {
             _speechText = text;
+            _maybeEnableVaVisionFromTranscript(text);
             notifyListeners();
           }
         } catch (e) {
@@ -1149,13 +1304,13 @@ class SpeechNotifierSimplified with ChangeNotifier {
   }
 
   /// 处理用户输入（转发给连续对话控制器）
-  Future<void> _processUserInput(String input) async {
+  Future<void> _processUserInput(
+    String input, {
+    Map<String, dynamic>? vaResult,
+    RouterDecision? precomputedRouterDecision,
+  }) async {
     if (input.isEmpty) return;
 
-    ConversationFlowTracer.asr(
-      '_processUserInput -> conversationController.processUserInput '
-      'len=${input.length}',
-    );
     _speechText = input;
     notifyListeners();
 
@@ -1171,12 +1326,27 @@ class SpeechNotifierSimplified with ChangeNotifier {
       await stopVoiceRecognition(resumeSherpaKws: false);
     }
 
-    await _conversationController.processUserInput(input);
+    await _conversationController.processUserInput(
+      input,
+      vaResult: vaResult,
+      precomputedRouterDecision: precomputedRouterDecision,
+    );
   }
 
   /// 兼容性方法：外部调用
   Future<void> processUserInput(String input) async {
     await _processUserInput(input);
+  }
+
+  void _maybeEnableVaVisionFromTranscript(String text) {
+    final manager = _vaSessionManager;
+    if (manager == null || manager.sessionId == null) return;
+    final normalized = text.trim();
+    if (normalized.isEmpty) return;
+    final hit = _vaVisionKeywords.any((keyword) => normalized.contains(keyword));
+    if (!hit) return;
+    print('🎯 [VA] 命中视觉增强关键词 transcript="$normalized"');
+    manager.enableVisionEnhancement();
   }
 
   /// 退出连续对话后清空 ASR 展示文案，避免 home 旧版「读词猜表情」把尾稿判成可爱脸
