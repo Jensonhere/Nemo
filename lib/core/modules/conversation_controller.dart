@@ -1831,10 +1831,11 @@ class ConversationController extends ChangeNotifier {
   ConversationContextPack _buildContextPack({
     Map<String, dynamic>? vaResult,
   }) {
-    final fusionSummary = vaResult?['fusion_summary']?.toString().trim();
-    final vaValuesSummary = vaResult?['values_summary']?.toString().trim();
-    final vaTagsSummary = vaResult?['tags_summary']?.toString().trim();
-    final vaPromptHint = vaResult?['llm_prompt_hint']?.toString().trim();
+    final fusionRaw = vaResult?['fusion_summary'];
+    final fusionSummary = _summarizeVaForCompanion(fusionRaw);
+    final vaValuesSummary = _summarizeVaValuesForCompanion(fusionRaw);
+    final vaTagsSummary = _summarizeVaTagsForCompanion(fusionRaw);
+    final vaPromptHint = _buildVaPromptHintForCompanion(fusionRaw);
     return ConversationContextPack(
       recentTurnLines: List<String>.from(_dialogTurnLines),
       userEmotionFromVa:
@@ -1850,7 +1851,199 @@ class ConversationController extends ChangeNotifier {
       deviceStateLine: '基座电量与传感器详情：待硬件上报',
       environmentSummary: null,
       idleSinceDescription: _describeIdleSince(),
-    );
+      );
+  }
+
+  Map<String, dynamic>? _asStringDynamicMap(Object? value) {
+    if (value is Map<String, dynamic>) return value;
+    if (value is Map) {
+      return value.map(
+        (key, dynamic val) => MapEntry(key.toString(), val),
+      );
+    }
+    return null;
+  }
+
+  double? _asDouble(Object? value) {
+    if (value is num) return value.toDouble();
+    return double.tryParse(value?.toString() ?? '');
+  }
+
+  String? _summarizeVaForCompanion(Object? fusionRaw) {
+    final fusion = _asStringDynamicMap(fusionRaw);
+    if (fusion == null || fusion.isEmpty) return null;
+    final emotion = (fusion['emotion'] ?? '').toString().trim();
+    final valence = _asDouble(fusion['valence']);
+    final arousal = _asDouble(fusion['arousal']);
+    final dominance = _asDouble(fusion['dominance']);
+    final tags = (fusion['va_tags'] is List)
+        ? List<String>.from((fusion['va_tags'] as List).map((e) => e.toString()))
+        : const <String>[];
+
+    final state = _describeVaState(emotion, valence, arousal, tags);
+    final tone = _describeVaTone(valence, arousal, tags);
+    final control = _describeVaControl(dominance, tags);
+    return '本轮状态判断：$state；整体语气：$tone；外在撑着程度：$control。';
+  }
+
+  String? _summarizeVaValuesForCompanion(Object? fusionRaw) {
+    final fusion = _asStringDynamicMap(fusionRaw);
+    if (fusion == null || fusion.isEmpty) return null;
+    final valence = _asDouble(fusion['valence']);
+    final arousal = _asDouble(fusion['arousal']);
+    final dominance = _asDouble(fusion['dominance']);
+    if (valence == null && arousal == null && dominance == null) return null;
+
+    final valenceText = valence == null
+        ? '未知'
+        : (valence <= -0.25
+            ? '偏负向'
+            : (valence >= 0.25 ? '偏正向' : '接近中性'));
+    final arousalText = arousal == null
+        ? '未知'
+        : (arousal <= -0.2
+            ? '偏低唤醒（更累、更慢）'
+            : (arousal >= 0.25 ? '偏高唤醒（更紧、更绷）' : '中等唤醒'));
+    final dominanceText = dominance == null
+        ? '未知'
+        : (dominance >= 0.2
+            ? '偏能撑着/偏克制'
+            : (dominance <= -0.2 ? '偏无力/偏没底气' : '中等'));
+    return 'VA数值可解释为：情绪倾向=$valenceText；激活程度=$arousalText；掌控感=$dominanceText。';
+  }
+
+  String? _summarizeVaTagsForCompanion(Object? fusionRaw) {
+    final fusion = _asStringDynamicMap(fusionRaw);
+    if (fusion == null || fusion.isEmpty) return null;
+    final tags = (fusion['va_tags'] is List)
+        ? List<String>.from((fusion['va_tags'] as List).map((e) => e.toString()))
+        : const <String>[];
+    if (tags.isEmpty) return null;
+
+    final mapped = tags.map(_translateVaTagToChinese).where((e) => e.isNotEmpty).toList();
+    if (mapped.isEmpty) return null;
+    return '可参考的状态标签：${mapped.join('、')}。';
+  }
+
+  String? _buildVaPromptHintForCompanion(Object? fusionRaw) {
+    final fusion = _asStringDynamicMap(fusionRaw);
+    if (fusion == null || fusion.isEmpty) return null;
+    final emotion = (fusion['emotion'] ?? '').toString().trim();
+    final valence = _asDouble(fusion['valence']);
+    final arousal = _asDouble(fusion['arousal']);
+    final tags = (fusion['va_tags'] is List)
+        ? List<String>.from((fusion['va_tags'] as List).map((e) => e.toString()))
+        : const <String>[];
+
+    final state = _describeVaState(emotion, valence, arousal, tags);
+    final advice = _buildCompanionReplyAdvice(emotion, valence, arousal, tags);
+    return '请把用户理解为：$state。回复时先做柔和观察，再做共情安抚；$advice 禁止提“看不到表情/无法看到你”，禁止机械复述标签名。';
+  }
+
+  String _describeVaState(
+    String emotion,
+    double? valence,
+    double? arousal,
+    List<String> tags,
+  ) {
+    if (emotion == 'tense_negative' ||
+        tags.contains('negative_valence') && tags.contains('high_arousal')) {
+      return '偏紧张、心里压着事，像是在硬撑';
+    }
+    if (tags.contains('negative_valence') && tags.contains('low_arousal')) {
+      return '偏疲惫、低落，像是有点提不起劲';
+    }
+    if (tags.contains('positive_valence') && tags.contains('low_arousal')) {
+      return '整体比较平稳，情绪不算糟，但也偏安静';
+    }
+    if (emotion == 'neutral' || tags.contains('neutral')) {
+      return '整体比较平静，但可能有些没说出来的心事';
+    }
+    if ((valence ?? 0) < -0.2 && (arousal ?? 0) > 0.2) {
+      return '情绪偏紧、偏烦，内心不太放松';
+    }
+    if ((valence ?? 0) < -0.2 && (arousal ?? 0) <= 0.2) {
+      return '情绪偏低，像是累了或者有点没精神';
+    }
+    if ((valence ?? 0) > 0.2) {
+      return '状态还算稳，没有明显低落';
+    }
+    return '状态总体平稳，但值得用温和方式继续确认感受';
+  }
+
+  String _describeVaTone(double? valence, double? arousal, List<String> tags) {
+    if (tags.contains('high_arousal') || (arousal ?? 0) >= 0.25) {
+      return '偏紧、偏急，需要先放缓';
+    }
+    if (tags.contains('low_arousal') || (arousal ?? 0) <= -0.2) {
+      return '偏疲惫、偏慢，适合轻声接住';
+    }
+    if (tags.contains('positive_valence') || (valence ?? 0) >= 0.25) {
+      return '还算平和';
+    }
+    if (tags.contains('negative_valence') || (valence ?? 0) <= -0.25) {
+      return '隐约有点低落';
+    }
+    return '中性偏平静';
+  }
+
+  String _describeVaControl(double? dominance, List<String> tags) {
+    if (tags.contains('high_dominance') || (dominance ?? 0) >= 0.2) {
+      return '表面上还能撑住，但不代表真的轻松';
+    }
+    if (tags.contains('balanced_dominance')) {
+      return '看起来还算稳';
+    }
+    return '可能更需要被接住';
+  }
+
+  String _buildCompanionReplyAdvice(
+    String emotion,
+    double? valence,
+    double? arousal,
+    List<String> tags,
+  ) {
+    if (emotion == 'tense_negative' ||
+        tags.contains('negative_valence') && tags.contains('high_arousal')) {
+      return '更适合先接住紧张和不安，再给一句“慢慢来/先缓一口气也行”这类低压力安抚；';
+    }
+    if (tags.contains('negative_valence') && tags.contains('low_arousal')) {
+      return '更适合先承认“你可能有点累了”，再允许休息，给很轻的照顾建议；';
+    }
+    if (emotion == 'neutral' || tags.contains('neutral')) {
+      return '更适合用“看起来还算平静，但像是有点心事”这类保守观察，不要夸大；';
+    }
+    if ((valence ?? 0) > 0.2 && (arousal ?? 0) < 0.2) {
+      return '更适合说状态总体还稳，但仍认真接住用户主诉，不要只报喜；';
+    }
+    return '更适合先观察、再陪伴、最后轻轻追问，不要一上来就给很多建议；';
+  }
+
+  String _translateVaTagToChinese(String tag) {
+    switch (tag) {
+      case 'positive_valence':
+        return '偏正向';
+      case 'negative_valence':
+        return '偏负向';
+      case 'balanced_valence':
+        return '情绪倾向较平衡';
+      case 'high_arousal':
+        return '偏高唤醒/偏紧绷';
+      case 'medium_arousal':
+        return '中等唤醒';
+      case 'low_arousal':
+        return '偏低唤醒/偏疲惫';
+      case 'high_dominance':
+        return '表面掌控感较强';
+      case 'balanced_dominance':
+        return '掌控感较平衡';
+      case 'neutral':
+        return '整体中性';
+      case 'tense_negative':
+        return '紧张偏负面';
+      default:
+        return tag;
+    }
   }
 
   /// Router 用：天气/地理问法注入**仅后台缓存**（不在 Router 轮内阻塞 HTTP）；
