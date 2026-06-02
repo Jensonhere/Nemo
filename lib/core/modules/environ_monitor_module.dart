@@ -1,64 +1,119 @@
 import 'dart:async';
-import 'dart:math';
-import 'package:flutter/material.dart';
-import 'package:voicegpt/core/services/camera_service.dart';
-import 'package:voicegpt/core/services/bluetooth_service.dart'
-    show
-        DeviceResponseEvent,
-        MotionCompletedEvent,
-        MotionInterruptedEvent,
-        MyBluetoothService,
-        SensorStatusEvent;
-import 'package:voicegpt/core/services/voice_tts_service.dart';
+
 import 'package:voicegpt/core/modules/ui_animation_module.dart';
-import 'package:flutter/foundation.dart';
+import 'package:voicegpt/core/services/bluetooth_service.dart'
+    show MyBluetoothService;
+import 'package:voicegpt/core/services/camera_service.dart';
+import 'package:voicegpt/core/services/voice_tts_service.dart';
+
+enum SnapshotTargetType {
+  none,
+  face,
+  person,
+}
+
+class SnapshotAlignStatus {
+  SnapshotAlignStatus._();
+
+  static const String verifiedFaceCentered = 'verified_face_centered';
+  static const String verifiedFaceAcceptable = 'verified_face_acceptable';
+  static const String verifiedPersonAcceptable = 'verified_person_acceptable';
+  static const String stillOffcenter = 'still_offcenter';
+  static const String targetLostAfterNudge = 'target_lost_after_nudge';
+  static const String noTarget = 'no_target';
+}
+
+class SnapshotAlignResult {
+  const SnapshotAlignResult({
+    required this.canProceed,
+    required this.finalAlignmentStatus,
+    required this.targetType,
+    this.centerX = 0.5,
+    this.centerY = 0.5,
+    this.confidence = 0,
+    this.areaRatio = 0,
+    this.humanObservation,
+    this.faceObservation,
+    this.imagePath,
+  });
+
+  final bool canProceed;
+  final String finalAlignmentStatus;
+  final SnapshotTargetType targetType;
+  final double centerX;
+  final double centerY;
+  final double confidence;
+  final double areaRatio;
+  final HumanObservation? humanObservation;
+  final FaceObservation? faceObservation;
+  final String? imagePath;
+
+  SnapshotAlignResult copyWith({
+    bool? canProceed,
+    String? finalAlignmentStatus,
+    SnapshotTargetType? targetType,
+    double? centerX,
+    double? centerY,
+    double? confidence,
+    double? areaRatio,
+    HumanObservation? humanObservation,
+    FaceObservation? faceObservation,
+    String? imagePath,
+  }) {
+    return SnapshotAlignResult(
+      canProceed: canProceed ?? this.canProceed,
+      finalAlignmentStatus: finalAlignmentStatus ?? this.finalAlignmentStatus,
+      targetType: targetType ?? this.targetType,
+      centerX: centerX ?? this.centerX,
+      centerY: centerY ?? this.centerY,
+      confidence: confidence ?? this.confidence,
+      areaRatio: areaRatio ?? this.areaRatio,
+      humanObservation: humanObservation ?? this.humanObservation,
+      faceObservation: faceObservation ?? this.faceObservation,
+      imagePath: imagePath ?? this.imagePath,
+    );
+  }
+
+  static SnapshotAlignResult noTarget({
+    HumanObservation? humanObservation,
+    String? imagePath,
+  }) {
+    return SnapshotAlignResult(
+      canProceed: false,
+      finalAlignmentStatus: SnapshotAlignStatus.noTarget,
+      targetType: SnapshotTargetType.none,
+      humanObservation: humanObservation,
+      imagePath: imagePath,
+    );
+  }
+}
 
 class EnvironMonitorModule {
-  MyBluetoothService? _bluetoothService; // 改为可空，等待外部注入
+  static const double _reliableHumanConfidence = 0.50;
+  static const double _reliableHumanMinAreaRatio = 0.01;
+  static const Duration _settleDelay = Duration(milliseconds: 220);
+  static const Duration _shortSettleDelay = Duration(milliseconds: 160);
+  static const Duration _quietCompanionInterval = Duration(seconds: 45);
 
-  // === 依赖服务 ===
+  MyBluetoothService? _bluetoothService;
   VoiceTtsService? _ttsService;
   UIAnimationModule? _uiModule;
-  Function()? _onWakeWordRestart;
-  Function()? _onGestureDetectionStart;
-
-  // === 环境监测变量 ===
-  Timer? _environmentCheckTimer;
-  bool _isEnvironmentMonitoring = false;
-  bool _lastDetectDirectly = false;
-  int _consecutiveInitialDetections = 0; // 连续在初始位置检测到用户的次数
-
-  // === 摄像头服务 ===
   CameraService? _cameraService;
-  bool _humanDetected = false;
-  String _monitorStatus = "环境监测已关闭";
-  bool _isCameraOn = false;
 
-  // === 状态变量 ===
+  Timer? _statePollTimer;
+  Timer? _quietCompanionTimer;
+
+  bool _isEnvironmentMonitoring = false;
   bool _isAnswering = false;
   bool _isTtsPlaying = false;
-  String _humanEmotion = '';
+  bool _degradedToVoiceExpressionOnly = false;
+  String _monitorStatus = '环境监测已关闭';
+  bool Function()? _isAnsweringProvider;
+  bool Function()? _isTtsPlayingProvider;
 
-  // === 表情资源 ===
-  final List<String> _happyExpressions = [
-    'assets/emotion/face2/可爱/02/可爱 02.json',
-    'assets/emotion/face2/眨眼.json',
-  ];
-  final List<String> _sadExpressions = [
-    'assets/emotion/face2/失落/02/失落 02.json',
-    'assets/emotion/face2/疑惑/01/疑惑 01.json',
-  ];
-  final List<String> _surprisedExpressions = [
-    'assets/emotion/face2/惊讶/02/惊讶 02.json',
-  ];
-  final List<String> _angryExpressions = [
-    'assets/emotion/face2/愤怒/02/愤怒 02.json',
-  ];
-
-  // === 依赖注入方法 ===
   void setBluetoothService(MyBluetoothService bluetoothService) {
     _bluetoothService = bluetoothService;
-    print("🔗 环境监测模块：蓝牙服务已设置");
+    print('🔗 环境监测模块：蓝牙服务已设置');
   }
 
   void setTTSService(VoiceTtsService ttsService) {
@@ -75,707 +130,599 @@ class EnvironMonitorModule {
     Function()? onWakeWordRestart,
     Function()? onGestureDetectionStart,
   }) {
-    _onWakeWordRestart = onWakeWordRestart;
-    _onGestureDetectionStart = onGestureDetectionStart;
-    // 定期更新状态
-    Timer.periodic(Duration(milliseconds: 500), (timer) {
-      if (!_isEnvironmentMonitoring) {
-        timer.cancel();
-        return;
-      }
-      _isAnswering = isAnswering();
-      _isTtsPlaying = isTtsPlaying();
-    });
+    _isAnsweringProvider = isAnswering;
+    _isTtsPlayingProvider = isTtsPlaying;
+    _cancelStatePollTimer();
   }
 
-  // === 公共接口方法 ===
-  void startEnvironmentMonitoring() => _startEnvironmentMonitoring();
+  void startEnvironmentMonitoring() {
+    if (_isEnvironmentMonitoring) {
+      print('[ENV_V1] already_running status=$_monitorStatus');
+      return;
+    }
+
+    _restartStatePollTimer();
+    _isEnvironmentMonitoring = true;
+    _degradedToVoiceExpressionOnly = false;
+    _monitorStatus = '环境监测 V1 启动';
+    _quietCompanionTimer?.cancel();
+    _quietCompanionTimer = null;
+    unawaited(_runEnvironmentMonitorV1());
+  }
 
   void stopEnvironmentMonitoring() {
-    _cleanupEnvironmentMonitoring();
+    unawaited(_cleanupEnvironmentMonitoring());
   }
 
   bool get isMonitoring => _isEnvironmentMonitoring;
   String get monitorStatus => _monitorStatus;
 
-  /// 检查蓝牙连接状态
-  bool _checkBluetoothConnection() {
-    if (_bluetoothService == null) {
-      print("❌ 蓝牙服务未设置！环境监测模块需要蓝牙服务实例");
-      return false;
+  Future<void> _runEnvironmentMonitorV1() async {
+    print('[ENV_V1] start');
+    _uiModule?.setProgramMode(ProgramMode.environmentCheck);
+
+    try {
+      await _ensureCameraService();
+      if (!_isEnvironmentMonitoring) return;
+
+      await _loadExpression('assets/emotion/face2/观察/01/观察 01.json');
+      await speakWithInterruptProtection('主人，你在这里吗？');
+
+      final found = await _runSearchOwnerV1();
+      if (!_isEnvironmentMonitoring) return;
+
+      final tracked = found == null ? null : await _runTrackOwnerV1(found);
+      if (!_isEnvironmentMonitoring) return;
+
+      final confirmed = tracked == null
+          ? SnapshotAlignResult.noTarget()
+          : await _runConfirmOwnerBySnapshotV1(tracked);
+      if (!_isEnvironmentMonitoring) return;
+
+      final finalResult = await _runFinalFaceCenteringV1(confirmed);
+      if (!_isEnvironmentMonitoring) return;
+
+      await _runInteractOwnerV1(finalResult);
+      await _disposeCameraService();
+      await _enterQuietCompanionModeV1();
+    } catch (e, st) {
+      _monitorStatus = '环境监测 V1 异常: $e';
+      print('[ENV_V1] error=$e\n$st');
+      await _degradeToVoiceExpressionOnly('exception');
+      await _disposeCameraService();
+      await _enterQuietCompanionModeV1();
     }
-    if (!_bluetoothService!.isConnected) {
-      print("❌ 蓝牙未连接！环境监测需要蓝牙控制机器人移动");
-      return false;
-    }
-    return true;
   }
 
-  // === 环境监测主方法 ===
-  void _startEnvironmentMonitoring() async {
-    // if (speech_isInConversationMode) {
-    //   print("🗨 连续对话模式已开启，无法进行环境监测");
-    //   return;
-    // }
+  Future<HumanObservation?> _runSearchOwnerV1() async {
+    print('[ENV_V1_SEARCH] start');
+    _monitorStatus = 'SEARCH: 原地找人';
 
-    // 🔴 检查蓝牙连接状态
-    if (!_checkBluetoothConnection()) {
-      print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      print("⛔ 环境监测需要蓝牙连接");
-      print("");
-      print("📋 环境监测功能需要蓝牙来：");
-      print("   1. 控制机器人移动（旋转、前进、后退）");
-      print("   2. 获取传感器状态（障碍物、悬崖检测）");
-      print("   3. 控制头部角度调整");
-      print("");
-      print("💡 解决方案：");
-      print("   1. 确保机器人已开机");
-      print("   2. 在设置中连接机器人蓝牙");
-      print("   3. 连接成功后，环境监测将自动启动");
-      print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      _monitorStatus = "蓝牙未连接，无法启动环境监测";
-      return;
+    final initial = await _detectHumanObservationSafe();
+    print(
+      '[ENV_V1_SEARCH] initial_check hasHuman=${initial.hasHuman} '
+      'conf=${_f(initial.confidence)} area=${_f(initial.areaRatio)} '
+      'cx=${_f(initial.centerX)}',
+    );
+    if (_isReliableHumanObservation(initial)) {
+      print('[ENV_V1_SEARCH] confirmed');
+      return initial;
     }
 
-    if (!_isEnvironmentMonitoring) {
-      print("🌍 开启环境监测功能");
-      print("✅ 蓝牙已连接，可以控制机器人");
-      _isEnvironmentMonitoring = true;
-      try {
-        // 延迟初始化摄像头服务，只在需要时初始化
-        if (_cameraService == null) {
-          _cameraService = CameraService();
-          print("📷 延迟初始化CameraService");
-        }
+    const sweepPlan = <_TurnStep>[
+      _TurnStep('左转', 15),
+      _TurnStep('右转', 30),
+      _TurnStep('右转', 30),
+      _TurnStep('左转', 30),
+      _TurnStep('左转', 15),
+    ];
 
-        // 确保摄像头服务正确初始化
-        await _cameraService!.initialize();
-        _isCameraOn = true;
-        print("📷 CameraService初始化完成");
-
-        // 起始位置检测到人且上次也是起始位置检测到人，说明人没动
-        bool currentDetectDirectly = await _detectHumanAtPosition();
-
-        // 检查连续在初始位置检测到用户的情况
-        if (currentDetectDirectly && _lastDetectDirectly) {
-          _consecutiveInitialDetections += 1;
-          print("✅ 连续在初始位置检测到用户，计数: $_consecutiveInitialDetections");
-
-          // 连续十次在初始位置检测到用户，提醒休息
-          if (_consecutiveInitialDetections >= 10) {
-            /// TODO:语音与表情显示修改
-            // await speakWithInterruptProtection("主人，该休息一下了！");
-            // _loadExpression('assets/face/晕');
-            _consecutiveInitialDetections = 0;
-            print("🔄 已提醒用户休息，重置连续监测计数器");
-          }
-        } else {
-          // 重置连续检测计数器
-          _consecutiveInitialDetections = 0;
-          print("🔄 重置连续检测计数器");
-        }
-
-        // 更新上一次监测结果
-        _lastDetectDirectly = currentDetectDirectly;
-        if (!currentDetectDirectly) {
-          // 启动基座旋转扫描
-          await _performEnvironmentScan();
-        }
-      } catch (e) {
-        _monitorStatus = "环境监测启动失败: $e";
-        print('环境监测启动失败: $e');
-      } finally {
-        // 关闭摄像头服务
-        _isEnvironmentMonitoring = false;
-        _isCameraOn = false;
-        _humanDetected = false;
-        if (_cameraService != null) {
-          try {
-            _cameraService!.stopRealTimeDetection();
-            print("⏹️ 停止实时图像流监测");
-            await _cameraService!.dispose();
-            _cameraService = null;
-            print("📷 摄像头资源已释放");
-          } catch (disposeError) {
-            print("⚠️ 清理摄像头资源失败: $disposeError");
-          }
-        }
+    for (final step in sweepPlan) {
+      if (!_isEnvironmentMonitoring) return null;
+      final tag = step.command == '左转' ? 'turn_left' : 'turn_right';
+      print('[ENV_V1_SEARCH] $tag angle=${step.angleDeg}');
+      final moved = await _safeSendCommandV1(step.command, step.angleDeg);
+      if (!moved) {
+        print(
+            '[ENV_V1_SEARCH] abort reason=bluetooth_disconnected/write_failed');
+        return null;
       }
+
+      await _safeSendCommandV1('停止', 0);
+      await Future<void>.delayed(_settleDelay);
+
+      final candidate = await _detectHumanObservationSafe();
+      print(
+        '[ENV_V1_SEARCH] candidate conf=${_f(candidate.confidence)} '
+        'area=${_f(candidate.areaRatio)} cx=${_f(candidate.centerX)}',
+      );
+      if (_isReliableHumanObservation(candidate)) {
+        print('[ENV_V1_SEARCH] confirmed');
+        return candidate;
+      }
+    }
+
+    await _safeSendCommandV1('停止', 0);
+    print('[ENV_V1_SEARCH] no_target');
+    return null;
+  }
+
+  Future<HumanObservation> _runTrackOwnerV1(HumanObservation initial) async {
+    final dx = initial.centerX - 0.5;
+    final absDx = dx.abs();
+    print(
+      '[ENV_V1_TRACK] start cx=${_f(initial.centerX)} dx=${_f(dx)}',
+    );
+    _monitorStatus = 'TRACK: 人体粗回正';
+
+    int angle = 0;
+    if (absDx <= 0.10) {
+      angle = 0;
+    } else if (absDx <= 0.20) {
+      angle = 5;
+    } else if (absDx <= 0.35) {
+      angle = 8;
     } else {
-      print("🌍 环境检测功能已开启！！！");
+      angle = 12;
+    }
+
+    final direction = dx > 0 ? '右转' : '左转';
+    print(
+      '[ENV_V1_TRACK] decision angle=$angle direction=$direction',
+    );
+
+    if (angle > 0) {
+      final moved = await _safeSendCommandV1(direction, angle);
+      if (!moved) {
+        print('[ENV_V1_TRACK] fallback_old_observation');
+        return initial;
+      }
+      await _safeSendCommandV1('停止', 0);
+      await Future<void>.delayed(_settleDelay);
+    }
+
+    final fresh = await _detectHumanObservationSafe();
+    print(
+      '[ENV_V1_TRACK] fresh_observation hasHuman=${fresh.hasHuman} '
+      'conf=${_f(fresh.confidence)} area=${_f(fresh.areaRatio)} '
+      'cx=${_f(fresh.centerX)}',
+    );
+
+    if (!_isReliableHumanObservation(fresh)) {
+      print('[ENV_V1_TRACK] fallback_old_observation');
+      print('[ENV_V1_TRACK] done');
+      return initial;
+    }
+
+    print('[ENV_V1_TRACK] done');
+    return fresh;
+  }
+
+  Future<SnapshotAlignResult> _runConfirmOwnerBySnapshotV1(
+    HumanObservation tracked,
+  ) async {
+    _monitorStatus = 'CONFIRM: snapshot 视觉确认';
+    print('[ENV_V1_CONFIRM] capture start');
+    await _safeSendCommandV1('停止', 0);
+    await Future<void>.delayed(_settleDelay);
+    return _captureSnapshotAlignResultV1(tracked);
+  }
+
+  Future<SnapshotAlignResult> _captureSnapshotAlignResultV1(
+    HumanObservation? tracked,
+  ) async {
+    try {
+      final camera = _cameraService;
+      if (camera == null) {
+        print('[ENV_V1_CONFIRM] target=none reason=camera_unavailable');
+        return SnapshotAlignResult.noTarget(humanObservation: tracked);
+      }
+
+      final imagePath = await camera.captureImage();
+      print('[ENV_V1_CONFIRM] imagePath=$imagePath');
+
+      final face = await camera.detectFaceObservationFromImagePath(imagePath);
+      print(
+        '[ENV_V1_CONFIRM] face hasFace=${face.hasFace} '
+        'conf=${_f(face.confidence)} cx=${_f(face.centerX)}',
+      );
+
+      final person =
+          await camera.detectHumanObservationFromImagePath(imagePath);
+      print(
+        '[ENV_V1_CONFIRM] person hasHuman=${person.hasHuman} '
+        'conf=${_f(person.confidence)} area=${_f(person.areaRatio)} '
+        'cx=${_f(person.centerX)}',
+      );
+
+      if (face.hasFace) {
+        print('[ENV_V1_CONFIRM] target=face');
+        return SnapshotAlignResult(
+          canProceed: true,
+          finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+          targetType: SnapshotTargetType.face,
+          centerX: face.centerX,
+          centerY: face.centerY,
+          confidence: face.confidence,
+          areaRatio: face.areaRatio,
+          humanObservation: person.hasHuman ? person : tracked,
+          faceObservation: face,
+          imagePath: imagePath,
+        );
+      }
+
+      if (_isReliableHumanObservation(person)) {
+        print('[ENV_V1_CONFIRM] target=person');
+        return SnapshotAlignResult(
+          canProceed: true,
+          finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+          targetType: SnapshotTargetType.person,
+          centerX: person.centerX,
+          centerY: person.centerY,
+          confidence: person.confidence,
+          areaRatio: person.areaRatio,
+          humanObservation: person,
+          imagePath: imagePath,
+        );
+      }
+
+      print('[ENV_V1_CONFIRM] target=none');
+      return SnapshotAlignResult.noTarget(
+        humanObservation: tracked,
+        imagePath: imagePath,
+      );
+    } catch (e) {
+      print('[ENV_V1_CONFIRM] target=none error=$e');
+      return SnapshotAlignResult.noTarget(humanObservation: tracked);
     }
   }
 
-  // === 新增: 执行环境扫描 ===
-  Future<void> _performEnvironmentScan() async {
-    const int maxMoves = 100; // 最大移动次数
-    int moveCount = 0;
+  Future<SnapshotAlignResult> _runFinalFaceCenteringV1(
+    SnapshotAlignResult result,
+  ) async {
+    final dx = result.centerX - 0.5;
+    final absDx = dx.abs();
+    final target = result.targetType.name;
+    print(
+      '[ENV_V1_FINAL_CENTER] start target=$target '
+      'cx=${_f(result.centerX)} dx=${_f(dx)}',
+    );
+    _monitorStatus = 'FINAL_CENTER: snapshot 居中确认';
 
-    // 设置人类检测回调
-    _cameraService!.setOnHumanDetectedCallback((hasCenteredHuman) {
-      if (hasCenteredHuman && _isCameraOn && _isEnvironmentMonitoring) {
-        print("🎯 移动过程中检测到用户");
-        _humanDetected = true;
-        _bluetoothService!.sendCommand('停止', 0);
+    if (result.targetType == SnapshotTargetType.none) {
+      print(
+          '[ENV_V1_FINAL_CENTER] decision action=no_target direction=none angle=0');
+      print('[ENV_V1_FINAL_CENTER] result=${SnapshotAlignStatus.noTarget}');
+      return result.copyWith(
+        canProceed: false,
+        finalAlignmentStatus: SnapshotAlignStatus.noTarget,
+      );
+    }
+
+    if (result.targetType == SnapshotTargetType.person) {
+      final status = absDx <= 0.16
+          ? SnapshotAlignStatus.verifiedPersonAcceptable
+          : SnapshotAlignStatus.stillOffcenter;
+      print(
+        '[ENV_V1_FINAL_CENTER] decision action=person_only '
+        'direction=none angle=0',
+      );
+      print('[ENV_V1_FINAL_CENTER] result=$status');
+      return result.copyWith(finalAlignmentStatus: status);
+    }
+
+    if (absDx <= 0.08) {
+      print(
+        '[ENV_V1_FINAL_CENTER] decision action=centered '
+        'direction=none angle=0',
+      );
+      print(
+        '[ENV_V1_FINAL_CENTER] result=${SnapshotAlignStatus.verifiedFaceCentered}',
+      );
+      return result.copyWith(
+        finalAlignmentStatus: SnapshotAlignStatus.verifiedFaceCentered,
+      );
+    }
+
+    if (absDx > 0.28) {
+      print(
+        '[ENV_V1_FINAL_CENTER] decision action=too_far '
+        'direction=none angle=0',
+      );
+      print(
+          '[ENV_V1_FINAL_CENTER] result=${SnapshotAlignStatus.stillOffcenter}');
+      return result.copyWith(
+        finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+      );
+    }
+
+    final angle = absDx <= 0.12
+        ? 3
+        : absDx <= 0.18
+            ? 5
+            : 7;
+    final direction = dx > 0 ? '右转' : '左转';
+    print(
+      '[ENV_V1_FINAL_CENTER] decision action=nudge '
+      'direction=$direction angle=$angle',
+    );
+
+    final moved = await _safeSendCommandV1(direction, angle);
+    if (!moved) {
+      print(
+          '[ENV_V1_FINAL_CENTER] result=${SnapshotAlignStatus.stillOffcenter}');
+      return result.copyWith(
+        finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+      );
+    }
+    await _safeSendCommandV1('停止', 0);
+    await Future<void>.delayed(_settleDelay);
+
+    final verified = await _captureSnapshotAlignResultV1(
+      result.humanObservation,
+    );
+    final updated = _classifyAfterNudge(verified);
+    print(
+      '[ENV_V1_FINAL_CENTER] verify_after_nudge '
+      'hasFace=${verified.faceObservation?.hasFace ?? false} '
+      'faceCx=${_f(verified.faceObservation?.centerX ?? 0.5)} '
+      'hasHuman=${verified.humanObservation?.hasHuman ?? false} '
+      'personCx=${_f(verified.humanObservation?.centerX ?? 0.5)}',
+    );
+    print('[ENV_V1_FINAL_CENTER] result=$updated');
+    return verified.copyWith(finalAlignmentStatus: updated);
+  }
+
+  String _classifyAfterNudge(SnapshotAlignResult verified) {
+    if (verified.targetType == SnapshotTargetType.face) {
+      final faceDx =
+          (verified.faceObservation?.centerX ?? verified.centerX) - 0.5;
+      if (faceDx.abs() <= 0.08) {
+        return SnapshotAlignStatus.verifiedFaceCentered;
       }
+      if (faceDx.abs() <= 0.16) {
+        return SnapshotAlignStatus.verifiedFaceAcceptable;
+      }
+      return SnapshotAlignStatus.stillOffcenter;
+    }
+
+    final person = verified.humanObservation;
+    if (person != null && _isReliableHumanObservation(person)) {
+      final personDx = person.centerX - 0.5;
+      if (personDx.abs() <= 0.16) {
+        return SnapshotAlignStatus.verifiedPersonAcceptable;
+      }
+      return SnapshotAlignStatus.stillOffcenter;
+    }
+
+    return SnapshotAlignStatus.targetLostAfterNudge;
+  }
+
+  Future<void> _runInteractOwnerV1(SnapshotAlignResult result) async {
+    _monitorStatus = 'INTERACT: 陪伴互动';
+    final isStrictlyCentered =
+        result.finalAlignmentStatus == SnapshotAlignStatus.verifiedFaceCentered;
+    final greetingLine = _greetingLineForStatus(result.finalAlignmentStatus);
+
+    print(
+      '[ENV_V1_INTERACT] status=${result.finalAlignmentStatus} '
+      'greetingLine=$greetingLine',
+    );
+    await _loadExpression(
+      isStrictlyCentered
+          ? 'assets/emotion/face2/可爱/02/可爱 02.json'
+          : 'assets/emotion/face2/观察/02/观察 02.json',
+    );
+    await speakWithInterruptProtection(greetingLine);
+
+    if (!_isEnvironmentMonitoring) return;
+    await speakWithInterruptProtection('要不要和我说句话？');
+    await Future<void>.delayed(const Duration(seconds: 6));
+    print('[ENV_V1_INTERACT] enter_quiet_companion reason=no_reply');
+  }
+
+  String _greetingLineForStatus(String status) {
+    switch (status) {
+      case SnapshotAlignStatus.verifiedFaceCentered:
+        return '找到你啦，主人！';
+      case SnapshotAlignStatus.verifiedFaceAcceptable:
+      case SnapshotAlignStatus.verifiedPersonAcceptable:
+      case SnapshotAlignStatus.stillOffcenter:
+        return '我看到你啦，主人。';
+      case SnapshotAlignStatus.targetLostAfterNudge:
+        return '我刚才好像看到你啦，主人，我先乖乖待着。';
+      case SnapshotAlignStatus.noTarget:
+      default:
+        return '我没看太清，主人，我先在这里陪你。';
+    }
+  }
+
+  Future<void> _enterQuietCompanionModeV1() async {
+    if (!_isEnvironmentMonitoring) return;
+    _monitorStatus = 'QUIET_COMPANION: 安静陪伴中';
+    await _loadExpression('assets/emotion/face2/眨眼.json');
+    print('[ENV_V1_QUIET] enter mode=voice_expression_only_no_movement');
+
+    _quietCompanionTimer?.cancel();
+    _quietCompanionTimer = Timer.periodic(_quietCompanionInterval, (_) {
+      if (!_isEnvironmentMonitoring || _isAnswering || _isTtsPlaying) {
+        return;
+      }
+      unawaited(_performPetMicroActionV1());
     });
-
-    // 开始实时检测
-    _cameraService!.startRealTimeDetection();
-
-    // 随机确定初始旋转方向
-    bool rotateRight = Random().nextBool();
-
-    while (moveCount < maxMoves && _isCameraOn && _isEnvironmentMonitoring) {
-      moveCount++;
-      _monitorStatus = "扫描中 - 第$moveCount次移动";
-      print(_monitorStatus);
-
-      /// TODO:语音与表情显示修改
-      // // 语音播报
-      // await speakWithInterruptProtection("主人，你在这里吗？");
-      // _loadExpression('assets/face/观察');
-
-      // 移动到下一个随机位置
-      await _moveToRandomPosition(rotateRight);
-
-      // 检查是否在移动过程中检测到人类
-      if (_humanDetected) {
-        print("✅ 移动过程中已检测到用户，处理中...");
-        bool shouldContinue = await _handleHumanDetected();
-
-        if (shouldContinue) {
-          print("✅ 用户已交互，停止扫描");
-          return; // 停止环境监测
-        } else {
-          print("⏩ 用户未交互，继续扫描");
-          _humanDetected = false; // 重置标志继续扫描
-          // 继续循环
-        }
-      } else {
-        await _handleNoHumanDetected();
-        print("⏩ 未检测到用户，继续扫描");
-      }
-
-      // 下一次旋转方向仍随机
-      rotateRight = Random().nextBool();
-    }
-
-    if (_isCameraOn && _isEnvironmentMonitoring) {
-      _monitorStatus = "扫描完成，未检测到人类";
-      print("环境扫描完成，未发现人员活动");
-
-      // 确保完全清理环境监测状态
-      await _cleanupEnvironmentMonitoring();
-
-      // 播放退出提示
-      await _speakExitMessage("我先睡了哦");
-
-      // 重新启动唤醒词检测
-      await _restartWakeWordDetection();
-
-      // === 环境监测，设置时间为300s ===
-      _environmentCheckTimer?.cancel();
-      _environmentCheckTimer = Timer(const Duration(seconds: 300), () {
-        if (!_isEnvironmentMonitoring && !_isAnswering && !_isTtsPlaying) {
-          _startEnvironmentMonitoring();
-        }
-      });
-    }
   }
 
-  Future<void> _moveToRandomPosition(bool rotateRight) async {
+  Future<void> _performPetMicroActionV1() async {
+    print('[ENV_V1_QUIET] micro_action action=blink_expression_only');
+    await _loadExpression('assets/emotion/face2/眨眼.json');
+  }
+
+  Future<void> _ensureCameraService() async {
+    _cameraService ??= CameraService();
+    await _cameraService!.initialize();
+  }
+
+  Future<HumanObservation> _detectHumanObservationSafe() async {
     try {
-      // 检查基座是否处于平台边缘或障碍附近
-      final sensorStatus = await _getSensorStatus();
-      // 生成随机旋转角度
-      int rotationAngle;
-
-      // 检查基座是否处于平台边缘
-      if (sensorStatus.frontCliff || sensorStatus.frontObstacle) {
-        // 先退一段距离
-        await _executeWithInterruptionCheck(
-            () => _bluetoothService!.sendCommand('后退', 350),
-            description: "后退350mm避免前部碰撞或坠落");
-        // 生成大于90度的旋转角度（91-180度）
-        rotationAngle = 90 + Random().nextInt(91);
-        print("🚨 检测到基座处于平台边缘或遇到障碍，生成大角度旋转: ${rotationAngle}度");
-      } else if (sensorStatus.rearCliff || sensorStatus.rearObstacle) {
-        // 先退10cm
-        await _executeWithInterruptionCheck(
-            () => _bluetoothService!.sendCommand('前进', 350),
-            description: "前进350mm避免后部碰撞或坠落");
-        // 生成小于90度的旋转角度（0-89度）
-        rotationAngle = Random().nextInt(90);
-        print("🚨 检测到基座处于平台边缘或遇到障碍，生成小角度旋转: ${rotationAngle}度");
-      } else {
-        // 正常情况下生成30-150度的随机角度
-        rotationAngle = 30 + Random().nextInt(121);
+      final camera = _cameraService;
+      if (camera == null) {
+        return const HumanObservation(hasHuman: false);
       }
-
-      // 生成随机前进距离（100-300mm）
-      int moveDistance = 100 + Random().nextInt(201);
-
-      await _loadExpression('assets/emotion/face2/眨眼.json');
-
-      // 执行旋转移动（带中断检测）
-      await _executeWithInterruptionCheck(
-          () => rotateRight
-              ? _bluetoothService!.sendCommand('右转', rotationAngle)
-              : _bluetoothService!.sendCommand('左转', rotationAngle),
-          description: rotateRight ? "右转$rotationAngle度" : "左转$rotationAngle度");
-      if (_humanDetected) return;
-      await Future.delayed(Duration(milliseconds: 500)); // 等待旋转完成
-
-      // 调整头部角度为水平
-      await _bluetoothService!.sendCommand('脑袋角度', 14);
-      await Future.delayed(Duration(milliseconds: 300)); // 等待头部调整
-
-      // 前进随机距离（带中断检测）
-      await _loadExpression('assets/emotion/face2/寻找/01/寻找 01.json');
-      await _executeWithInterruptionCheck(
-          () => _bluetoothService!.sendCommand('前进', moveDistance),
-          description: "前进${moveDistance}mm");
-      if (_humanDetected) return;
-      await Future.delayed(Duration(seconds: 1)); // 等待基座稳定
-
-      print("📍 已移动到新的检测位置");
+      return await camera.detectHumanObservation();
     } catch (e) {
-      print("❌ 移动到检测位置失败: $e");
+      print('[ENV_V1_SEARCH] human_detection_failed error=$e');
+      return const HumanObservation(hasHuman: false);
     }
   }
 
-  // 实时获取传感器状态
-  Future<SensorStatusEvent> _getSensorStatus() async {
-    late StreamSubscription<DeviceResponseEvent> subscription;
-    final completer = Completer<SensorStatusEvent>();
-
-    try {
-      // 设置订阅，在发送命令前开始监听
-      subscription = _bluetoothService!.responseStream.listen((event) {
-        if (event is SensorStatusEvent) {
-          // 只处理一次响应
-          if (!completer.isCompleted) {
-            completer.complete(event);
-          }
-        }
-      });
-
-      // 发送查询命令
-      await _bluetoothService!.sendCommand('查询传感器', 0);
-
-      // 等待响应或超时
-      final sensorStatus = await completer.future
-          .timeout(const Duration(seconds: 2), onTimeout: () {
-        debugPrint("⚠️ 传感器状态查询超时");
-        return SensorStatusEvent(
-            frontObstacle: false,
-            rearObstacle: false,
-            frontCliff: false,
-            rearCliff: false);
-      });
-
-      subscription.cancel();
-      return sensorStatus;
-    } catch (e) {
-      debugPrint("❌ 获取传感器状态失败: $e");
-      return SensorStatusEvent(
-          frontObstacle: false,
-          rearObstacle: false,
-          frontCliff: false,
-          rearCliff: false);
-    }
+  bool _isReliableHumanObservation(HumanObservation observation) {
+    return observation.hasHuman &&
+        observation.confidence >= _reliableHumanConfidence &&
+        observation.areaRatio >= _reliableHumanMinAreaRatio &&
+        observation.centerX >= 0.05 &&
+        observation.centerX <= 0.95;
   }
 
-  Future<void> _executeWithInterruptionCheck(Future Function() action,
-      {required String description}) async {
-    final completer = Completer<void>();
-    bool interrupted = false;
-    Timer? sensorCheckTimer;
-
-    // 监听事件（在动作开始前）
-    final subscription = _bluetoothService!.responseStream.listen((event) {
-      if (event is MotionInterruptedEvent) {
-        interrupted = true;
-        _bluetoothService!.sendCommand('停止', 0);
-        completer.completeError(
-            Exception("${description}被中断: ${event.obstacleDescription}"));
-      } else if (event is MotionCompletedEvent) {
-        // 检测到动作完成
-        if (!completer.isCompleted) {
-          completer.complete();
-        }
-      }
-    });
-
-    try {
-      sensorCheckTimer =
-          Timer.periodic(Duration(milliseconds: 1000), (timer) async {
-        try {
-          final sensorStatus = await _getSensorStatus();
-
-          // 检查是否需要立即停止
-          bool shouldStop = false;
-          String stopReason = "";
-
-          if (sensorStatus.frontCliff) {
-            shouldStop = true;
-            stopReason = "前方悬崖";
-          } else if (sensorStatus.frontObstacle) {
-            shouldStop = true;
-            stopReason = "前方障碍";
-          } else if (sensorStatus.rearCliff) {
-            shouldStop = true;
-            stopReason = "后方悬崖";
-          } else if (sensorStatus.rearObstacle) {
-            shouldStop = true;
-            stopReason = "后方障碍";
-          }
-
-          if (shouldStop && !interrupted) {
-            interrupted = true;
-            // 发送停止命令
-            await _bluetoothService!.sendCommand('停止', 0);
-            completer
-                .completeError(Exception("${description}被中断: 检测到$stopReason"));
-            timer.cancel();
-          }
-        } catch (e) {
-          debugPrint("❌ 传感器定期检查失败: $e");
-        }
-      });
-      // 执行动作
-      await action();
-
-      // 等待动作完成或中断（带超时）
-      await completer.future.timeout(Duration(seconds: 10));
-
-      // 如果没有超时且未中断
-      if (!interrupted) {
-        print("✅ $description 完成");
-      }
-    } on TimeoutException {
-      if (!interrupted) {
-        print("⚠️ $description 超时未完成");
-      }
-    } catch (e) {
-      rethrow; // 重新抛出中断错误
-    } finally {
-      subscription.cancel();
-      sensorCheckTimer?.cancel();
-    }
-  }
-
-  // === 新增方法：在初始位置调用摄像头检测人类活动 ===
-  Future<bool> _detectHumanAtPosition() async {
-    if (!_isEnvironmentMonitoring || !_isCameraOn) {
-      print("🛑 人类检测已中断");
-      return false;
-    }
-
-    // 检查蓝牙连接
-    if (!_checkBluetoothConnection()) {
-      print("⚠️ 蓝牙未连接，无法调整头部角度");
+  Future<bool> _safeSendCommandV1(String command, int value) async {
+    final service = _bluetoothService;
+    if (service == null || !service.isConnected) {
+      print('[ENV_V1_CHASSIS] unavailable reason=disconnected');
+      await _degradeToVoiceExpressionOnly('disconnected');
       return false;
     }
 
     try {
-      await _bluetoothService!.sendCommand('脑袋角度', 20);
-      await Future.delayed(Duration(milliseconds: 300));
-      _humanDetected = await _cameraService!.detectHuman();
-
-      // 连续两次直接检测到人，则直接返回true
-      if (_humanDetected && _lastDetectDirectly) {
-        return true;
+      await service.sendCommand(command, value);
+      if (command == '左转' || command == '右转') {
+        await Future<void>.delayed(_shortSettleDelay);
       }
-
-      // 语音播报
-      await speakWithInterruptProtection("主人，你在这里吗？");
-      _loadExpression('assets/emotion/face2/观察/01/观察 01.json');
-
-      if (_humanDetected) {
-        return await _handleHumanDetected();
-      } else {
-        await _handleNoHumanDetected();
-        return false;
-      }
-    } catch (e) {
-      print('检测失败: $e');
-      return false;
-    }
-  }
-
-  // === 新增：处理检测到人类的情况 ===
-  Future<bool> _handleHumanDetected() async {
-    _monitorStatus = "⚠️ 检测到人类活动！";
-    print("检测到人类活动！！！！！！");
-
-    // 进行人脸监测和人脸识别
-    final _isOwner = await _identifyOwner(); // 调用身份识别方法
-    if (_isOwner) {
-      _monitorStatus = "⚠️ 检测到主人活动！";
-      print("检测到主人活动！！！！！！");
-
-      // === 停止图像流监测 ===
-      _cameraService!.stopRealTimeDetection();
-      print("⏹️ 已停止实时图像流监测");
-
-      // 立即并行播报，同时执行动作
-      unawaited(speakWithInterruptProtection("找到你了，主人！"));
-      await _performFoundOwnerAction();
-
-      // 进行情绪识别
-      _humanEmotion = await _cameraService!.detectFaceEmotion();
-      await feedbackHumanEmotion(_humanEmotion);
-
-      // 清理环境监测状态
-      await _cleanupEnvironmentMonitoring();
-
-      // === 启动自动手势检测 ===
-      _startAutoGestureDetection();
       return true;
-    } else {
-      _monitorStatus = "⚠️ 检测到陌生人活动！";
-      print("检测到陌生人活动，继续监测");
-      await speakWithInterruptProtection("有人来了，但不是主人");
+    } catch (e) {
+      print('[ENV_V1_CHASSIS] write_failed command=$command error=$e');
+      await _degradeToVoiceExpressionOnly('write_failed');
+      await _bestEffortStopAfterWriteFailed(command);
       return false;
     }
   }
 
-  // === 新增：处理未检测到人类的情况 ===
-  Future<void> _handleNoHumanDetected() async {
-    _monitorStatus = "未检测到人类活动";
-    print("该位置未检测到人类活动");
-
-    // 显示沮丧的表情
-    await _loadExpression(_getRandomExpression(_sadExpressions));
-
-    // 检查蓝牙连接后再尝试低头动作
-    if (_checkBluetoothConnection()) {
-      await _bluetoothService!.sendCommand('脑袋角度', 8); // 低头
+  Future<void> _bestEffortStopAfterWriteFailed(String failedCommand) async {
+    final service = _bluetoothService;
+    if (failedCommand == '停止') {
+      print('[ENV_V1_CHASSIS] best_effort_stop skipped reason=already_stop');
+      return;
     }
-
-    /// TODO:描述看到的场景
-  }
-
-  // === 新增：执行找到主人的动作 ===
-  Future<void> _performFoundOwnerAction() async {
-    // 检查蓝牙连接
-    if (!_checkBluetoothConnection()) {
-      print("⚠️ 蓝牙未连接，无法执行找到主人动作");
+    if (service == null || !service.isConnected) {
+      print('[ENV_V1_CHASSIS] best_effort_stop skipped reason=disconnected');
       return;
     }
 
     try {
-      // 抬头
-      print("🎉 执行找到主人动作：抬头");
-      await _bluetoothService!.sendCommand('脑袋角度', 20);
-      await Future.delayed(Duration(milliseconds: 300));
-
-      // 显示开心表情
-      _loadExpression(_getRandomExpression(_happyExpressions));
-
-      // 前进
-      print("🎉 执行找到主人动作：前进到平台边缘");
-      // 前进随机距离（带中断检测）
-      await _executeWithInterruptionCheck(
-          () => _bluetoothService!.sendCommand('持续前进', 0),
-          description: "持续前进到平台边缘");
-      await Future.delayed(Duration(seconds: 3));
-
-      print("🎉 找到主人动作完成");
+      print('[ENV_V1_CHASSIS] best_effort_stop start');
+      await service.sendCommand('停止', 0);
+      print('[ENV_V1_CHASSIS] best_effort_stop done');
     } catch (e) {
-      print("❌ 执行找到主人动作失败: $e");
+      print('[ENV_V1_CHASSIS] best_effort_stop failed error=$e');
     }
   }
 
-  // // 对不同面部表情的不同反馈
-  // Future<void> feedbackHumanEmotion(String emotion) async {
-  //   switch (emotion) {
-  //     case '开心':
-  //       print('😊 监测到用户情绪：开心');
-  //       _loadExpression(_getRandomExpression(_happyExpressions));
-  //       await speakWithInterruptProtection('看到你笑得这么开心，我的心情也变好啦！有什么好事发生吗？');
-  //       break;
-  //     case '难过':
-  //       print('😔 监测到用户情绪：难过');
-  //       _loadExpression(_getRandomExpression(_sadExpressions));
-  //       await speakWithInterruptProtection('感觉你似乎有些低落呢，没关系，有我在这里陪着你。');
-  //       break;
-  //     case '惊讶':
-  //       print('😲 监测到用户情绪：惊讶');
-  //       _loadExpression(_getRandomExpression(_surprisedExpressions));
-  //       await speakWithInterruptProtection('看起来发生了什么让你意想不到的事情，可以跟我分享一下吗？');
-  //       break;
-  //     case '愤怒':
-  //       print('😡 监测到用户情绪：愤怒');
-  //       _loadExpression(_getRandomExpression(_angryExpressions));
-  //       await speakWithInterruptProtection('感觉你有些生气呢，需要我帮你做点什么来缓解一下吗？');
-  //       break;
-  //     default:
-  //       print('🤔 监测到用户情绪：未知');
-  //       _loadExpression('assets/face/眨眼');
-  //       await speakWithInterruptProtection('你好呀！有什么需要我为你做的吗？');
-  //       break;
-  //   }
-  // }
-
-  // === 新增：清理环境监测状态的方法 ===
-  Future<void> _cleanupEnvironmentMonitoring() async {
-    print("🧹 清理环境监测状态");
-    _isEnvironmentMonitoring = false;
-    _isCameraOn = false;
-    _lastDetectDirectly = false;
-    _humanDetected = false;
-    _consecutiveInitialDetections = 0;
-
-    // 取消所有环境监测相关计时器
-    _environmentCheckTimer?.cancel();
-
-    // 释放摄像头资源
-    try {
-      if (_cameraService != null) {
-        _cameraService!.stopRealTimeDetection();
-        print("⏹️ 停止实时图像流监测");
-        await _cameraService!.dispose();
-        _cameraService = null; // 重置为null，确保下次重新初始化
-        print("📷 摄像头资源已释放");
-      }
-    } catch (e) {
-      print("⚠️ 释放摄像头资源时出错: $e");
-      _cameraService = null; // 即使出错也要重置为null
-    }
-
-    print("✅ 环境监测状态清理完成");
+  Future<void> _degradeToVoiceExpressionOnly(String reason) async {
+    if (_degradedToVoiceExpressionOnly) return;
+    _degradedToVoiceExpressionOnly = true;
+    _cancelStatePollTimer();
+    print('[ENV_V1_CHASSIS] degrade_to_voice_expression_only');
+    _monitorStatus = '底盘不可用，降级为语音和表情陪伴';
+    await _loadExpression('assets/emotion/face2/眨眼.json');
   }
 
-  // === 辅助方法实现 ===
-
-  /// 加载表情动画
   Future<void> _loadExpression(String expressionPath) async {
     try {
-      if (_uiModule != null) {
-        _uiModule!.setAnimation(expressionPath);
-        print("🎭 切换表情: $expressionPath");
-      } else {
-        print("⚠️ UIModule未设置，无法切换表情");
-      }
+      _uiModule?.setAnimation(expressionPath);
+      print('🎭 环境监测 V1 表情: $expressionPath');
     } catch (e) {
-      print("❌ 切换表情失败: $e");
+      print('❌ 环境监测 V1 表情切换失败: $e');
     }
   }
 
-  /// 带中断保护的语音播报
   Future<void> speakWithInterruptProtection(String text) async {
     try {
-      if (_ttsService != null && !_isTtsPlaying) {
-        print("🎤 环境监测语音播报: $text");
-        await _ttsService!.speak(text);
-      } else if (_isTtsPlaying) {
-        print("⚠️ TTS正在播放，跳过语音播报: $text");
-      } else {
-        print("⚠️ TTS服务未设置，无法语音播报");
+      if (_ttsService == null) {
+        print('⚠️ TTS服务未设置，无法语音播报: $text');
+        return;
       }
+      if (_isTtsPlaying) {
+        print('⚠️ TTS正在播放，跳过语音播报: $text');
+        return;
+      }
+      print('🎤 环境监测 V1 语音播报: $text');
+      await _ttsService!.speak(text);
     } catch (e) {
-      print("❌ 语音播报失败: $e");
+      print('❌ 环境监测 V1 语音播报失败: $e');
     }
   }
 
-  /// 随机获取表情
-  String _getRandomExpression(List<String> expressions) {
-    if (expressions.isEmpty) {
-      return 'assets/emotion/face2/眨眼.json';
-    }
-    return expressions[Random().nextInt(expressions.length)];
-  }
+  Future<void> _cleanupEnvironmentMonitoring() async {
+    print('🧹 清理环境监测 V1 状态');
+    _isEnvironmentMonitoring = false;
+    _degradedToVoiceExpressionOnly = false;
+    _monitorStatus = '环境监测已关闭';
+    _cancelStatePollTimer();
+    _quietCompanionTimer?.cancel();
+    _quietCompanionTimer = null;
 
-  /// 情绪反馈处理
-  Future<void> feedbackHumanEmotion(String emotion) async {
     try {
-      switch (emotion) {
-        case '开心':
-          print('😊 监测到用户情绪：开心');
-          await _loadExpression(_getRandomExpression(_happyExpressions));
-          await speakWithInterruptProtection('看到你笑得这么开心，我的心情也变好啦！有什么好事发生吗？');
-          break;
-        case '难过':
-          print('😔 监测到用户情绪：难过');
-          await _loadExpression(_getRandomExpression(_sadExpressions));
-          await speakWithInterruptProtection('感觉你似乎有些低落呢，没关系，有我在这里陪着你。');
-          break;
-        case '惊讶':
-          print('😲 监测到用户情绪：惊讶');
-          await _loadExpression(_getRandomExpression(_surprisedExpressions));
-          await speakWithInterruptProtection('看起来发生了什么让你意想不到的事情，可以跟我分享一下吗？');
-          break;
-        case '愤怒':
-          print('😡 监测到用户情绪：愤怒');
-          await _loadExpression(_getRandomExpression(_angryExpressions));
-          await speakWithInterruptProtection('感觉你有些生气呢，需要我帮你做点什么来缓解一下吗？');
-          break;
-        default:
-          print('🤔 监测到用户情绪：未知');
-          await _loadExpression('assets/emotion/face2/眨眼.json');
-          await speakWithInterruptProtection('你好呀！有什么需要我为你做的吗？');
-          break;
+      final service = _bluetoothService;
+      if (service != null && service.isConnected) {
+        await service.sendCommand('停止', 0);
       }
     } catch (e) {
-      print("❌ 情绪反馈处理失败: $e");
+      print('[ENV_V1_CHASSIS] stop_on_cleanup_failed error=$e');
     }
+
+    await _disposeCameraService();
+    _uiModule?.setProgramMode(ProgramMode.idle);
+    print('✅ 环境监测 V1 状态清理完成');
   }
 
-  /// 退出消息播报
-  Future<void> _speakExitMessage(String message) async {
-    await speakWithInterruptProtection(message);
+  void _cancelStatePollTimer() {
+    if (_statePollTimer == null) return;
+    _statePollTimer?.cancel();
+    _statePollTimer = null;
+    print('[ENV_V1_CLEANUP] state_poll_timer_cancelled');
   }
 
-  /// 重启唤醒词检测
-  Future<void> _restartWakeWordDetection() async {
-    try {
-      if (_onWakeWordRestart != null) {
-        _onWakeWordRestart!();
-        print("🎤 重新启动唤醒词检测");
-      } else {
-        print("⚠️ 唤醒词重启回调未设置");
-      }
-    } catch (e) {
-      print("❌ 重启唤醒词检测失败: $e");
-    }
-  }
-
-  /// 启动自动手势检测
-  void _startAutoGestureDetection() {
-    try {
-      if (_onGestureDetectionStart != null) {
-        _onGestureDetectionStart!();
-        print("👋 启动自动手势检测");
-      } else {
-        print("⚠️ 手势检测启动回调未设置");
-      }
-    } catch (e) {
-      print("❌ 启动手势检测失败: $e");
-    }
-  }
-
-  /// unawaited 辅助方法
-  void unawaited(Future future) {
-    // 这个方法允许不等待Future完成，用于并行执行
-    future.catchError((error) {
-      print("⚠️ unawaited future error: $error");
+  void _restartStatePollTimer() {
+    _cancelStatePollTimer();
+    final isAnswering = _isAnsweringProvider;
+    final isTtsPlaying = _isTtsPlayingProvider;
+    if (isAnswering == null || isTtsPlaying == null) return;
+    _statePollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      _isAnswering = isAnswering();
+      _isTtsPlaying = isTtsPlaying();
     });
   }
 
-  /// 身份识别方法
-  Future<bool> _identifyOwner() async {
+  Future<void> _disposeCameraService() async {
+    final camera = _cameraService;
+    if (camera == null) return;
     try {
-      // TODO: 这里可以集成实际的人脸识别功能
-      // 目前暂时返回true，表示都认为是主人
-      // 未来可以连接到人脸识别服务或本地模型
-      await Future.delayed(Duration(milliseconds: 100)); // 模拟识别延迟
-      return true; // 暂时假设都是主人
+      camera.stopRealTimeDetection();
+      await camera.dispose();
+      print('📷 环境监测 V1 摄像头资源已释放');
     } catch (e) {
-      print("❌ 身份识别失败: $e");
-      return false; // 识别失败时认为是陌生人
+      print('⚠️ 环境监测 V1 摄像头释放失败: $e');
+    } finally {
+      if (identical(_cameraService, camera)) {
+        _cameraService = null;
+      }
     }
   }
+
+  String _f(double value) => value.toStringAsFixed(3);
+}
+
+class _TurnStep {
+  const _TurnStep(this.command, this.angleDeg);
+
+  final String command;
+  final int angleDeg;
 }
