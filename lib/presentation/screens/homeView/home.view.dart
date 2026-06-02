@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:lottie/lottie.dart';
 import 'package:provider/provider.dart';
+import 'package:voicegpt/app/routes/app.routes.dart';
 import 'package:voicegpt/core/notifiers/openai.notifier.dart';
 import 'package:voicegpt/core/notifiers/speech_notifier_simplified.dart';
 import 'package:voicegpt/core/services/fullscreen_service.dart';
@@ -44,6 +45,8 @@ class _HomeViewState extends State<HomeView> {
   // 新增：唤醒词响应分阶段控制变量
   String _wakeUpEmotionStage = 'none'; // none, stage1, stage2
   Timer? _wakeUpEmotionTimer;
+
+  bool get _legacyKeywordEmotionsWhenIdle => false;
 
   @override
   void initState() {
@@ -129,6 +132,7 @@ class _HomeViewState extends State<HomeView> {
     final isTtsPlaying = speech.isTtsPlaying;
     final isListening = speech.isListening;
     final isInappropriate = speech.isInappropriateContent;
+    final isEnvironmentMonitoring = speech.isEnvironmentMonitoring;
     final currentExpression = speech.currentExpression;
 
     // 全局状态重置：如果在聊天模式但仍在退出状态，强制重置
@@ -143,6 +147,7 @@ class _HomeViewState extends State<HomeView> {
     print('  - 聊天模式: $isChatting');
     print('  - TTS播放: $isTtsPlaying');
     print('  - 监听状态: $isListening');
+    print('  - 环境监测: $isEnvironmentMonitoring');
     print('  - 违规内容: $isInappropriate');
     print('  - 退出聊天: $_isExitingChat');
     print('  - 当前回答有特殊表情: $_hasSpecialEmotionInCurrentResponse');
@@ -156,6 +161,15 @@ class _HomeViewState extends State<HomeView> {
       _hasSpecialEmotionInCurrentResponse = false;
       _lastSpecialEmotion = null;
       return currentExpression;
+    }
+
+    if (isEnvironmentMonitoring) {
+      if (_isExitingChat) {
+        print('🔄 环境监测中，清除退出聊天状态');
+        _isExitingChat = false;
+      }
+      print('🎭 环境监测中，保持界面线程当前表情: $_currentAnimation');
+      return _currentAnimation;
     }
 
     // 1. 检测违规行为 - 最高优先级
@@ -180,9 +194,8 @@ class _HomeViewState extends State<HomeView> {
     }
 
     // 3. 非连续对话模式下的原有逻辑（已关闭：简化版常态应眨眼，勿用语义尾稿误判为可爱等）
-    const legacyKeywordEmotionsWhenIdle = false;
     // 检测正能量和负能量词汇 - 在非聊天模式下检测
-    if (legacyKeywordEmotionsWhenIdle &&
+    if (_legacyKeywordEmotionsWhenIdle &&
         input.isNotEmpty &&
         input != "等待唤醒词...") {
       // 确保所有表情阶段状态都被正确初始化
@@ -1025,7 +1038,9 @@ class _HomeViewState extends State<HomeView> {
         // 简化：连续对话模式退出检测
         WidgetsBinding.instance.addPostFrameCallback((_) {
           // 检测从连续对话模式退出到非连续对话模式
-          if (speechNotifier.isInConversationMode == false && !_isExitingChat) {
+          if (speechNotifier.isInConversationMode == false &&
+              !speechNotifier.isEnvironmentMonitoring &&
+              !_isExitingChat) {
             print('🚪 检测到退出连续对话模式');
             setState(() {
               _isExitingChat = true;
@@ -1045,6 +1060,7 @@ class _HomeViewState extends State<HomeView> {
 
           // 强制回到默认状态：如果不在连续对话模式且不在环境监测状态
           if (speechNotifier.isInConversationMode == false &&
+              !speechNotifier.isEnvironmentMonitoring &&
               !_isExitingChat &&
               speechNotifier.currentExpression == null &&
               _currentAnimation != 'assets/emotion/face2/眨眼.json') {
@@ -1168,6 +1184,19 @@ class _HomeViewState extends State<HomeView> {
                         },
                       ),
                       IconButton(
+                        tooltip: '日志',
+                        icon: const Icon(
+                          Icons.article_outlined,
+                          color: Colors.white,
+                          size: 26,
+                        ),
+                        onPressed: () {
+                          Navigator.of(context).pushNamed(
+                            AppRoutes.debugLogRoute,
+                          );
+                        },
+                      ),
+                      IconButton(
                         tooltip: '设置',
                         icon: const Icon(
                           Icons.settings,
@@ -1246,8 +1275,8 @@ class _HomeViewState extends State<HomeView> {
   ) {
     final inChat = speech.isInConversationMode;
     // 思考中不可按；播报中 isProcessing 仍为 true，须允许按住打断。
-    final canHold = inChat &&
-        (!speech.isProcessingUserInput || speech.isTtsPlaying);
+    final canHold =
+        inChat && (!speech.isProcessingUserInput || speech.isTtsPlaying);
     final holding = speech.isPttRecordingHold;
     final arming = speech.isPttFingerPressed && !holding;
     // 播报与「处理中」可能同时为 true，文案须优先播报态（显示按住说话/打断）。

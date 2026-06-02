@@ -5,6 +5,7 @@ import 'package:voicegpt/core/services/bluetooth_service.dart'
     show MyBluetoothService;
 import 'package:voicegpt/core/services/camera_service.dart';
 import 'package:voicegpt/core/services/desktop_object_detector.dart';
+import 'package:voicegpt/core/services/in_app_log_console.dart';
 import 'package:voicegpt/core/services/voice_tts_service.dart';
 
 enum SnapshotTargetType {
@@ -93,6 +94,7 @@ class EnvironMonitorModule {
   static const bool _invertOwnerTurnDirection = false;
   static const bool _enableStartSearchSpeechAfterPreLookFail = true;
   static const bool _enableObjectLookAroundAfterOwnerFoundV1 = true;
+  static const bool _allowObjectLookAfterAcceptableFaceV1 = false;
   static const bool _enableWeakObjectSpeechV1 = true;
   static const int _preLookAroundSweepAngleDeg = 18;
   static const int _objectLookAroundTurnStepDeg = 30;
@@ -110,6 +112,8 @@ class EnvironMonitorModule {
     milliseconds: 800,
   );
   static const Duration _ownerTrackSettleV1 = Duration(milliseconds: 180);
+  static const Duration _finalStableVerifySettleV1 =
+      Duration(milliseconds: 400);
   static const Duration _settleDelay = Duration(milliseconds: 220);
   static const Duration _shortSettleDelay = Duration(milliseconds: 160);
   static const Duration _quietCompanionInterval = Duration(seconds: 45);
@@ -117,6 +121,9 @@ class EnvironMonitorModule {
       Duration(seconds: 30);
   static const Duration _objectLookAroundPreStartStopSettleV1 =
       Duration(milliseconds: 200);
+  static const Duration _ownerReplyWaitTimeoutV1 = Duration(seconds: 8);
+  static const Duration _ownerReplyWaitPollIntervalV1 =
+      Duration(milliseconds: 250);
 
   MyBluetoothService? _bluetoothService;
   VoiceTtsService? _ttsService;
@@ -147,7 +154,7 @@ class EnvironMonitorModule {
 
   void setBluetoothService(MyBluetoothService bluetoothService) {
     _bluetoothService = bluetoothService;
-    print('🔗 环境监测模块：蓝牙服务已设置');
+    _envLogV1('🔗 环境监测模块：蓝牙服务已设置');
   }
 
   void setTTSService(VoiceTtsService ttsService) {
@@ -171,7 +178,7 @@ class EnvironMonitorModule {
 
   void startEnvironmentMonitoring() {
     if (_isEnvironmentMonitoring) {
-      print('[ENV_V1] already_running status=$_monitorStatus');
+      _envLogV1('[ENV_V1] already_running status=$_monitorStatus');
       return;
     }
 
@@ -194,8 +201,13 @@ class EnvironMonitorModule {
   bool get isMonitoring => _isEnvironmentMonitoring;
   String get monitorStatus => _monitorStatus;
 
+  void _envLogV1(String message) {
+    print(message);
+    InAppLogConsole.instance.add(message);
+  }
+
   Future<void> _runEnvironmentMonitorV1() async {
-    print('[ENV_V1] start');
+    _envLogV1('[ENV_V1] start');
     _uiModule?.setProgramMode(ProgramMode.environmentCheck);
     _ownerAlignmentActiveV1 = true;
 
@@ -205,17 +217,17 @@ class EnvironMonitorModule {
       if (!_isEnvironmentMonitoring) return;
 
       await _loadExpression('assets/emotion/face2/观察/01/观察 01.json');
-      print('[ENV_V1] start_owner_search_speech');
+      _envLogV1('[ENV_V1] start_owner_search_speech');
       await speakWithInterruptProtection('主人，你在这里吗？');
       if (!_isEnvironmentMonitoring) return;
 
       final preLookFound = await _runPreLookAroundOwnerV1();
       final HumanObservation? found;
       if (preLookFound != null) {
-        print('[ENV_V1] prelook_found skip_start_search_speech');
+        _envLogV1('[ENV_V1] prelook_found skip_start_search_speech');
         found = preLookFound;
       } else {
-        print(
+        _envLogV1(
           '[ENV_V1] prelook_no_target '
           'start_search_speech=$_enableStartSearchSpeechAfterPreLookFail',
         );
@@ -236,12 +248,16 @@ class EnvironMonitorModule {
 
       var finalResult = await _runFinalFaceCenteringV1(confirmed);
       if (!_isEnvironmentMonitoring) return;
+      finalResult = await _runStableVerifyIfCenteredV1(finalResult);
+      if (!_isEnvironmentMonitoring) return;
 
       if (finalResult.finalAlignmentStatus ==
           SnapshotAlignStatus.stillOffcenter) {
         finalResult = await _runSilentReacquireAfterFinalOffcenterV1(
           finalResult,
         );
+        if (!_isEnvironmentMonitoring) return;
+        finalResult = await _runStableVerifyIfCenteredV1(finalResult);
       }
       if (!_isEnvironmentMonitoring) return;
 
@@ -250,7 +266,7 @@ class EnvironMonitorModule {
       if (!_isEnvironmentMonitoring) return;
     } catch (e, st) {
       _monitorStatus = '环境监测 V1 异常: $e';
-      print('[ENV_V1] error=$e\n$st');
+      _envLogV1('[ENV_V1] error=$e\n$st');
       await _degradeToVoiceExpressionOnly('exception');
     } finally {
       _ownerAlignmentActiveV1 = false;
@@ -261,17 +277,17 @@ class EnvironMonitorModule {
   }
 
   Future<HumanObservation?> _runSearchOwnerV1() async {
-    print('[ENV_V1_SEARCH] start');
+    _envLogV1('[ENV_V1_SEARCH] start');
     _monitorStatus = 'SEARCH: 原地找人';
 
     final initial = await _detectHumanObservationSafe(phase: 'search_initial');
-    print(
+    _envLogV1(
       '[ENV_V1_SEARCH] initial_check hasHuman=${initial.hasHuman} '
       'conf=${_f(initial.confidence)} area=${_f(initial.areaRatio)} '
       'cx=${_f(initial.centerX)}',
     );
     if (_isReliableHumanObservation(initial)) {
-      print('[ENV_V1_SEARCH] confirmed');
+      _envLogV1('[ENV_V1_SEARCH] confirmed');
       return initial;
     }
 
@@ -287,10 +303,10 @@ class EnvironMonitorModule {
     for (final step in sweepPlan) {
       if (!_isEnvironmentMonitoring) return null;
       final tag = step.command == '左转' ? 'turn_left' : 'turn_right';
-      print('[ENV_V1_SEARCH] $tag angle=${step.angleDeg}');
+      _envLogV1('[ENV_V1_SEARCH] $tag angle=${step.angleDeg}');
       final moved = await _safeSendCommandV1(step.command, step.angleDeg);
       if (!moved) {
-        print(
+        _envLogV1(
             '[ENV_V1_SEARCH] abort reason=bluetooth_disconnected/write_failed');
         return null;
       }
@@ -301,33 +317,33 @@ class EnvironMonitorModule {
       final candidate = await _detectHumanObservationSafe(
         phase: 'search_sweep',
       );
-      print(
+      _envLogV1(
         '[ENV_V1_SEARCH] candidate conf=${_f(candidate.confidence)} '
         'area=${_f(candidate.areaRatio)} cx=${_f(candidate.centerX)}',
       );
       if (_isReliableHumanObservation(candidate)) {
-        print('[ENV_V1_SEARCH] confirmed');
+        _envLogV1('[ENV_V1_SEARCH] confirmed');
         return candidate;
       }
     }
 
     await _safeSendCommandV1('停止', 0);
-    print('[ENV_V1_SEARCH] no_target');
+    _envLogV1('[ENV_V1_SEARCH] no_target');
     return null;
   }
 
   Future<HumanObservation?> _runPreLookAroundOwnerV1() async {
-    print('[ENV_V1_PRELOOK] start');
+    _envLogV1('[ENV_V1_PRELOOK] start');
     _monitorStatus = 'PRELOOK: 原地张望';
 
     final front = await _detectHumanObservationSafe(phase: 'prelook_front');
-    print(
+    _envLogV1(
       '[ENV_V1_PRELOOK] front_check hasHuman=${front.hasHuman} '
       'conf=${_f(front.confidence)} area=${_f(front.areaRatio)} '
       'cx=${_f(front.centerX)}',
     );
     if (_isReliableHumanObservation(front)) {
-      print('[ENV_V1_PRELOOK] found phase=front');
+      _envLogV1('[ENV_V1_PRELOOK] found phase=front');
       return front;
     }
 
@@ -352,7 +368,7 @@ class EnvironMonitorModule {
     );
     if (center != null) return center;
 
-    print('[ENV_V1_PRELOOK] no_target');
+    _envLogV1('[ENV_V1_PRELOOK] no_target');
     return null;
   }
 
@@ -362,11 +378,11 @@ class EnvironMonitorModule {
     required String phase,
   }) async {
     final tag = command == '左转' ? 'turn_left' : 'turn_right';
-    print('[ENV_V1_PRELOOK] $tag angle=$angleDeg');
+    _envLogV1('[ENV_V1_PRELOOK] $tag angle=$angleDeg');
 
     final moved = await _safeSendCommandV1(command, angleDeg);
     if (!moved) {
-      print('[ENV_V1_PRELOOK] no_target');
+      _envLogV1('[ENV_V1_PRELOOK] no_target');
       return null;
     }
 
@@ -376,13 +392,13 @@ class EnvironMonitorModule {
     final candidate = await _detectHumanObservationSafe(
       phase: 'prelook_$phase',
     );
-    print(
+    _envLogV1(
       '[ENV_V1_PRELOOK] candidate phase=$phase '
       'conf=${_f(candidate.confidence)} area=${_f(candidate.areaRatio)} '
       'cx=${_f(candidate.centerX)}',
     );
     if (_isReliableHumanObservation(candidate)) {
-      print('[ENV_V1_PRELOOK] found phase=$phase');
+      _envLogV1('[ENV_V1_PRELOOK] found phase=$phase');
       return candidate;
     }
     return null;
@@ -392,7 +408,7 @@ class EnvironMonitorModule {
     HumanObservation initial, {
     int maxLoops = _ownerTrackMaxLoopsV1,
   }) async {
-    print(
+    _envLogV1(
       '[ENV_V1_TRACK] start cx=${_f(initial.centerX)} '
       'dx=${_f(initial.centerX - 0.5)}',
     );
@@ -416,20 +432,20 @@ class EnvironMonitorModule {
       }
 
       if (!_isReliableHumanObservation(current)) {
-        print('[ENV_V1_TRACK] loop=$loop no reliable human, break');
+        _envLogV1('[ENV_V1_TRACK] loop=$loop no reliable human, break');
         break;
       }
 
       lastReliable = current;
       final dx = current.centerX - 0.5;
       final absDx = dx.abs();
-      print(
+      _envLogV1(
         '[ENV_V1_TRACK] loop=$loop source=$source '
         'cx=${_f(current.centerX)} dx=${_f(dx)} absDx=${_f(absDx)}',
       );
 
       if (absDx <= _ownerTrackDeadZoneV1) {
-        print(
+        _envLogV1(
           '[ENV_V1_TRACK] loop=$loop centered_by_human '
           'absDx=${_f(absDx)}',
         );
@@ -438,27 +454,27 @@ class EnvironMonitorModule {
 
       final angle = absDx > _ownerTrackSoftZoneV1 ? 12 : 6;
       final direction = _turnDirectionForOwnerDx(dx);
-      print(
+      _envLogV1(
         '[ENV_V1_TRACK] loop=$loop recenter '
         'direction=$direction angle=$angle',
       );
 
       final moved = await _safeSendCommandV1(direction, angle);
       if (!moved) {
-        print('[ENV_V1_TRACK] loop=$loop recenter_failed reason=turn');
+        _envLogV1('[ENV_V1_TRACK] loop=$loop recenter_failed reason=turn');
         return lastReliable;
       }
 
       final stopped = await _safeSendCommandV1('停止', 0);
       if (!stopped) {
-        print('[ENV_V1_TRACK] loop=$loop recenter_failed reason=stop');
+        _envLogV1('[ENV_V1_TRACK] loop=$loop recenter_failed reason=stop');
         return lastReliable;
       }
       await Future<void>.delayed(_ownerTrackSettleV1);
       current = null;
     }
 
-    print('[ENV_V1_TRACK] finished max_loops_or_no_target');
+    _envLogV1('[ENV_V1_TRACK] finished max_loops_or_no_target');
     return lastReliable;
   }
 
@@ -466,7 +482,7 @@ class EnvironMonitorModule {
     HumanObservation tracked,
   ) async {
     _monitorStatus = 'CONFIRM: snapshot 视觉确认';
-    print('[ENV_V1_CONFIRM] capture start');
+    _envLogV1('[ENV_V1_CONFIRM] capture start');
     await _safeSendCommandV1('停止', 0);
     await Future<void>.delayed(_settleDelay);
     return _captureSnapshotAlignResultV1(tracked);
@@ -478,29 +494,29 @@ class EnvironMonitorModule {
     try {
       final camera = _cameraService;
       if (camera == null) {
-        print('[ENV_V1_CONFIRM] target=none reason=camera_unavailable');
+        _envLogV1('[ENV_V1_CONFIRM] target=none reason=camera_unavailable');
         return SnapshotAlignResult.noTarget(humanObservation: tracked);
       }
 
       final imagePath = await camera.captureImage();
-      print('[ENV_V1_CONFIRM] imagePath=$imagePath');
+      _envLogV1('[ENV_V1_CONFIRM] imagePath=$imagePath');
 
       final face = await camera.detectFaceObservationFromImagePath(imagePath);
-      print(
+      _envLogV1(
         '[ENV_V1_CONFIRM] face hasFace=${face.hasFace} '
         'conf=${_f(face.confidence)} cx=${_f(face.centerX)}',
       );
 
       final person =
           await camera.detectHumanObservationFromImagePath(imagePath);
-      print(
+      _envLogV1(
         '[ENV_V1_CONFIRM] person hasHuman=${person.hasHuman} '
         'conf=${_f(person.confidence)} area=${_f(person.areaRatio)} '
         'cx=${_f(person.centerX)}',
       );
 
       if (face.hasFace) {
-        print('[ENV_V1_CONFIRM] target=face');
+        _envLogV1('[ENV_V1_CONFIRM] target=face');
         return SnapshotAlignResult(
           canProceed: true,
           finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
@@ -516,7 +532,7 @@ class EnvironMonitorModule {
       }
 
       if (_isReliableHumanObservation(person)) {
-        print('[ENV_V1_CONFIRM] target=person');
+        _envLogV1('[ENV_V1_CONFIRM] target=person');
         return SnapshotAlignResult(
           canProceed: true,
           finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
@@ -530,13 +546,13 @@ class EnvironMonitorModule {
         );
       }
 
-      print('[ENV_V1_CONFIRM] target=none');
+      _envLogV1('[ENV_V1_CONFIRM] target=none');
       return SnapshotAlignResult.noTarget(
         humanObservation: tracked,
         imagePath: imagePath,
       );
     } catch (e) {
-      print('[ENV_V1_CONFIRM] target=none error=$e');
+      _envLogV1('[ENV_V1_CONFIRM] target=none error=$e');
       return SnapshotAlignResult.noTarget(humanObservation: tracked);
     }
   }
@@ -544,7 +560,7 @@ class EnvironMonitorModule {
   Future<SnapshotAlignResult> _runFinalFaceCenteringV1(
     SnapshotAlignResult result,
   ) async {
-    print(
+    _envLogV1(
       '[ENV_V1_FINAL_CENTER] start target=${result.targetType.name} '
       'cx=${_f(result.centerX)} dx=${_f(result.centerX - 0.5)}',
     );
@@ -558,17 +574,18 @@ class EnvironMonitorModule {
       final target = current.targetType.name;
       final dx = current.centerX - 0.5;
       final absDx = dx.abs();
-      print(
+      _envLogV1(
         '[ENV_V1_FINAL_CENTER] round=$round target=$target '
         'cx=${_f(current.centerX)} dx=${_f(dx)}',
       );
 
       if (current.targetType == SnapshotTargetType.none) {
-        print(
+        _envLogV1(
           '[ENV_V1_FINAL_CENTER] decision action=no_target '
           'direction=none angle=0',
         );
-        print('[ENV_V1_FINAL_CENTER] result=${SnapshotAlignStatus.noTarget}');
+        _envLogV1(
+            '[ENV_V1_FINAL_CENTER] result=${SnapshotAlignStatus.noTarget}');
         return current.copyWith(
           canProceed: false,
           finalAlignmentStatus: SnapshotAlignStatus.noTarget,
@@ -579,28 +596,28 @@ class EnvironMonitorModule {
         final status = absDx <= _verifiedPersonAcceptableDx
             ? SnapshotAlignStatus.verifiedPersonAcceptable
             : SnapshotAlignStatus.stillOffcenter;
-        print(
+        _envLogV1(
           '[ENV_V1_FINAL_CENTER] decision action=person_only '
           'direction=none angle=0',
         );
-        print('[ENV_V1_FINAL_CENTER] result=$status');
+        _envLogV1('[ENV_V1_FINAL_CENTER] result=$status');
         return current.copyWith(finalAlignmentStatus: status);
       }
 
       final faceDx =
           (current.faceObservation?.centerX ?? current.centerX) - 0.5;
       final absFaceDx = faceDx.abs();
-      print(
+      _envLogV1(
         '[ENV_V1_FINAL_CENTER] round=$round faceDx=${_f(faceDx)} '
         'absDx=${_f(absFaceDx)}',
       );
 
       if (absFaceDx <= _verifiedFaceCenteredDx) {
-        print(
+        _envLogV1(
           '[ENV_V1_FINAL_CENTER] decision action=centered '
           'direction=none angle=0',
         );
-        print(
+        _envLogV1(
           '[ENV_V1_FINAL_CENTER] result=${SnapshotAlignStatus.verifiedFaceCentered}',
         );
         return current.copyWith(
@@ -609,11 +626,11 @@ class EnvironMonitorModule {
       }
 
       if (absFaceDx <= _verifiedFaceAcceptableDx) {
-        print(
+        _envLogV1(
           '[ENV_V1_FINAL_CENTER] decision action=acceptable '
           'direction=none angle=0',
         );
-        print(
+        _envLogV1(
           '[ENV_V1_FINAL_CENTER] result=${SnapshotAlignStatus.verifiedFaceAcceptable}',
         );
         return current.copyWith(
@@ -623,7 +640,7 @@ class EnvironMonitorModule {
 
       if (round >= _finalFaceCenterMaxCorrectionRoundsV1) {
         final updated = _classifyAfterNudge(current);
-        print('[ENV_V1_FINAL_CENTER] result=$updated');
+        _envLogV1('[ENV_V1_FINAL_CENTER] result=$updated');
         return current.copyWith(finalAlignmentStatus: updated);
       }
 
@@ -632,14 +649,14 @@ class EnvironMonitorModule {
         overshotLastNudge: overshotLastNudge,
       );
       final direction = _turnDirectionForOwnerDx(faceDx);
-      print(
+      _envLogV1(
         '[ENV_V1_FINAL_CENTER] round=$round recenter '
         'direction=$direction angle=$angle',
       );
 
       final moved = await _safeSendCommandV1(direction, angle);
       if (!moved) {
-        print(
+        _envLogV1(
           '[ENV_V1_FINAL_CENTER] result='
           '${SnapshotAlignStatus.stillOffcenter}',
         );
@@ -650,7 +667,7 @@ class EnvironMonitorModule {
 
       final stopped = await _safeSendCommandV1('停止', 0);
       if (!stopped) {
-        print(
+        _envLogV1(
           '[ENV_V1_FINAL_CENTER] result='
           '${SnapshotAlignStatus.stillOffcenter}',
         );
@@ -665,7 +682,7 @@ class EnvironMonitorModule {
       current = await _captureSnapshotAlignResultV1(
         current.humanObservation ?? result.humanObservation,
       );
-      print(
+      _envLogV1(
         '[ENV_V1_FINAL_CENTER] verify_after_nudge '
         'hasFace=${current.faceObservation?.hasFace ?? false} '
         'faceCx=${_f(current.faceObservation?.centerX ?? 0.5)} '
@@ -680,7 +697,7 @@ class EnvironMonitorModule {
         final didNotImprove = afterNudgeDx.abs() >= beforeNudgeAbsDx;
         overshotLastNudge = signFlipped && didNotImprove;
         if (overshotLastNudge) {
-          print(
+          _envLogV1(
             '[ENV_V1_FINAL_CENTER] overshoot_detected '
             'beforeDx=${_f(beforeNudgeDx)} '
             'afterDx=${_f(afterNudgeDx)} next_angle_limited=true',
@@ -692,8 +709,185 @@ class EnvironMonitorModule {
     }
 
     final updated = _classifyAfterNudge(current);
-    print('[ENV_V1_FINAL_CENTER] result=$updated');
+    _envLogV1('[ENV_V1_FINAL_CENTER] result=$updated');
     return current.copyWith(finalAlignmentStatus: updated);
+  }
+
+  Future<SnapshotAlignResult> _runStableVerifyIfCenteredV1(
+    SnapshotAlignResult result,
+  ) async {
+    if (result.finalAlignmentStatus !=
+        SnapshotAlignStatus.verifiedFaceCentered) {
+      return result;
+    }
+    return _finalStableVerifyOwnerFaceV1(result);
+  }
+
+  Future<SnapshotAlignResult> _finalStableVerifyOwnerFaceV1(
+    SnapshotAlignResult result,
+  ) async {
+    _envLogV1(
+      '[ENV_V1_STABLE_VERIFY] start '
+      'status=${result.finalAlignmentStatus}',
+    );
+
+    final stopped = await _safeSendCommandV1('停止', 0);
+    if (!stopped) {
+      _envLogV1(
+          '[ENV_V1_STABLE_VERIFY] result=still_offcenter reason=stop_failed');
+      return result.copyWith(
+        finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+      );
+    }
+
+    _envLogV1(
+      '[ENV_V1_STABLE_VERIFY] stop_and_settle '
+      'ms=${_finalStableVerifySettleV1.inMilliseconds}',
+    );
+    await Future<void>.delayed(_finalStableVerifySettleV1);
+    if (!_isEnvironmentMonitoring) return result;
+
+    final verified = await _captureStableVerifySnapshotV1(result);
+    if (verified.faceObservation?.hasFace != true) {
+      return verified;
+    }
+
+    final faceDx =
+        (verified.faceObservation?.centerX ?? verified.centerX) - 0.5;
+    final absFaceDx = faceDx.abs();
+    final stableStatus = _stableVerifyStatusForFaceDxV1(absFaceDx);
+    if (stableStatus != null) {
+      _envLogV1(
+        '[ENV_V1_STABLE_VERIFY] result='
+        '${stableStatus == SnapshotAlignStatus.verifiedFaceCentered ? 'confirmed_centered' : 'downgrade_acceptable'}',
+      );
+      return verified.copyWith(finalAlignmentStatus: stableStatus);
+    }
+
+    _envLogV1('[ENV_V1_STABLE_VERIFY] result=large_offset_repair_needed');
+    return _repairStableVerifyLargeOffsetV1(verified, faceDx);
+  }
+
+  Future<SnapshotAlignResult> _captureStableVerifySnapshotV1(
+    SnapshotAlignResult previous,
+  ) async {
+    try {
+      final camera = _cameraService;
+      if (camera == null) {
+        _envLogV1(
+          '[ENV_V1_STABLE_VERIFY] result=still_offcenter '
+          'reason=camera_unavailable',
+        );
+        return previous.copyWith(
+          finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+          targetType: SnapshotTargetType.none,
+          faceObservation: const FaceObservation(hasFace: false),
+        );
+      }
+
+      final imagePath = await camera.captureImage();
+      _envLogV1('[ENV_V1_STABLE_VERIFY] snapshot imagePath=$imagePath');
+
+      final face = await camera.detectFaceObservationFromImagePath(imagePath);
+      final faceDx = face.centerX - 0.5;
+      _envLogV1(
+        '[ENV_V1_STABLE_VERIFY] face hasFace=${face.hasFace} '
+        'cx=${_f(face.centerX)} dx=${_f(faceDx)} '
+        'absDx=${_f(faceDx.abs())}',
+      );
+
+      if (!face.hasFace) {
+        _envLogV1(
+            '[ENV_V1_STABLE_VERIFY] result=still_offcenter reason=face_lost');
+        return previous.copyWith(
+          finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+          targetType: SnapshotTargetType.none,
+          faceObservation: face,
+          imagePath: imagePath,
+        );
+      }
+
+      return previous.copyWith(
+        targetType: SnapshotTargetType.face,
+        centerX: face.centerX,
+        centerY: face.centerY,
+        confidence: face.confidence,
+        areaRatio: face.areaRatio,
+        faceObservation: face,
+        imagePath: imagePath,
+      );
+    } catch (e) {
+      _envLogV1('[ENV_V1_STABLE_VERIFY] result=still_offcenter error=$e');
+      return previous.copyWith(
+        finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+        targetType: SnapshotTargetType.none,
+        faceObservation: const FaceObservation(hasFace: false),
+      );
+    }
+  }
+
+  String? _stableVerifyStatusForFaceDxV1(double absFaceDx) {
+    if (absFaceDx <= _verifiedFaceCenteredDx) {
+      return SnapshotAlignStatus.verifiedFaceCentered;
+    }
+    if (absFaceDx <= _verifiedFaceAcceptableDx) {
+      return SnapshotAlignStatus.verifiedFaceAcceptable;
+    }
+    return null;
+  }
+
+  Future<SnapshotAlignResult> _repairStableVerifyLargeOffsetV1(
+    SnapshotAlignResult verified,
+    double faceDx,
+  ) async {
+    final absFaceDx = faceDx.abs();
+    final angle = absFaceDx > _ownerTrackSoftZoneV1 ? 6 : 3;
+    final direction = _turnDirectionForOwnerDx(faceDx);
+    _envLogV1(
+      '[ENV_V1_STABLE_VERIFY] repair direction=$direction '
+      'angle=$angle',
+    );
+
+    final moved = await _safeSendCommandV1(direction, angle);
+    if (!moved) {
+      _envLogV1('[ENV_V1_STABLE_VERIFY] repair_result=still_offcenter');
+      return verified.copyWith(
+        finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+      );
+    }
+
+    final stopped = await _safeSendCommandV1('停止', 0);
+    if (!stopped) {
+      _envLogV1('[ENV_V1_STABLE_VERIFY] repair_result=still_offcenter');
+      return verified.copyWith(
+        finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+      );
+    }
+
+    _envLogV1(
+      '[ENV_V1_STABLE_VERIFY] stop_and_settle '
+      'ms=${_finalStableVerifySettleV1.inMilliseconds}',
+    );
+    await Future<void>.delayed(_finalStableVerifySettleV1);
+    if (!_isEnvironmentMonitoring) return verified;
+
+    final repaired = await _captureStableVerifySnapshotV1(verified);
+    final repairedFace = repaired.faceObservation;
+    if (repairedFace?.hasFace != true) {
+      _envLogV1(
+        '[ENV_V1_STABLE_VERIFY] repair_result='
+        '${SnapshotAlignStatus.stillOffcenter}',
+      );
+      return repaired.copyWith(
+        finalAlignmentStatus: SnapshotAlignStatus.stillOffcenter,
+      );
+    }
+
+    final repairedDx = repairedFace!.centerX - 0.5;
+    final repairedStatus = _stableVerifyStatusForFaceDxV1(repairedDx.abs());
+    final finalStatus = repairedStatus ?? SnapshotAlignStatus.stillOffcenter;
+    _envLogV1('[ENV_V1_STABLE_VERIFY] repair_result=$finalStatus');
+    return repaired.copyWith(finalAlignmentStatus: finalStatus);
   }
 
   int _finalFaceNudgeAngleV1(
@@ -711,7 +905,7 @@ class EnvironMonitorModule {
   ) async {
     if (!_isEnvironmentMonitoring) return previous;
 
-    print('[ENV_V1_FINAL_RECOVER] start reason=still_offcenter');
+    _envLogV1('[ENV_V1_FINAL_RECOVER] start reason=still_offcenter');
     HumanObservation? seed = _getFreshRealtimeHumanV1();
     final previousHuman = previous.humanObservation;
     if (seed == null &&
@@ -725,7 +919,7 @@ class EnvironMonitorModule {
     );
 
     if (!_isReliableHumanObservation(seed)) {
-      print('[ENV_V1_FINAL_RECOVER] abort reason=no_reliable_human');
+      _envLogV1('[ENV_V1_FINAL_RECOVER] abort reason=no_reliable_human');
       return previous;
     }
 
@@ -736,7 +930,7 @@ class EnvironMonitorModule {
     if (!_isEnvironmentMonitoring) return confirmed;
 
     final recovered = await _runFinalFaceCenteringV1(confirmed);
-    print(
+    _envLogV1(
       '[ENV_V1_FINAL_RECOVER] result='
       '${recovered.finalAlignmentStatus}',
     );
@@ -770,77 +964,171 @@ class EnvironMonitorModule {
 
   Future<void> _runInteractOwnerV1(SnapshotAlignResult result) async {
     _monitorStatus = 'INTERACT: 陪伴互动';
+    final status = result.finalAlignmentStatus;
     final isStrictlyCentered =
-        result.finalAlignmentStatus == SnapshotAlignStatus.verifiedFaceCentered;
-    final objectLookAroundReason =
-        _objectLookAroundScheduleReasonForStatusV1(result.finalAlignmentStatus);
-    final canHoldForObjectLookAround =
-        _enableObjectLookAroundAfterOwnerFoundV1 &&
-            objectLookAroundReason != null;
-    final greetingLine = _greetingLineForStatus(result.finalAlignmentStatus);
+        status == SnapshotAlignStatus.verifiedFaceCentered;
+    final greetingLine = _greetingLineForStatus(status);
 
     if (greetingLine != null) {
-      print(
-        '[ENV_V1_INTERACT] status=${result.finalAlignmentStatus} '
-        'strict_centered=$isStrictlyCentered speak_found_owner=true',
+      _envLogV1(
+        '[ENV_V1_INTERACT] owner_seen status=$status '
+        'strictCentered=$isStrictlyCentered',
       );
-      if (canHoldForObjectLookAround) {
-        await _sendImmediateStopV1(phase: 'owner_found_hold');
-        if (!_isEnvironmentMonitoring) return;
-      }
+      await _sendImmediateStopV1(phase: 'owner_seen_interact');
+      if (!_isEnvironmentMonitoring) return;
+
       await _loadExpression('assets/emotion/face2/可爱/02/可爱 02.json');
+      _envLogV1('[ENV_V1_INTERACT] speak_owner_seen text=$greetingLine');
       await speakWithInterruptProtection(greetingLine);
       if (!_isEnvironmentMonitoring) return;
-      final scheduledObjectLookAround =
-          _checkAndScheduleObjectLookAroundAfterOwnerFoundV1(
-        status: result.finalAlignmentStatus,
+
+      const companionInvite = '要不要和我说句话？';
+      _envLogV1(
+          '[ENV_V1_INTERACT] speak_companion_invite text=$companionInvite');
+      await speakWithInterruptProtection(companionInvite);
+      if (!_isEnvironmentMonitoring) return;
+
+      final waitResult = await _waitOwnerReplyBeforeCompanionV1(
+        timeout: _ownerReplyWaitTimeoutV1,
+      );
+      if (waitResult != 'no_response') {
+        _cancelPendingObjectLookAroundTimerV1(reason: waitResult);
+        return;
+      }
+
+      const quietCompanionLine = '那我就在这儿陪你啦。';
+      _envLogV1(
+        '[ENV_V1_INTERACT] speak_quiet_companion '
+        'text=$quietCompanionLine',
+      );
+      await speakWithInterruptProtection(quietCompanionLine);
+      if (!_isEnvironmentMonitoring) return;
+
+      _envLogV1('[ENV_V1_INTERACT] enter_owner_found_hold');
+      _checkAndScheduleObjectLookAroundAfterOwnerFoundV1(
+        status: status,
         strictCentered: isStrictlyCentered,
       );
-      if (scheduledObjectLookAround) {
-        print(
-          '[ENV_V1_INTERACT] skip_companion_invite '
-          'reason=object_look_around_pending',
-        );
-      } else {
-        await speakWithInterruptProtection('要不要和我说句话？');
-      }
     } else {
-      print(
-        '[ENV_V1_INTERACT] status=${result.finalAlignmentStatus} '
+      _envLogV1(
+        '[ENV_V1_INTERACT] status=$status '
         'speak_skipped reason=not_aligned',
       );
       await _loadExpression('assets/emotion/face2/眨眼.json');
       _checkAndScheduleObjectLookAroundAfterOwnerFoundV1(
-        status: result.finalAlignmentStatus,
+        status: status,
         strictCentered: isStrictlyCentered,
       );
     }
 
     if (!_isEnvironmentMonitoring) return;
-    print('[ENV_V1_INTERACT] enter_quiet_companion');
+    _envLogV1('[ENV_V1_INTERACT] enter_quiet_companion');
+  }
+
+  Future<String> _waitOwnerReplyBeforeCompanionV1({
+    required Duration timeout,
+  }) async {
+    _envLogV1(
+      '[ENV_V1_INTERACT] wait_owner_reply start '
+      'timeoutMs=${timeout.inMilliseconds}',
+    );
+
+    final stopped = await _sendImmediateStopV1(
+      phase: 'wait_owner_reply_start',
+    );
+    if (!stopped && !_isBluetoothConnectedV1()) {
+      _envLogV1(
+        '[ENV_V1_INTERACT] wait_owner_reply canceled '
+        'reason=bluetooth_disconnected',
+      );
+      return 'bluetooth_disconnected';
+    }
+
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (!_isEnvironmentMonitoring) {
+        _envLogV1(
+          '[ENV_V1_INTERACT] wait_owner_reply canceled reason=env_stopped',
+        );
+        return 'env_stopped';
+      }
+      if (!_isBluetoothConnectedV1()) {
+        _envLogV1(
+          '[ENV_V1_INTERACT] wait_owner_reply canceled '
+          'reason=bluetooth_disconnected',
+        );
+        return 'bluetooth_disconnected';
+      }
+      if (_isChatOrWakeActiveV1()) {
+        _envLogV1(
+          '[ENV_V1_INTERACT] wait_owner_reply canceled reason=chat_started',
+        );
+        return 'chat_started';
+      }
+
+      final remaining = deadline.difference(DateTime.now());
+      final delay = remaining < _ownerReplyWaitPollIntervalV1
+          ? remaining
+          : _ownerReplyWaitPollIntervalV1;
+      if (delay > Duration.zero) {
+        await Future<void>.delayed(delay);
+      }
+    }
+
+    _envLogV1('[ENV_V1_INTERACT] wait_owner_reply timeout no_response');
+    final finalStopped = await _sendImmediateStopV1(
+      phase: 'wait_owner_reply_no_response',
+    );
+    if (!finalStopped && !_isBluetoothConnectedV1()) {
+      _envLogV1(
+        '[ENV_V1_INTERACT] wait_owner_reply canceled '
+        'reason=bluetooth_disconnected',
+      );
+      return 'bluetooth_disconnected';
+    }
+    return 'no_response';
+  }
+
+  bool _isChatOrWakeActiveV1() {
+    _refreshExternalActivityStateV1();
+    return _isAnswering;
+  }
+
+  bool _isBluetoothConnectedV1() {
+    final service = _bluetoothService;
+    return service != null && service.isConnected;
   }
 
   bool _checkAndScheduleObjectLookAroundAfterOwnerFoundV1({
     required String status,
     required bool strictCentered,
   }) {
-    print(
+    _envLogV1(
       '[ENV_V1_OBJECT_DELAY] schedule_check status=$status '
       'strictCentered=$strictCentered '
       'enable=$_enableObjectLookAroundAfterOwnerFoundV1',
     );
 
     if (!_enableObjectLookAroundAfterOwnerFoundV1) {
-      print(
+      _envLogV1(
         '[ENV_V1_OBJECT_DELAY] not_scheduled '
         'reason=feature_disabled status=$status',
       );
       return false;
     }
 
+    if (status == SnapshotAlignStatus.verifiedFaceAcceptable &&
+        !_allowObjectLookAfterAcceptableFaceV1) {
+      _envLogV1(
+        '[ENV_V1_OBJECT_DELAY] not_scheduled '
+        'reason=acceptable_face_not_strict_enough status=$status',
+      );
+      return false;
+    }
+
     final reason = _objectLookAroundScheduleReasonForStatusV1(status);
     if (reason == null) {
-      print(
+      _envLogV1(
         '[ENV_V1_OBJECT_DELAY] not_scheduled '
         'reason=status_not_owner_seen status=$status',
       );
@@ -848,14 +1136,14 @@ class EnvironMonitorModule {
     }
 
     if (_objectLookAroundExecutedV1) {
-      print(
+      _envLogV1(
         '[ENV_V1_OBJECT_DELAY] not_scheduled '
         'reason=already_executed status=$status',
       );
       return false;
     }
     if (_objectLookAroundRunningV1) {
-      print(
+      _envLogV1(
         '[ENV_V1_OBJECT_DELAY] not_scheduled '
         'reason=already_running status=$status',
       );
@@ -868,17 +1156,18 @@ class EnvironMonitorModule {
 
   String? _objectLookAroundScheduleReasonForStatusV1(String status) {
     if (status == SnapshotAlignStatus.verifiedFaceCentered) {
-      return 'owner_seen';
+      return 'owner_found_hold_started_centered';
     }
-    if (status == SnapshotAlignStatus.verifiedFaceAcceptable) {
-      return 'owner_seen_acceptable';
+    if (status == SnapshotAlignStatus.verifiedFaceAcceptable &&
+        _allowObjectLookAfterAcceptableFaceV1) {
+      return 'owner_found_hold_started_acceptable';
     }
     return null;
   }
 
   void _scheduleObjectLookAroundAfterOwnerFoundV1({required String reason}) {
     _ownerFoundAtV1 = DateTime.now();
-    print(
+    _envLogV1(
       '[ENV_V1_INTERACT] owner_found_hold still for '
       '${_objectLookAroundDelayAfterOwnerFoundV1.inSeconds}s before object '
       'look-around',
@@ -889,7 +1178,7 @@ class EnvironMonitorModule {
       _objectLookAroundDelayAfterOwnerFoundV1,
       () => unawaited(_handleObjectLookAroundDelayElapsedV1()),
     );
-    print(
+    _envLogV1(
       '[ENV_V1_OBJECT_DELAY] scheduled '
       'delay=${_objectLookAroundDelayAfterOwnerFoundV1.inSeconds}s '
       'reason=$reason',
@@ -907,15 +1196,15 @@ class EnvironMonitorModule {
         ? 0
         : DateTime.now().difference(ownerFoundAt).inMilliseconds;
     if (!allowed) {
-      print(
+      _envLogV1(
         '[ENV_V1_OBJECT_DELAY] elapsed allowed=false '
         'reason=$skipReason heldMs=$heldMs',
       );
       return;
     }
 
-    print('[ENV_V1_OBJECT_DELAY] elapsed allowed=true heldMs=$heldMs');
-    print('[ENV_V1_OBJECT_DELAY] elapsed start object look-around');
+    _envLogV1('[ENV_V1_OBJECT_DELAY] elapsed allowed=true heldMs=$heldMs');
+    _envLogV1('[ENV_V1_OBJECT_DELAY] elapsed start object look-around');
     final hadCameraService = _cameraService != null;
     _objectLookAroundRunningV1 = true;
     _quietCompanionActiveV1 = false;
@@ -926,7 +1215,7 @@ class EnvironMonitorModule {
 
       final stopped = await _sendImmediateStopV1(phase: 'object_look_start');
       if (!stopped) {
-        print('[ENV_V1_OBJECT_DELAY] skipped reason=pre_start_stop_failed');
+        _envLogV1('[ENV_V1_OBJECT_DELAY] skipped reason=pre_start_stop_failed');
         return;
       }
       await Future<void>.delayed(_objectLookAroundPreStartStopSettleV1);
@@ -935,7 +1224,7 @@ class EnvironMonitorModule {
       _objectLookAroundExecutedV1 = true;
       await _runObjectLookAroundAfterOwnerFoundV1();
     } catch (e, st) {
-      print('[ENV_V1_OBJECT_DELAY] start_failed error=$e\n$st');
+      _envLogV1('[ENV_V1_OBJECT_DELAY] start_failed error=$e\n$st');
     } finally {
       _objectLookAroundRunningV1 = false;
       if (_isEnvironmentMonitoring) {
@@ -984,7 +1273,7 @@ class EnvironMonitorModule {
     if (timer == null) return;
     timer.cancel();
     _pendingObjectLookAroundTimerV1 = null;
-    print('[ENV_V1_OBJECT_DELAY] canceled reason=$reason');
+    _envLogV1('[ENV_V1_OBJECT_DELAY] canceled reason=$reason');
   }
 
   void _cancelPendingObjectLookAroundIfInterruptedV1() {
@@ -1020,7 +1309,7 @@ class EnvironMonitorModule {
   Future<bool> _sendImmediateStopV1({required String phase}) async {
     final service = _bluetoothService;
     if (service == null || !service.isConnected) {
-      print(
+      _envLogV1(
         '[ENV_V1_OBJECT_DELAY] stop skipped '
         'phase=$phase reason=bluetooth_disconnected',
       );
@@ -1030,10 +1319,10 @@ class EnvironMonitorModule {
     try {
       _envV1MotionCommandInFlight = true;
       await service.sendCommand('停止', 0);
-      print('[ENV_V1_OBJECT_DELAY] stop sent phase=$phase');
+      _envLogV1('[ENV_V1_OBJECT_DELAY] stop sent phase=$phase');
       return true;
     } catch (e) {
-      print('[ENV_V1_OBJECT_DELAY] stop failed phase=$phase error=$e');
+      _envLogV1('[ENV_V1_OBJECT_DELAY] stop failed phase=$phase error=$e');
       return false;
     } finally {
       _envV1MotionCommandInFlight = false;
@@ -1044,7 +1333,7 @@ class EnvironMonitorModule {
     if (!_isEnvironmentMonitoring) return;
 
     _monitorStatus = 'OBJECT_LOOK: 原地物体观察';
-    print(
+    _envLogV1(
       '[ENV_V1_OBJECT] start leave_owner_view=true '
       'reason=verified_face_centered_owner_face_or_body_dominates_frame',
     );
@@ -1065,11 +1354,11 @@ class EnvironMonitorModule {
             await _safeSendCommandV1('右转', _objectLookAroundTurnStepDeg);
         if (!moved) {
           canAttemptApproximateReturn = false;
-          print('[ENV_V1_OBJECT] abort reason=turn_away_failed');
+          _envLogV1('[ENV_V1_OBJECT] abort reason=turn_away_failed');
           return;
         }
         accumulatedTurnDeg += _objectLookAroundTurnStepDeg;
-        print(
+        _envLogV1(
           '[ENV_V1_OBJECT] turn_away direction=右转 '
           'angle=$_objectLookAroundTurnStepDeg '
           'accumulated=$accumulatedTurnDeg',
@@ -1078,14 +1367,14 @@ class EnvironMonitorModule {
         final stopped = await _safeSendCommandV1('停止', 0);
         if (!stopped) {
           canAttemptApproximateReturn = false;
-          print('[ENV_V1_OBJECT] abort reason=stop_after_turn_failed');
+          _envLogV1('[ENV_V1_OBJECT] abort reason=stop_after_turn_failed');
           return;
         }
         await Future<void>.delayed(_settleDelay);
 
         final result = await _captureAndDetectObjectSnapshotV1(detector);
         if (result == null) {
-          print('[ENV_V1_OBJECT] detection_skipped reason=snapshot_failed');
+          _envLogV1('[ENV_V1_OBJECT] detection_skipped reason=snapshot_failed');
           break;
         }
 
@@ -1109,12 +1398,12 @@ class EnvironMonitorModule {
     if (!_isEnvironmentMonitoring) return;
     if (returnedToOwnerDirection) {
       final finalResult = await _reconfirmOwnerAfterObjectLookV1();
-      print(
+      _envLogV1(
         '[ENV_V1_OBJECT] done final_status='
         '${finalResult.finalAlignmentStatus}',
       );
     } else {
-      print(
+      _envLogV1(
           '[ENV_V1_OBJECT] done reason=return_owner_approx_failed_or_skipped');
     }
   }
@@ -1125,23 +1414,23 @@ class EnvironMonitorModule {
     try {
       final camera = _cameraService;
       if (camera == null) {
-        print('[ENV_V1_OBJECT] snapshot skipped reason=camera_unavailable');
+        _envLogV1('[ENV_V1_OBJECT] snapshot skipped reason=camera_unavailable');
         return null;
       }
 
       final imagePath = await camera.captureImage();
-      print('[ENV_V1_OBJECT] snapshot imagePath=$imagePath');
+      _envLogV1('[ENV_V1_OBJECT] snapshot imagePath=$imagePath');
 
       final result =
           await detector.detectDesktopObjectsFromImagePath(imagePath);
-      print(
+      _envLogV1(
         '[ENV_V1_OBJECT] result hasObject=${result.hasObject} '
         'rawCount=${result.rawDetectionCount} '
         'filteredCount=${result.objects.length}',
       );
 
       for (final object in result.objects) {
-        print(
+        _envLogV1(
           '[ENV_V1_OBJECT] object label=${object.label} '
           'conf=${_f(object.confidence)} '
           'cx=${_f(object.centerX)} cy=${_f(object.centerY)} '
@@ -1150,7 +1439,7 @@ class EnvironMonitorModule {
       }
       return result;
     } catch (e) {
-      print('[ENV_V1_OBJECT] result hasObject=false error=$e');
+      _envLogV1('[ENV_V1_OBJECT] result hasObject=false error=$e');
       return null;
     }
   }
@@ -1163,7 +1452,7 @@ class EnvironMonitorModule {
     }
 
     const text = '我好像看到一个小东西。';
-    print('[ENV_V1_OBJECT] weak_speech text=$text');
+    _envLogV1('[ENV_V1_OBJECT] weak_speech text=$text');
     await speakWithInterruptProtection(text);
   }
 
@@ -1180,23 +1469,23 @@ class EnvironMonitorModule {
             ? _objectLookAroundMaxAccumulatedTurnDeg
             : accumulatedTurnDeg;
     _monitorStatus = 'OBJECT_RETURN: 回到主人方向';
-    print(
+    _envLogV1(
       '[ENV_V1_OBJECT] return_owner_approx '
       'direction=$returnDirection angle=$boundedTurnDeg',
     );
 
     final moved = await _safeSendCommandV1(returnDirection, boundedTurnDeg);
     if (!moved) {
-      print('[ENV_V1_OBJECT_RETURN] approximate_return failed reason=turn');
+      _envLogV1('[ENV_V1_OBJECT_RETURN] approximate_return failed reason=turn');
       return false;
     }
     final stopped = await _safeSendCommandV1('停止', 0);
     if (!stopped) {
-      print('[ENV_V1_OBJECT_RETURN] approximate_return failed reason=stop');
+      _envLogV1('[ENV_V1_OBJECT_RETURN] approximate_return failed reason=stop');
       return false;
     }
     await Future<void>.delayed(_settleDelay);
-    print(
+    _envLogV1(
       '[ENV_V1_OBJECT_RETURN] approximate_return done '
       'accumulated=$boundedTurnDeg',
     );
@@ -1205,12 +1494,12 @@ class EnvironMonitorModule {
 
   Future<SnapshotAlignResult> _reconfirmOwnerAfterObjectLookV1() async {
     _monitorStatus = 'OBJECT_RETURN: 视觉重确认主人';
-    print('[ENV_V1_OBJECT_RETURN] owner_reacquire start');
+    _envLogV1('[ENV_V1_OBJECT_RETURN] owner_reacquire start');
 
     final human = await _detectHumanObservationSafe(
       phase: 'object_return_reacquire',
     );
-    print(
+    _envLogV1(
       '[ENV_V1_OBJECT_RETURN] human hasHuman=${human.hasHuman} '
       'conf=${_f(human.confidence)} cx=${_f(human.centerX)}',
     );
@@ -1222,7 +1511,7 @@ class EnvironMonitorModule {
       final noTarget = SnapshotAlignResult.noTarget(
         humanObservation: human.hasHuman ? human : null,
       );
-      print(
+      _envLogV1(
         '[ENV_V1_OBJECT_RETURN] final_status='
         '${noTarget.finalAlignmentStatus} reason=no_reliable_human',
       );
@@ -1240,7 +1529,7 @@ class EnvironMonitorModule {
     }
 
     final finalResult = await _runFinalFaceCenteringV1(confirmed);
-    print(
+    _envLogV1(
       '[ENV_V1_OBJECT_RETURN] final_status='
       '${finalResult.finalAlignmentStatus}',
     );
@@ -1255,9 +1544,11 @@ class EnvironMonitorModule {
     if (status == SnapshotAlignStatus.verifiedFaceCentered) {
       return '找到你啦，主人！';
     }
-    if (status == SnapshotAlignStatus.verifiedFaceAcceptable ||
-        status == SnapshotAlignStatus.verifiedPersonAcceptable) {
+    if (status == SnapshotAlignStatus.verifiedFaceAcceptable) {
       return '我看到你啦，主人。';
+    }
+    if (status == SnapshotAlignStatus.verifiedPersonAcceptable) {
+      return '我好像看到你啦。';
     }
     return null;
   }
@@ -1266,7 +1557,8 @@ class EnvironMonitorModule {
     if (!_isEnvironmentMonitoring) return;
     _monitorStatus = 'QUIET_COMPANION: 安静陪伴中';
     _quietCompanionActiveV1 = true;
-    print('[ENV_V1_QUIET] enter mode=voice_expression_only_keep_expression');
+    _envLogV1(
+        '[ENV_V1_QUIET] enter mode=voice_expression_only_keep_expression');
 
     _quietCompanionTimer?.cancel();
     _quietCompanionTimer = Timer.periodic(_quietCompanionInterval, (_) {
@@ -1281,7 +1573,7 @@ class EnvironMonitorModule {
   }
 
   Future<void> _performPetMicroActionV1() async {
-    print('[ENV_V1_QUIET] micro_action action=keep_current_expression');
+    _envLogV1('[ENV_V1_QUIET] micro_action action=keep_current_expression');
   }
 
   Future<void> _ensureCameraService() async {
@@ -1291,14 +1583,14 @@ class EnvironMonitorModule {
 
   Future<void> _startRealtimeHumanDetectionForEnvV1() async {
     if (_envRealtimeHumanRunning) {
-      print('[ENV_V1_RT_HUMAN] start skipped reason=already_running');
+      _envLogV1('[ENV_V1_RT_HUMAN] start skipped reason=already_running');
       return;
     }
 
-    print('[ENV_V1_RT_HUMAN] start requested');
+    _envLogV1('[ENV_V1_RT_HUMAN] start requested');
     final camera = _cameraService;
     if (camera == null) {
-      print('[ENV_V1_RT_HUMAN] start failed error=camera_unavailable');
+      _envLogV1('[ENV_V1_RT_HUMAN] start failed error=camera_unavailable');
       return;
     }
 
@@ -1309,7 +1601,7 @@ class EnvironMonitorModule {
         (recognitions) {
           final observation =
               _extractBestRealtimeHumanObservationV1(recognitions);
-          print(
+          _envLogV1(
             '[ENV_V1_RT_HUMAN] update hasHuman=${observation.hasHuman} '
             'conf=${_f(observation.confidence)} '
             'area=${_f(observation.areaRatio)} '
@@ -1320,14 +1612,14 @@ class EnvironMonitorModule {
           }
         },
         onError: (Object error) {
-          print('[ENV_V1_RT_HUMAN] update failed error=$error');
+          _envLogV1('[ENV_V1_RT_HUMAN] update failed error=$error');
         },
       );
       _envRealtimeHumanRunning = true;
-      print('[ENV_V1_RT_HUMAN] start success');
+      _envLogV1('[ENV_V1_RT_HUMAN] start success');
     } catch (e) {
       _envRealtimeHumanRunning = false;
-      print('[ENV_V1_RT_HUMAN] start failed error=$e');
+      _envLogV1('[ENV_V1_RT_HUMAN] start failed error=$e');
     }
   }
 
@@ -1338,14 +1630,14 @@ class EnvironMonitorModule {
       return;
     }
 
-    print('[ENV_V1_RT_HUMAN] stop requested');
+    _envLogV1('[ENV_V1_RT_HUMAN] stop requested');
     try {
       await _envRealtimeHumanSubscription?.cancel();
       _envRealtimeHumanSubscription = null;
       _cameraService?.stopRealTimeDetection();
-      print('[ENV_V1_RT_HUMAN] stop success');
+      _envLogV1('[ENV_V1_RT_HUMAN] stop success');
     } catch (e) {
-      print('[ENV_V1_RT_HUMAN] stop failed error=$e');
+      _envLogV1('[ENV_V1_RT_HUMAN] stop failed error=$e');
     } finally {
       _envRealtimeHumanRunning = false;
       _recentRealtimeHuman = null;
@@ -1433,7 +1725,7 @@ class EnvironMonitorModule {
   }) async {
     final realtime = _getFreshRealtimeHumanV1();
     if (realtime != null) {
-      print(
+      _envLogV1(
         '[ENV_V1_HUMAN] phase=$phase source=realtime fresh=true '
         'hasHuman=${realtime.hasHuman} conf=${_f(realtime.confidence)} '
         'area=${_f(realtime.areaRatio)} cx=${_f(realtime.centerX)}',
@@ -1442,7 +1734,7 @@ class EnvironMonitorModule {
     }
 
     if (!allowSnapshotFallback) {
-      print(
+      _envLogV1(
         '[ENV_V1_HUMAN] phase=$phase source=realtime fresh=false '
         'reason=no_fresh_realtime',
       );
@@ -1452,7 +1744,7 @@ class EnvironMonitorModule {
     try {
       final camera = _cameraService;
       if (camera == null) {
-        print(
+        _envLogV1(
           '[ENV_V1_HUMAN] phase=$phase source=snapshot_fallback '
           'reason=camera_unavailable',
         );
@@ -1461,7 +1753,7 @@ class EnvironMonitorModule {
       final observation = await camera.detectHumanObservation();
       if (_isReliableHumanObservation(observation)) {
         _cacheRealtimeHumanV1(observation);
-        print(
+        _envLogV1(
           '[ENV_V1_HUMAN] phase=$phase source=snapshot_fallback '
           'reason=no_fresh_realtime hasHuman=true '
           'conf=${_f(observation.confidence)} '
@@ -1469,7 +1761,7 @@ class EnvironMonitorModule {
           'cx=${_f(observation.centerX)}',
         );
       } else {
-        print(
+        _envLogV1(
           '[ENV_V1_HUMAN] phase=$phase source=snapshot_fallback '
           'reason=no_fresh_realtime hasHuman=${observation.hasHuman} '
           'conf=${_f(observation.confidence)} '
@@ -1479,7 +1771,7 @@ class EnvironMonitorModule {
       }
       return observation;
     } catch (e) {
-      print(
+      _envLogV1(
         '[ENV_V1_HUMAN] phase=$phase source=snapshot_fallback '
         'error=$e',
       );
@@ -1500,7 +1792,7 @@ class EnvironMonitorModule {
     final shouldTurnRight =
         _invertOwnerTurnDirection ? !targetOnRight : targetOnRight;
     final direction = shouldTurnRight ? '右转' : '左转';
-    print(
+    _envLogV1(
       '[ENV_V1_TURN_DIR] dx=${_f(dx)} '
       'invert=$_invertOwnerTurnDirection direction=$direction',
     );
@@ -1510,20 +1802,27 @@ class EnvironMonitorModule {
   Future<bool> _safeSendCommandV1(String command, int value) async {
     final service = _bluetoothService;
     if (service == null || !service.isConnected) {
-      print('[ENV_V1_CHASSIS] unavailable reason=disconnected');
+      _envLogV1('[ENV_V1_CHASSIS] unavailable reason=disconnected');
       await _degradeToVoiceExpressionOnly('disconnected');
       return false;
     }
 
     try {
       _envV1MotionCommandInFlight = true;
+      if (command == '左转' || command == '右转') {
+        _envLogV1(
+          '[BT_TURN] command=$command angleDeg=$value source=ENV_V1',
+        );
+      } else if (command == '停止') {
+        _envLogV1('[ENV_V1_CHASSIS] send_stop source=ENV_V1');
+      }
       await service.sendCommand(command, value);
       if (command == '左转' || command == '右转') {
         await Future<void>.delayed(_shortSettleDelay);
       }
       return true;
     } catch (e) {
-      print('[ENV_V1_CHASSIS] write_failed command=$command error=$e');
+      _envLogV1('[ENV_V1_CHASSIS] write_failed command=$command error=$e');
       await _degradeToVoiceExpressionOnly('write_failed');
       await _bestEffortStopAfterWriteFailed(command);
       return false;
@@ -1535,20 +1834,22 @@ class EnvironMonitorModule {
   Future<void> _bestEffortStopAfterWriteFailed(String failedCommand) async {
     final service = _bluetoothService;
     if (failedCommand == '停止') {
-      print('[ENV_V1_CHASSIS] best_effort_stop skipped reason=already_stop');
+      _envLogV1(
+          '[ENV_V1_CHASSIS] best_effort_stop skipped reason=already_stop');
       return;
     }
     if (service == null || !service.isConnected) {
-      print('[ENV_V1_CHASSIS] best_effort_stop skipped reason=disconnected');
+      _envLogV1(
+          '[ENV_V1_CHASSIS] best_effort_stop skipped reason=disconnected');
       return;
     }
 
     try {
-      print('[ENV_V1_CHASSIS] best_effort_stop start');
+      _envLogV1('[ENV_V1_CHASSIS] best_effort_stop start');
       await service.sendCommand('停止', 0);
-      print('[ENV_V1_CHASSIS] best_effort_stop done');
+      _envLogV1('[ENV_V1_CHASSIS] best_effort_stop done');
     } catch (e) {
-      print('[ENV_V1_CHASSIS] best_effort_stop failed error=$e');
+      _envLogV1('[ENV_V1_CHASSIS] best_effort_stop failed error=$e');
     }
   }
 
@@ -1557,7 +1858,7 @@ class EnvironMonitorModule {
     _degradedToVoiceExpressionOnly = true;
     _cancelPendingObjectLookAroundTimerV1(reason: 'chassis_degraded_$reason');
     _cancelStatePollTimer();
-    print('[ENV_V1_CHASSIS] degrade_to_voice_expression_only');
+    _envLogV1('[ENV_V1_CHASSIS] degrade_to_voice_expression_only');
     _monitorStatus = '底盘不可用，降级为语音和表情陪伴';
     await _loadExpression('assets/emotion/face2/眨眼.json');
   }
@@ -1565,31 +1866,31 @@ class EnvironMonitorModule {
   Future<void> _loadExpression(String expressionPath) async {
     try {
       _uiModule?.setAnimation(expressionPath);
-      print('🎭 环境监测 V1 表情: $expressionPath');
+      _envLogV1('🎭 环境监测 V1 表情: $expressionPath');
     } catch (e) {
-      print('❌ 环境监测 V1 表情切换失败: $e');
+      _envLogV1('❌ 环境监测 V1 表情切换失败: $e');
     }
   }
 
   Future<void> speakWithInterruptProtection(String text) async {
     try {
       if (_ttsService == null) {
-        print('⚠️ TTS服务未设置，无法语音播报: $text');
+        _envLogV1('⚠️ TTS服务未设置，无法语音播报: $text');
         return;
       }
       if (_isTtsPlaying) {
-        print('⚠️ TTS正在播放，跳过语音播报: $text');
+        _envLogV1('⚠️ TTS正在播放，跳过语音播报: $text');
         return;
       }
-      print('🎤 环境监测 V1 语音播报: $text');
+      _envLogV1('🎤 环境监测 V1 语音播报: $text');
       await _ttsService!.speak(text);
     } catch (e) {
-      print('❌ 环境监测 V1 语音播报失败: $e');
+      _envLogV1('❌ 环境监测 V1 语音播报失败: $e');
     }
   }
 
   Future<void> _cleanupEnvironmentMonitoring() async {
-    print('🧹 清理环境监测 V1 状态');
+    _envLogV1('🧹 清理环境监测 V1 状态');
     _isEnvironmentMonitoring = false;
     _cancelPendingObjectLookAroundTimerV1(reason: 'env_monitoring_stopped');
     _degradedToVoiceExpressionOnly = false;
@@ -1609,20 +1910,20 @@ class EnvironMonitorModule {
         await service.sendCommand('停止', 0);
       }
     } catch (e) {
-      print('[ENV_V1_CHASSIS] stop_on_cleanup_failed error=$e');
+      _envLogV1('[ENV_V1_CHASSIS] stop_on_cleanup_failed error=$e');
     }
 
     await _stopRealtimeHumanDetectionForEnvV1();
     await _disposeCameraService();
     _uiModule?.setProgramMode(ProgramMode.idle);
-    print('✅ 环境监测 V1 状态清理完成');
+    _envLogV1('✅ 环境监测 V1 状态清理完成');
   }
 
   void _cancelStatePollTimer() {
     if (_statePollTimer == null) return;
     _statePollTimer?.cancel();
     _statePollTimer = null;
-    print('[ENV_V1_CLEANUP] state_poll_timer_cancelled');
+    _envLogV1('[ENV_V1_CLEANUP] state_poll_timer_cancelled');
   }
 
   void _restartStatePollTimer() {
@@ -1645,7 +1946,7 @@ class EnvironMonitorModule {
       _isAnswering = isAnswering();
       _isTtsPlaying = isTtsPlaying();
     } catch (e) {
-      print('[ENV_V1_STATE] poll_failed error=$e');
+      _envLogV1('[ENV_V1_STATE] poll_failed error=$e');
     }
   }
 
@@ -1655,9 +1956,9 @@ class EnvironMonitorModule {
     try {
       camera.stopRealTimeDetection();
       await camera.dispose();
-      print('📷 环境监测 V1 摄像头资源已释放');
+      _envLogV1('📷 环境监测 V1 摄像头资源已释放');
     } catch (e) {
-      print('⚠️ 环境监测 V1 摄像头释放失败: $e');
+      _envLogV1('⚠️ 环境监测 V1 摄像头释放失败: $e');
     } finally {
       if (identical(_cameraService, camera)) {
         _cameraService = null;

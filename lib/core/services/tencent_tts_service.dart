@@ -6,8 +6,14 @@ import 'dart:ui';
 //import 'dart:html';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:tts_plugin/tts_plugin.dart';
+import 'package:voicegpt/core/services/in_app_log_console.dart';
 
 final TencentTtsService tencentTts = TencentTtsService();
+
+void _ttsLog(String message) {
+  print(message);
+  InAppLogConsole.instance.add(message);
+}
 
 class TencentTtsService {
   final TTSController _controller = TTSController.instance;
@@ -44,9 +50,9 @@ class TencentTtsService {
     _controller.listener.listen((ttsData) async {
       try {
         await _player.play(BytesSource(ttsData.data));
-        print("🎵 TTS音频播放开始");
+        _ttsLog("🎵 TTS音频播放开始");
       } catch (e) {
-        print("❌ TTS音频播放失败: $e");
+        _ttsLog("❌ TTS音频播放失败: $e");
         _onPlaybackStartedOnce = null;
         // 播放失败时也完成Completer
         if (_currentCompleter != null && !_currentCompleter!.isCompleted) {
@@ -55,12 +61,12 @@ class TencentTtsService {
       }
     }, onError: (err) {
       if (err is TTSError) {
-        print(
+        _ttsLog(
           '❌ 腾讯 TTS 合成错误: code=${err.code} msg=${err.message} '
           'server=${err.serverMessage}',
         );
       } else {
-        print("❌ 腾讯 TTS 合成错误: $err");
+        _ttsLog("❌ 腾讯 TTS 合成错误: $err");
       }
       _onPlaybackStartedOnce = null;
       // 合成错误时完成Completer
@@ -85,32 +91,32 @@ class TencentTtsService {
         ),
       );
       _player.setAudioContext(_androidVoicePlaybackContext!).then((_) {
-        print('🎚️ [TTS] AudioPlayer setAudioContext(voiceCommunication) ok');
+        _ttsLog('🎚️ [TTS] AudioPlayer setAudioContext(voiceCommunication) ok');
       }).catchError((Object e) {
-        print('🎚️ [TTS] setAudioContext failed: $e');
+        _ttsLog('🎚️ [TTS] setAudioContext failed: $e');
       });
     }
 
     _player.onPlayerStateChanged.listen((state) {
-      print("🎵 TTS播放器状态变化: $state");
+      _ttsLog("🎵 TTS播放器状态变化: $state");
       if (state == PlayerState.playing) {
         final once = _onPlaybackStartedOnce;
         if (once != null) {
           _onPlaybackStartedOnce = null;
-          print("🎵 [TTS] PlayerState.playing → 首帧播放回调（表情对齐）");
+          _ttsLog("🎵 [TTS] PlayerState.playing → 首帧播放回调（表情对齐）");
           once();
         }
       }
       if (state == PlayerState.completed &&
           _currentCompleter != null &&
           !_currentCompleter!.isCompleted) {
-        print("✅ TTS播放完成，正常结束");
+        _ttsLog("✅ TTS播放完成，正常结束");
         _currentCompleter!.complete();
         onCompleted?.call(); // 触发完成回调
       } else if (state == PlayerState.stopped &&
           _currentCompleter != null &&
           !_currentCompleter!.isCompleted) {
-        print("🛑 TTS播放被停止");
+        _ttsLog("🛑 TTS播放被停止");
         _currentCompleter!.complete();
       }
     });
@@ -123,7 +129,7 @@ class TencentTtsService {
 
     // === 新增：文本预处理，确保TTS能正常播报 ===
     String cleanedText = _preprocessTextForTts(text);
-    print("🎤 TTS输入文本: '$text' -> '$cleanedText'");
+    _ttsLog("🎤 TTS输入文本: '$text' -> '$cleanedText'");
 
     await stop();
     _currentCompleter = Completer<void>();
@@ -132,9 +138,10 @@ class TencentTtsService {
     if (Platform.isAndroid && _androidVoicePlaybackContext != null) {
       try {
         await _player.setAudioContext(_androidVoicePlaybackContext!);
-        print('🎚️ [TTS] speak(): refreshed AudioContext(voiceCommunication)');
+        _ttsLog(
+            '🎚️ [TTS] speak(): refreshed AudioContext(voiceCommunication)');
       } catch (e) {
-        print('🎚️ [TTS] speak() setAudioContext: $e');
+        _ttsLog('🎚️ [TTS] speak() setAudioContext: $e');
       }
     }
 
@@ -145,9 +152,9 @@ class TencentTtsService {
 
       // 修改：优化超时处理机制，允许更长的合成时间
       Timer? timeoutTimer;
-      timeoutTimer = Timer(Duration(seconds: 120), () {
+      timeoutTimer = Timer(const Duration(seconds: 120), () {
         if (_currentCompleter != null && !_currentCompleter!.isCompleted) {
-          print("⏰ TTS合成超时（120秒），强制停止播放并完成");
+          _ttsLog("⏰ TTS合成超时（120秒），强制停止播放并完成");
           // 先停止播放，再完成
           _player.stop();
           _currentCompleter!.complete();
@@ -162,7 +169,7 @@ class TencentTtsService {
 
       return _currentCompleter!.future;
     } catch (e) {
-      print("❌ TTS合成失败: $e");
+      _ttsLog("❌ TTS合成失败: $e");
       if (_currentCompleter != null && !_currentCompleter!.isCompleted) {
         _currentCompleter!.complete();
       }
@@ -208,8 +215,8 @@ class TencentTtsService {
   String _preprocessTextForTts(String text) {
     String processed = text.trim();
     processed = _stripMarkdownAndMultimodalArtifacts(processed);
-    processed =
-        processed.replaceAll(RegExp(r'[\x00-\x08\x0b\x0c\x0e-\x1f\u200b-\u200f\ufeff]'), '');
+    processed = processed.replaceAll(
+        RegExp(r'[\x00-\x08\x0b\x0c\x0e-\x1f\u200b-\u200f\ufeff]'), '');
 
     // 确保文本不为空
     if (processed.isEmpty) {
@@ -218,7 +225,7 @@ class TencentTtsService {
 
     // 检查是否包含大量数字（可能是错误的调试信息）
     if (RegExp(r'^\d{10,}$').hasMatch(processed)) {
-      print("⚠️ 检测到纯数字文本，可能是错误的调试信息: $processed");
+      _ttsLog("⚠️ 检测到纯数字文本，可能是错误的调试信息: $processed");
       return "抱歉，出现了一些问题";
     }
 
@@ -233,7 +240,7 @@ class TencentTtsService {
     if (tl.startsWith('{') &&
         tl.contains('"choices"') &&
         (tl.contains('"usage"') || tl.contains('"finish_reason"'))) {
-      print("⚠️ 检测到疑似 API JSON 整段泄漏，已替换默认句");
+      _ttsLog("⚠️ 检测到疑似 API JSON 整段泄漏，已替换默认句");
       return "好的，我明白了";
     }
 
