@@ -53,11 +53,20 @@ class LinearMotionFeedback {
   const LinearMotionFeedback(this.kind, {this.obstacleType = 0});
 
   final LinearMotionEndKind kind;
+
   /// 仅 [LinearMotionEndKind.interrupted] 时有效，与 [MotionInterruptedEvent.obstacleType] 一致
   final int obstacleType;
 }
 
 class MyBluetoothService extends ChangeNotifier {
+  static const bool kEnableFrontSafetyRecover = true;
+  static const bool kEnableRearSafetyRecover = false;
+  static const int kFrontSafetyRecoverDistanceMm = 30;
+  static const Duration kFrontSafetyRecoverSettleDelay =
+      Duration(milliseconds: 150);
+  static const int _rotationValueScale = 4;
+  static const int _rotationPacketMaxValue = 180;
+
   static const String SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
   static const String CHARACTERISTIC_UUID_RX =
       "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
@@ -65,6 +74,8 @@ class MyBluetoothService extends ChangeNotifier {
       "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
   BluetoothDevice? _device;
+  StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
+  StreamSubscription<List<int>>? _txValueSubscription;
   BluetoothCharacteristic? _rxCharacteristic; // 写入
   BluetoothCharacteristic? _txCharacteristic; // 通知
   bool _isConnected = false;
@@ -85,6 +96,8 @@ class MyBluetoothService extends ChangeNotifier {
   // 记录当前命令类型
   int? _currentCommand;
   bool _isAutoRecoveringFromObstacle = false;
+  Timer? _autoReconnectTimer;
+  Timer? _retryConnectTimer;
 
   // 连接设备
   Future<void> connect(String deviceName) async {
@@ -107,19 +120,21 @@ class MyBluetoothService extends ChangeNotifier {
 
       print("✅ 找到设备: ${_device!.name}, 尝试连接...");
       await _device!.connect(autoConnect: false);
+      _retryConnectTimer?.cancel();
+      _retryConnectTimer = null;
       _isConnected = true;
       notifyListeners();
 
       // 监听断开事件
-      _device!.connectionState.listen((state) {
+      await _connectionStateSubscription?.cancel();
+      _connectionStateSubscription = _device!.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
           print("⚠️ 设备断开，准备重连...");
           _isConnected = false;
           notifyListeners();
           _rxCharacteristic = null;
           _txCharacteristic = null;
-          _isExecutingCommand = false;
-          _currentCommand = null;
+          _clearExecutingCommandTracking();
           _retryConnect(deviceName);
         }
       });
@@ -137,8 +152,10 @@ class MyBluetoothService extends ChangeNotifier {
           if (characteristic.uuid.toString() == CHARACTERISTIC_UUID_TX) {
             _txCharacteristic = characteristic;
             await _txCharacteristic!.setNotifyValue(true);
-            _txCharacteristic!.lastValueStream.listen(
-                (data) => _handleDeviceResponse(Uint8List.fromList(data)));
+            await _txValueSubscription?.cancel();
+            _txValueSubscription = _txCharacteristic!.lastValueStream.listen(
+              (data) => _handleDeviceResponse(Uint8List.fromList(data)),
+            );
           }
         }
       }
@@ -164,6 +181,11 @@ class MyBluetoothService extends ChangeNotifier {
 
     print("📩 收到设备返回: ${data.join(' ')}");
 
+    if (data.length == 1 && data[0] == 0x66) {
+      print("[BT_ACK] single_byte_ack");
+      return;
+    }
+
     // 检查数据长度和基本格式
     if (data.length != 5) {
       print("⚠️ 无效数据长度: ${data.length}");
@@ -186,19 +208,24 @@ class MyBluetoothService extends ChangeNotifier {
         _responseStreamController.add(MotionStartedEvent(byte1));
         print("🚀 运动开始: ${_commandToString(byte1)}");
       } else if (byte2 == 0x02) {
-        _isExecutingCommand = false;
-        _currentCommand = null;
+        _clearExecutingCommandTracking();
         _responseStreamController.add(MotionCompletedEvent(byte1));
         print("🏁 运动完成: ${_commandToString(byte1)}");
       } else if (byte2 == 0x03) {
-        _isExecutingCommand = false;
-        _currentCommand = null;
+        _clearExecutingCommandTracking();
         final obstacleInfo = _parseObstacleType(byte3);
         _responseStreamController
             .add(MotionInterruptedEvent(byte1, byte3, obstacleInfo));
         print("🛑 运动中断: ${_commandToString(byte1)}, 原因: $obstacleInfo");
-        // 自动脱困：前方风险后退 10cm；后方风险前进 10cm。
-        unawaited(_autoRecoverFromObstacle(byte3));
+        print(
+          "[BT_SAFE] motion_interrupted "
+          "command=${_commandToString(byte1)} "
+          "obstacleType=0x${byte3.toRadixString(16).toUpperCase()} "
+          "obstacleDescription=$obstacleInfo",
+        );
+        if (byte3 >= 0x01 && byte3 <= 0x04) {
+          unawaited(_autoRecoverFromObstacle(byte3));
+        }
       }
     }
     // 处理传感器查询响应
@@ -226,6 +253,12 @@ class MyBluetoothService extends ChangeNotifier {
           "后障碍: ${rearObstacle ? '有' : '无'}, "
           "前悬崖: ${frontCliff ? '有' : '无'}, "
           "后悬崖: ${rearCliff ? '有' : '无'}");
+      if (rearCliff) {
+        print(
+          "[BT_SAFE] rear_cliff_reported "
+          "source=sensor_query ignored_for_auto_recover",
+        );
+      }
     }
   }
 
@@ -271,6 +304,26 @@ class MyBluetoothService extends ChangeNotifier {
     }
   }
 
+  void _clearExecutingCommandTracking() {
+    _isExecutingCommand = false;
+    _currentCommand = null;
+  }
+
+  String _obstacleTypeTag(int obstacleType) {
+    switch (obstacleType) {
+      case 0x01:
+        return 'front_obstacle';
+      case 0x02:
+        return 'rear_obstacle';
+      case 0x03:
+        return 'front_cliff';
+      case 0x04:
+        return 'rear_cliff';
+      default:
+        return 'unknown';
+    }
+  }
+
   // 发送命令
   Future<void> sendCommand(String command, int value) async {
     if (!_isConnected || _rxCharacteristic == null) {
@@ -310,9 +363,14 @@ class MyBluetoothService extends ChangeNotifier {
         throw Exception('未知命令: $command');
     }
 
-    // 记录当前命令
-    _currentCommand = commandCode;
-    _isExecutingCommand = true;
+    final shouldTrackExecutingCommand = commandCode == 0x01 ||
+        commandCode == 0x02 ||
+        commandCode == 0x03 ||
+        commandCode == 0x04;
+    if (shouldTrackExecutingCommand) {
+      _currentCommand = commandCode;
+      _isExecutingCommand = true;
+    }
 
     // 停止/持续前进/持续后退/查询传感器指令，数据包具有相同格式
     if (commandCode == 0x00 ||
@@ -323,6 +381,9 @@ class MyBluetoothService extends ChangeNotifier {
       final data = Uint8List.fromList([0x66, commandCode, 0, 0, 0xFE]);
       await _rxCharacteristic!.write(data);
       print('发送指令: $command | 发送数据包: $data');
+      if (commandCode == 0x00) {
+        _clearExecutingCommandTracking();
+      }
     }
     // 前进或后退指令
     else if (commandCode == 0x01 || commandCode == 0x02) {
@@ -331,39 +392,61 @@ class MyBluetoothService extends ChangeNotifier {
     }
     // 左转或右转指令：按真实角度下发，单包最大 180 度，超过时拆包发送
     else if (commandCode == 0x03 || commandCode == 0x04) {
-      if (value <= 180) {
-        final data = Uint8List.fromList([0x66, commandCode, value, 0, 0xFE]);
+      final angleDeg = value.clamp(0, 3600).toInt();
+      final encodedTotal = angleDeg * _rotationValueScale;
+      if (encodedTotal <= _rotationPacketMaxValue) {
+        final data =
+            Uint8List.fromList([0x66, commandCode, encodedTotal, 0, 0xFE]);
         await _rxCharacteristic!.write(data);
-        print('发送指令: $command $value | 发送数据包: $data');
+        print(
+            "[BT_TURN] command=$command angleDeg=$angleDeg encoded=$encodedTotal");
 
         // 等待旋转完成，根据角度大小调整等待时间
-        int waitTime = (value * 10).clamp(500, 2200); // 最小500ms，最大2200ms
+        int waitTime = (encodedTotal * 12).clamp(700, 2600);
         await Future.delayed(Duration(milliseconds: waitTime));
         print('旋转完成，等待时间: ${waitTime}ms');
+        _clearExecutingCommandTracking();
       } else {
-        int times = value ~/ 180;
-        int remainder = value % 180;
+        const int maxAnglePerPacket =
+            _rotationPacketMaxValue ~/ _rotationValueScale;
+        int times = angleDeg ~/ maxAnglePerPacket;
+        int remainder = angleDeg % maxAnglePerPacket;
 
-        print('需要旋转 $value 度，分 ${times + (remainder > 0 ? 1 : 0)} 次执行');
+        print('需要旋转 $angleDeg 度，分 ${times + (remainder > 0 ? 1 : 0)} 次执行');
 
         for (int i = 0; i < times; i++) {
-          final data = Uint8List.fromList([0x66, commandCode, 180, 0, 0xFE]);
+          final data = Uint8List.fromList(
+              [0x66, commandCode, _rotationPacketMaxValue, 0, 0xFE]);
           await _rxCharacteristic!.write(data);
-          print('发送指令: $command 180 | 发送数据包: $data (第${i + 1}次)');
+          print(
+            "[BT_TURN] command=$command "
+            "angleDeg=$maxAnglePerPacket encoded=$_rotationPacketMaxValue",
+          );
 
-          await Future.delayed(const Duration(milliseconds: 1800));
-          print('完成第${i + 1}次180度旋转');
+          await Future.delayed(const Duration(milliseconds: 2200));
+          print('完成第${i + 1}次${maxAnglePerPacket}度旋转');
+          if (!_isExecutingCommand || _currentCommand != commandCode) {
+            break;
+          }
         }
 
-        if (remainder > 0) {
-          final data = Uint8List.fromList([0x66, commandCode, remainder, 0, 0xFE]);
+        if (remainder > 0 &&
+            _isExecutingCommand &&
+            _currentCommand == commandCode) {
+          final encodedRemainder = remainder * _rotationValueScale;
+          final data = Uint8List.fromList(
+              [0x66, commandCode, encodedRemainder, 0, 0xFE]);
           await _rxCharacteristic!.write(data);
-          print('发送指令: $command $remainder | 发送数据包: $data (最后1次)');
+          print(
+            "[BT_TURN] command=$command "
+            "angleDeg=$remainder encoded=$encodedRemainder",
+          );
 
-          int waitTime = (remainder * 10).clamp(500, 1800);
+          int waitTime = (encodedRemainder * 12).clamp(700, 2200);
           await Future.delayed(Duration(milliseconds: waitTime));
           print('完成最后 $remainder 度旋转，等待时间: ${waitTime}ms');
         }
+        _clearExecutingCommandTracking();
       }
     }
     // 头部移动指令，绝对角度范围为 8 到 20 度（协议定义）
@@ -388,15 +471,39 @@ class MyBluetoothService extends ChangeNotifier {
       await _rxCharacteristic!.write(stop);
       await Future<void>.delayed(const Duration(milliseconds: 120));
 
-      // 0x01/0x03: 前障碍/前悬崖 -> 后退100mm
-      // 0x02/0x04: 后障碍/后悬崖 -> 前进100mm
-      final moveForward = obstacleType == 0x02 || obstacleType == 0x04;
-      final cmd = moveForward ? 0x01 : 0x02;
-      await _writeForwardBackwardMm(cmd, 100);
+      final obstacleTag = _obstacleTypeTag(obstacleType);
+      if (obstacleType == 0x02 || obstacleType == 0x04) {
+        if (!kEnableRearSafetyRecover) {
+          print(
+            "[BT_SAFE] rear_recover_disabled "
+            "obstacle=$obstacleTag no_forward_recovery",
+          );
+          return;
+        }
+      }
+
+      if (obstacleType != 0x01 && obstacleType != 0x03) {
+        print(
+          "[BT_SAFE] rear_recover_disabled "
+          "obstacle=$obstacleTag no_forward_recovery",
+        );
+        return;
+      }
+
+      if (!kEnableFrontSafetyRecover) {
+        print("[BT_SAFE] front_safety_recover_disabled obstacle=$obstacleTag");
+        return;
+      }
+
+      await _writeForwardBackwardMm(0x02, kFrontSafetyRecoverDistanceMm);
       print(
-        '🛡️ 自动脱困已执行: obstacle=0x${obstacleType.toRadixString(16)} '
-        '${moveForward ? "前进" : "后退"} 100mm',
+        "[BT_SAFE] front_safety_recover "
+        "action=backward "
+        "distanceMm=$kFrontSafetyRecoverDistanceMm "
+        "reason=$obstacleTag",
       );
+      await _rxCharacteristic!.write(stop);
+      await Future<void>.delayed(kFrontSafetyRecoverSettleDelay);
     } catch (e) {
       print('⚠️ 自动脱困失败: $e');
     } finally {
@@ -409,14 +516,16 @@ class MyBluetoothService extends ChangeNotifier {
     if (value <= 255) {
       final data = Uint8List.fromList([0x66, commandCode, value, 0, 0xFE]);
       await _rxCharacteristic!.write(data);
-      print('发送直线运动包: cmd=0x${commandCode.toRadixString(16)} mm=$value | $data');
+      print(
+          '发送直线运动包: cmd=0x${commandCode.toRadixString(16)} mm=$value | $data');
     } else {
       final times = value ~/ 256;
       final remainder = value % 256;
       final data =
           Uint8List.fromList([0x66, commandCode, remainder, times, 0xFE]);
       await _rxCharacteristic!.write(data);
-      print('发送直线运动包: cmd=0x${commandCode.toRadixString(16)} mm=$value | $data');
+      print(
+          '发送直线运动包: cmd=0x${commandCode.toRadixString(16)} mm=$value | $data');
     }
   }
 
@@ -474,8 +583,7 @@ class MyBluetoothService extends ChangeNotifier {
     watchdog = Timer(timeout, () {
       if (!completer.isCompleted) {
         print('⚠️ 直线运动等待 MCU 反馈超时 (${timeout.inSeconds}s)');
-        _isExecutingCommand = false;
-        _currentCommand = null;
+        _clearExecutingCommandTracking();
         finish(const LinearMotionFeedback(LinearMotionEndKind.timedOut));
       }
     });
@@ -487,8 +595,7 @@ class MyBluetoothService extends ChangeNotifier {
       return await completer.future;
     } catch (e) {
       watchdog?.cancel();
-      _isExecutingCommand = false;
-      _currentCommand = null;
+      _clearExecutingCommandTracking();
       rethrow;
     } finally {
       watchdog?.cancel();
@@ -498,6 +605,15 @@ class MyBluetoothService extends ChangeNotifier {
 
   // 主动断开
   Future<void> disconnect() async {
+    _autoReconnectTimer?.cancel();
+    _autoReconnectTimer = null;
+    _retryConnectTimer?.cancel();
+    _retryConnectTimer = null;
+    await _connectionStateSubscription?.cancel();
+    _connectionStateSubscription = null;
+    await _txValueSubscription?.cancel();
+    _txValueSubscription = null;
+
     if (_device != null) {
       await _device!.disconnect();
       _isConnected = false;
@@ -505,9 +621,13 @@ class MyBluetoothService extends ChangeNotifier {
       _device = null;
       _rxCharacteristic = null;
       _txCharacteristic = null;
-      _isExecutingCommand = false;
-      _currentCommand = null;
     }
+    _isConnected = false;
+    _device = null;
+    _rxCharacteristic = null;
+    _txCharacteristic = null;
+    _clearExecutingCommandTracking();
+    notifyListeners();
   }
 
   /// 自动重连固定设备
@@ -524,7 +644,11 @@ class MyBluetoothService extends ChangeNotifier {
   }
 
   Future<void> startAutoReconnect() async {
-    Timer.periodic(Duration(seconds: 5), (timer) async {
+    if (_autoReconnectTimer != null) {
+      print("[BT_RECONNECT] auto_reconnect_already_running");
+      return;
+    }
+    _autoReconnectTimer = Timer.periodic(Duration(seconds: 5), (timer) async {
       if (!_isConnected) {
         try {
           await reconnectLastDevice();
@@ -537,15 +661,22 @@ class MyBluetoothService extends ChangeNotifier {
 
   // 自动重连
   Future<void> _retryConnect(String deviceName) async {
-    await Future.delayed(const Duration(seconds: 2));
-    try {
-      print("🔄 自动重连中...");
-      await connect(deviceName);
-    } catch (e) {
-      print("⚠️ 重连失败: $e，稍后重试...");
-      Future.delayed(const Duration(seconds: 5), () {
-        _retryConnect(deviceName);
-      });
+    if (_retryConnectTimer != null) {
+      print("[BT_RECONNECT] retry_already_scheduled");
+      return;
     }
+    _retryConnectTimer = Timer(const Duration(seconds: 2), () async {
+      _retryConnectTimer = null;
+      try {
+        print("🔄 自动重连中...");
+        await connect(deviceName);
+      } catch (e) {
+        print("⚠️ 重连失败: $e，稍后重试...");
+        _retryConnectTimer = Timer(const Duration(seconds: 5), () {
+          _retryConnectTimer = null;
+          _retryConnect(deviceName);
+        });
+      }
+    });
   }
 }
