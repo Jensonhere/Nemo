@@ -2,15 +2,19 @@ package com.dev.voicegpt
 
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.FlutterInjector
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.StandardMethodCodec
 
 // MediaPipe 导入
 import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.facedetector.FaceDetector
+import com.google.mediapipe.tasks.vision.facedetector.FaceDetectorResult
 import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizer
 import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizerResult
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.components.containers.Detection
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 
@@ -34,6 +38,8 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import java.io.ByteArrayOutputStream
 import java.util.HashMap
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.example.gesture_recognizer_app/mediapipe"
@@ -43,6 +49,8 @@ class MainActivity : FlutterActivity() {
     // 两种模式的手势识别器
     private var gestureRecognizer: GestureRecognizer? = null // live stream
     private var gestureRecognizerImageMode: GestureRecognizer? = null // image mode
+    private var faceDetectorImageMode: FaceDetector? = null // image mode
+    private var faceDetectorModelBuffer: ByteBuffer? = null
 
     private var eventSink: EventChannel.EventSink? = null
 
@@ -143,6 +151,44 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "detectFaceInImage" -> {
+                        val imagePath = call.argument<String>("path")
+                        if (imagePath.isNullOrEmpty()) {
+                            result.error("INVALID_ARGUMENTS", "Missing image path", null)
+                            return@setMethodCallHandler
+                        }
+
+                        val bitmap = BitmapFactory.decodeFile(imagePath)
+                        if (bitmap == null) {
+                            result.error(
+                                "IMAGE_DECODE_ERROR",
+                                "Failed to decode image at path: $imagePath",
+                                null
+                            )
+                            return@setMethodCallHandler
+                        }
+
+                        try {
+                            if (faceDetectorImageMode == null) {
+                                initializeFaceDetectorImageMode()
+                            }
+                            val mpImage = BitmapImageBuilder(bitmap).build()
+                            val detectResult = faceDetectorImageMode?.detect(mpImage)
+                            result.success(
+                                buildPrimaryFaceResultMap(
+                                    detectResult = detectResult,
+                                    imageWidth = bitmap.width.toFloat(),
+                                    imageHeight = bitmap.height.toFloat()
+                                )
+                            )
+                        } catch (e: Exception) {
+                            result.error(
+                                "FACE_DETECT_ERROR",
+                                "Failed to detect face from image: ${e.message}",
+                                null
+                            )
+                        }
+                    }
                     // ----------- 单帧图片识别 -----------
                     "recognizeImage" -> {
                         val imagePath = call.argument<String>("path")
@@ -387,6 +433,42 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun initializeFaceDetectorImageMode() {
+        if (faceDetectorImageMode == null) {
+            if (faceDetectorModelBuffer == null) {
+                faceDetectorModelBuffer =
+                    loadFlutterAssetModelBuffer("assets/models/face_detection_short_range.tflite")
+            }
+            val baseOptions = BaseOptions.builder()
+                .setModelAssetBuffer(faceDetectorModelBuffer)
+                .build()
+            val options = FaceDetector.FaceDetectorOptions.builder()
+                .setBaseOptions(baseOptions)
+                .setRunningMode(RunningMode.IMAGE)
+                .build()
+            try {
+                faceDetectorImageMode = FaceDetector.createFromOptions(this, options)
+                Log.d("MainActivity", "FaceDetector (IMAGE) initialized successfully.")
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error initializing FaceDetector (IMAGE): ${e.message}", e)
+                throw e
+            }
+        }
+    }
+
+    private fun loadFlutterAssetModelBuffer(assetKey: String): ByteBuffer {
+        val flutterAssetPath =
+            FlutterInjector.instance().flutterLoader().getLookupKeyForAsset(assetKey)
+        assets.open(flutterAssetPath).use { input ->
+            val bytes = input.readBytes()
+            val buffer = ByteBuffer.allocateDirect(bytes.size)
+            buffer.order(ByteOrder.nativeOrder())
+            buffer.put(bytes)
+            buffer.rewind()
+            return buffer
+        }
+    }
+
     // -------- 流式处理回调，EventChannel 发送 --------
     private fun processImageWithMediaPipe(bitmap: Bitmap) {
         if (gestureRecognizer == null) {
@@ -448,11 +530,60 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun buildPrimaryFaceResultMap(
+        detectResult: FaceDetectorResult?,
+        imageWidth: Float,
+        imageHeight: Float
+    ): Map<String, Any?> {
+        val detections = detectResult?.detections() ?: emptyList()
+        if (detections.isEmpty()) {
+            return hashMapOf("hasFace" to false)
+        }
+
+        val bestDetection = detections.maxByOrNull { detection ->
+            val score = detection.categories().firstOrNull()?.score() ?: 0f
+            val box = detection.boundingBox()
+            score * box.width() * box.height()
+        } ?: return hashMapOf("hasFace" to false)
+
+        return detectionToFaceResultMap(bestDetection, imageWidth, imageHeight)
+    }
+
+    private fun detectionToFaceResultMap(
+        detection: Detection,
+        imageWidth: Float,
+        imageHeight: Float
+    ): Map<String, Any?> {
+        val box = detection.boundingBox()
+        val score = detection.categories().firstOrNull()?.score() ?: 0f
+
+        val x = box.left.coerceAtLeast(0f)
+        val y = box.top.coerceAtLeast(0f)
+        val width = box.width().coerceAtLeast(0f)
+        val height = box.height().coerceAtLeast(0f)
+        val centerX = x + width / 2f
+        val centerY = y + height / 2f
+
+        return hashMapOf(
+            "hasFace" to true,
+            "centerX" to (centerX / imageWidth).toDouble(),
+            "centerY" to (centerY / imageHeight).toDouble(),
+            "bboxX" to (x / imageWidth).toDouble(),
+            "bboxY" to (y / imageHeight).toDouble(),
+            "bboxW" to (width / imageWidth).toDouble(),
+            "bboxH" to (height / imageHeight).toDouble(),
+            "confidence" to score.toDouble()
+        )
+    }
+
     private fun stopRecognizer() {
         gestureRecognizer?.close()
         gestureRecognizer = null
         gestureRecognizerImageMode?.close()
         gestureRecognizerImageMode = null
+        faceDetectorImageMode?.close()
+        faceDetectorImageMode = null
+        faceDetectorModelBuffer = null
         Log.d("MainActivity", "GestureRecognizers stopped.")
     }
 

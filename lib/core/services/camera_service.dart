@@ -16,9 +16,63 @@ import 'package:path_provider/path_provider.dart';
 /// 图片分析/环境监测模块使用的相机流订阅者 ID（统一由 CameraResourceManager 管理）
 const String _kCameraServiceStreamSubscriberId = 'camera_service';
 const String _kVaPrebufferStreamSubscriberId = 'va_prebuffer';
+const String _kMediaPipePlatformChannel =
+    'com.example.gesture_recognizer_app/mediapipe';
+
+class HumanObservation {
+  const HumanObservation({
+    required this.hasHuman,
+    this.confidence = 0,
+    this.centerX = 0.5,
+    this.centerY = 0.5,
+    this.areaRatio = 0,
+    this.isCentered = false,
+    this.widthRatio = 0,
+    this.heightRatio = 0,
+    this.observedAt,
+  });
+
+  final bool hasHuman;
+  final double confidence;
+  final double centerX;
+  final double centerY;
+  final double areaRatio;
+  final bool isCentered;
+  final double widthRatio;
+  final double heightRatio;
+  final DateTime? observedAt;
+}
+
+class FaceObservation {
+  const FaceObservation({
+    required this.hasFace,
+    this.confidence = 0,
+    this.centerX = 0.5,
+    this.centerY = 0.5,
+    this.bboxX = 0,
+    this.bboxY = 0,
+    this.bboxW = 0,
+    this.bboxH = 0,
+    this.areaRatio = 0,
+    this.observedAt,
+  });
+
+  final bool hasFace;
+  final double confidence;
+  final double centerX;
+  final double centerY;
+  final double bboxX;
+  final double bboxY;
+  final double bboxW;
+  final double bboxH;
+  final double areaRatio;
+  final DateTime? observedAt;
+}
 
 class CameraService {
   final CameraResourceManager _cameraManager = CameraResourceManager();
+  static const MethodChannel _mediaPipeMethodChannel =
+      MethodChannel(_kMediaPipePlatformChannel);
 
   Interpreter? _interpreter;
   bool _isReady = false;
@@ -45,6 +99,9 @@ class CameraService {
   static const int INPUT_SIZE = 300;
   static const String MODEL_PATH = 'assets/models/mobilenet_ssd.tflite';
   static const String LABELS_PATH = 'assets/models/label.txt';
+  static const double _centeredHorizontalDeadZone = 0.075;
+  static const double _centeredMinCenterY = 0.22;
+  static const double _centeredMaxCenterY = 0.80;
 
   final OpenAI _openAI = OpenAI();
 
@@ -114,14 +171,14 @@ class CameraService {
 
     final future = _cameraManager
         .initialize(
-          preferredLens: CameraLensDirection.front,
-          resolutionPreset: ResolutionPreset.medium,
-          imageFormatGroup: ImageFormatGroup.yuv420,
-        )
+      preferredLens: CameraLensDirection.front,
+      resolutionPreset: ResolutionPreset.medium,
+      imageFormatGroup: ImageFormatGroup.yuv420,
+    )
         .then((_) {
-          _isCameraReady = true;
-          print('✅ CameraService 相机资源已就绪');
-        });
+      _isCameraReady = true;
+      print('✅ CameraService 相机资源已就绪');
+    });
     _cameraReadyFuture = future;
     try {
       await future;
@@ -174,6 +231,89 @@ class CameraService {
     }
   }
 
+  Future<HumanObservation> detectHumanObservation({
+    CameraTaskPriority priority = CameraTaskPriority.low,
+    Duration timeout = const Duration(seconds: 3),
+    bool keepStreamOn = true,
+  }) async {
+    await initialize();
+    await _ensureModelReady();
+
+    try {
+      final imageFile = await _cameraManager.takePicture(
+        priority: priority,
+        timeout: timeout,
+        keepStreamOn: keepStreamOn,
+      );
+      final imageBytes = await imageFile.readAsBytes();
+
+      final directory = await getApplicationDocumentsDirectory();
+      imagePath =
+          '${directory.path}/${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final imageFileObj = File(imagePath);
+      await imageFileObj.writeAsBytes(imageBytes);
+
+      final input = await _preprocessImage(imageBytes);
+      final recognitions = await _runInference(input);
+      return _extractBestHumanObservation(recognitions);
+    } catch (e) {
+      print('❌ 人体 observation 检测失败: $e');
+      return const HumanObservation(hasHuman: false);
+    }
+  }
+
+  Future<HumanObservation> detectHumanObservationFromImagePath(
+    String imagePath,
+  ) async {
+    await _ensureModelReady();
+
+    try {
+      final imageFile = File(imagePath);
+      final imageBytes = await imageFile.readAsBytes();
+      final input = await _preprocessImage(imageBytes);
+      final recognitions = await _runInference(input);
+      return _extractBestHumanObservation(recognitions);
+    } catch (e) {
+      print('❌ 静态图人体 observation 检测失败: $e');
+      return const HumanObservation(hasHuman: false);
+    }
+  }
+
+  Future<FaceObservation> detectFaceObservationFromImagePath(
+    String imagePath,
+  ) async {
+    try {
+      final rawResult = await _mediaPipeMethodChannel.invokeMethod(
+        'detectFaceInImage',
+        {'path': imagePath},
+      );
+      if (rawResult is! Map || rawResult['hasFace'] != true) {
+        return const FaceObservation(hasFace: false);
+      }
+
+      final bboxW = (rawResult['bboxW'] as num?)?.toDouble() ?? 0;
+      final bboxH = (rawResult['bboxH'] as num?)?.toDouble() ?? 0;
+      return FaceObservation(
+        hasFace: true,
+        confidence: (rawResult['confidence'] as num?)?.toDouble() ?? 0,
+        centerX: (rawResult['centerX'] as num?)?.toDouble() ?? 0.5,
+        centerY: (rawResult['centerY'] as num?)?.toDouble() ?? 0.5,
+        bboxX: (rawResult['bboxX'] as num?)?.toDouble() ?? 0,
+        bboxY: (rawResult['bboxY'] as num?)?.toDouble() ?? 0,
+        bboxW: bboxW,
+        bboxH: bboxH,
+        areaRatio: bboxW * bboxH,
+        observedAt: DateTime.now(),
+      );
+    } on PlatformException catch (e) {
+      print('❌ 静态图人脸检测平台调用失败: ${e.message}');
+      return const FaceObservation(hasFace: false);
+    } catch (e) {
+      print('❌ 静态图人脸检测失败: $e');
+      return const FaceObservation(hasFace: false);
+    }
+  }
+
   Future<Uint8List> _preprocessImage(Uint8List bytes) async {
     try {
       final codec = await instantiateImageCodec(
@@ -210,6 +350,58 @@ class CameraService {
       }
     }
     return false;
+  }
+
+  HumanObservation _extractBestHumanObservation(List<dynamic> results) {
+    Map<dynamic, dynamic>? bestRecognition;
+    double bestScore = 0;
+
+    for (final recognition in results) {
+      if (recognition is! Map) continue;
+      if (recognition['detectedClass'] != 'person') continue;
+
+      final confidence =
+          (recognition['confidenceInClass'] as num?)?.toDouble() ?? 0;
+      if (confidence <= HUMAN_THRESHOLD) continue;
+
+      final rect = recognition['rect'];
+      if (rect is! Map) continue;
+      final width = (rect['w'] as num?)?.toDouble() ?? 0;
+      final height = (rect['h'] as num?)?.toDouble() ?? 0;
+      final area = width * height;
+      final score = confidence * area;
+      if (score > bestScore) {
+        bestScore = score;
+        bestRecognition = recognition;
+      }
+    }
+
+    if (bestRecognition == null) {
+      return const HumanObservation(hasHuman: false);
+    }
+
+    final rect = bestRecognition['rect'] as Map<dynamic, dynamic>;
+    final x = (rect['x'] as num?)?.toDouble() ?? 0;
+    final y = (rect['y'] as num?)?.toDouble() ?? 0;
+    final width = (rect['w'] as num?)?.toDouble() ?? 0;
+    final height = (rect['h'] as num?)?.toDouble() ?? 0;
+    final centerX = x + width / 2;
+    final centerY = y + height / 2;
+
+    return HumanObservation(
+      hasHuman: true,
+      confidence:
+          (bestRecognition['confidenceInClass'] as num?)?.toDouble() ?? 0,
+      centerX: centerX,
+      centerY: centerY,
+      areaRatio: width * height,
+      isCentered: (centerX - 0.5).abs() <= _centeredHorizontalDeadZone &&
+          centerY >= _centeredMinCenterY &&
+          centerY <= _centeredMaxCenterY,
+      widthRatio: width,
+      heightRatio: height,
+      observedAt: DateTime.now(),
+    );
   }
 
   Future<List<dynamic>> _runInference(Uint8List input) async {
@@ -347,13 +539,11 @@ class CameraService {
         final vIndex = (srcY ~/ 2) * vStride + (srcX ~/ 2);
         final uValue = uData[uIndex];
         final vValue = vData[vIndex];
-        int r =
-            (yValue + 1.402 * (vValue - 128)).round().clamp(0, 255);
+        int r = (yValue + 1.402 * (vValue - 128)).round().clamp(0, 255);
         int g = (yValue - 0.344 * (uValue - 128) - 0.714 * (vValue - 128))
             .round()
             .clamp(0, 255);
-        int b =
-            (yValue + 1.772 * (uValue - 128)).round().clamp(0, 255);
+        int b = (yValue + 1.772 * (uValue - 128)).round().clamp(0, 255);
         rgbBytes[rgbIndex++] = r;
         rgbBytes[rgbIndex++] = g;
         rgbBytes[rgbIndex++] = b;
@@ -378,8 +568,10 @@ class CameraService {
         double maxX = 0.5 + centerThreshold / 2;
         double minY = 0.5 - centerThreshold / 2;
         double maxY = 0.5 + centerThreshold / 2;
-        if (centerX >= minX && centerX <= maxX &&
-            centerY >= minY && centerY <= maxY) {
+        if (centerX >= minX &&
+            centerX <= maxX &&
+            centerY >= minY &&
+            centerY <= maxY) {
           return true;
         }
       }
@@ -449,7 +641,8 @@ class CameraService {
   }
 
   Future<void> unsubscribeVaPrebufferStream() async {
-    await _cameraManager.unsubscribeImageStream(_kVaPrebufferStreamSubscriberId);
+    await _cameraManager
+        .unsubscribeImageStream(_kVaPrebufferStreamSubscriberId);
   }
 
   Future<bool> detectGestureByVisionModel() async {
@@ -472,8 +665,7 @@ class CameraService {
         if (json is Map && json.containsKey('has_gesture')) {
           final v = json['has_gesture'];
           hasGesture = v == true ||
-              (v is String &&
-                  (v.toLowerCase() == 'true' || v == '1'));
+              (v is String && (v.toLowerCase() == 'true' || v == '1'));
         }
       } catch (_) {
         final lower = text.toLowerCase();
