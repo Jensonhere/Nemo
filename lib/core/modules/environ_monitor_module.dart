@@ -94,11 +94,17 @@ class EnvironMonitorModule {
   static const bool _invertOwnerTurnDirection = false;
   static const bool _enableStartSearchSpeechAfterPreLookFail = true;
   static const bool _enableObjectLookAroundAfterOwnerFoundV1 = true;
-  static const bool _allowObjectLookAfterAcceptableFaceV1 = false;
+  static const bool _allowObjectLookAfterAcceptableFaceV1 = true;
   static const bool _enableWeakObjectSpeechV1 = true;
   static const int _preLookAroundSweepAngleDeg = 18;
-  static const int _objectLookAroundTurnStepDeg = 30;
-  static const int _objectLookAroundMaxAccumulatedTurnDeg = 60;
+  static const int _objectLookAroundStepDegV1 = 20;
+  static const int _objectLookAroundMaxRoundsV1 = 3;
+  static const int _objectLookAroundMaxAccumulatedDegV1 = 60;
+  static const int _objectReturnOwnerReacquireMaxAttemptsV1 = 2;
+  static const int _objectReturnResearchLocalStepDegV1 = 20;
+  static const int _objectReturnResearchWideStepDegV1 = 30;
+  static const int _objectReturnResearchWideMaxRoundsV1 = 6;
+  static const int _objectReturnResearchWideMaxAccumulatedDegV1 = 180;
   static const double _reliableHumanConfidence = 0.50;
   static const double _reliableHumanMinAreaRatio = 0.012;
   static const double _ownerTrackDeadZoneV1 = 0.08;
@@ -118,12 +124,49 @@ class EnvironMonitorModule {
   static const Duration _shortSettleDelay = Duration(milliseconds: 160);
   static const Duration _quietCompanionInterval = Duration(seconds: 45);
   static const Duration _objectLookAroundDelayAfterOwnerFoundV1 =
-      Duration(seconds: 30);
+      Duration(seconds: 10);
   static const Duration _objectLookAroundPreStartStopSettleV1 =
       Duration(milliseconds: 200);
   static const Duration _ownerReplyWaitTimeoutV1 = Duration(seconds: 8);
   static const Duration _ownerReplyWaitPollIntervalV1 =
       Duration(milliseconds: 250);
+  static const double _objectSpeechSpecificConfidenceV1 = 0.65;
+  static const double _objectSpeechFallbackConfidenceV1 = 0.40;
+  static const Set<String> _objectSpeechSafeLabelsV1 = {
+    'cup',
+    'bottle',
+    'book',
+    'laptop',
+    'keyboard',
+    'mouse',
+    'remote',
+    'cell phone',
+    'chair',
+    'potted plant',
+    '杯子',
+    '瓶子',
+    '书',
+    '电脑',
+    '键盘',
+    '鼠标',
+    '遥控器',
+    '手机',
+    '椅子',
+    '小植物',
+    '盆栽',
+  };
+  static const Map<String, String> _objectSpeechLabelZhV1 = {
+    'cup': '杯子',
+    'bottle': '瓶子',
+    'book': '书',
+    'laptop': '电脑',
+    'keyboard': '键盘',
+    'mouse': '鼠标',
+    'cell phone': '手机',
+    'remote': '遥控器',
+    'chair': '椅子',
+    'potted plant': '小植物',
+  };
 
   MyBluetoothService? _bluetoothService;
   VoiceTtsService? _ttsService;
@@ -1210,17 +1253,43 @@ class EnvironMonitorModule {
     _quietCompanionActiveV1 = false;
 
     try {
-      await _ensureCameraService();
-      if (!_isEnvironmentMonitoring) return;
-
       final stopped = await _sendImmediateStopV1(phase: 'object_look_start');
       if (!stopped) {
         _envLogV1('[ENV_V1_OBJECT_DELAY] skipped reason=pre_start_stop_failed');
         return;
       }
-      await Future<void>.delayed(_objectLookAroundPreStartStopSettleV1);
-      if (!_isEnvironmentMonitoring) return;
 
+      var cancelReason = _objectLookAroundStartCancelReasonV1();
+      if (cancelReason != null) {
+        _envLogV1('[ENV_V1_OBJECT_DELAY] skipped reason=$cancelReason');
+        return;
+      }
+
+      await _speakBeforeObjectLookAroundV1();
+      cancelReason = _objectLookAroundStartCancelReasonV1();
+      if (cancelReason != null) {
+        _envLogV1('[ENV_V1_OBJECT_DELAY] skipped reason=$cancelReason');
+        return;
+      }
+
+      final stoppedAfterSpeech = await _sendImmediateStopV1(
+        phase: 'object_look_after_speech',
+      );
+      if (!stoppedAfterSpeech) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_DELAY] skipped reason=post_speech_stop_failed',
+        );
+        return;
+      }
+      await Future<void>.delayed(_objectLookAroundPreStartStopSettleV1);
+      cancelReason = _objectLookAroundStartCancelReasonV1();
+      if (cancelReason != null) {
+        _envLogV1('[ENV_V1_OBJECT_DELAY] skipped reason=$cancelReason');
+        return;
+      }
+
+      await _ensureCameraService();
+      if (!_isEnvironmentMonitoring) return;
       _objectLookAroundExecutedV1 = true;
       await _runObjectLookAroundAfterOwnerFoundV1();
     } catch (e, st) {
@@ -1329,13 +1398,44 @@ class EnvironMonitorModule {
     }
   }
 
+  String? _objectLookAroundStartCancelReasonV1() {
+    _refreshExternalActivityStateV1();
+    if (!_isEnvironmentMonitoring) {
+      return 'env_monitoring_stopped';
+    }
+    if (_isAnswering) {
+      return 'chat_active';
+    }
+    final service = _bluetoothService;
+    if (service == null || !service.isConnected) {
+      return 'bluetooth_disconnected';
+    }
+    return null;
+  }
+
+  Future<void> _speakBeforeObjectLookAroundV1() async {
+    const text = '我去找找有没有别的好玩的。';
+    _envLogV1('[ENV_V1_OBJECT_DELAY] speak_before_object text=$text');
+    try {
+      final tts = _ttsService;
+      if (tts == null) {
+        throw StateError('tts_service_unavailable');
+      }
+      _envLogV1('🎤 环境监测 V1 语音播报: $text');
+      await tts.speak(text);
+      _envLogV1('[ENV_V1_OBJECT_DELAY] speak_before_object done');
+    } catch (e) {
+      _envLogV1('[ENV_V1_OBJECT_DELAY] speak_before_object failed error=$e');
+    }
+  }
+
   Future<void> _runObjectLookAroundAfterOwnerFoundV1() async {
     if (!_isEnvironmentMonitoring) return;
 
     _monitorStatus = 'OBJECT_LOOK: 原地物体观察';
     _envLogV1(
       '[ENV_V1_OBJECT] start leave_owner_view=true '
-      'reason=verified_face_centered_owner_face_or_body_dominates_frame',
+      'reason=owner_found_hold_elapsed',
     );
     await _loadExpression('assets/emotion/face2/观察/01/观察 01.json');
 
@@ -1343,24 +1443,25 @@ class EnvironMonitorModule {
     var accumulatedTurnDeg = 0;
     var returnedToOwnerDirection = false;
     var canAttemptApproximateReturn = true;
+    DetectedDesktopObject? bestObject;
     try {
-      for (var attempt = 0; attempt < 2; attempt++) {
+      for (var round = 1; round <= _objectLookAroundMaxRoundsV1; round++) {
         if (!_isEnvironmentMonitoring) return;
-        if (accumulatedTurnDeg >= _objectLookAroundMaxAccumulatedTurnDeg) {
+        if (accumulatedTurnDeg >= _objectLookAroundMaxAccumulatedDegV1) {
           break;
         }
 
-        final moved =
-            await _safeSendCommandV1('右转', _objectLookAroundTurnStepDeg);
+        const turnDeg = _objectLookAroundStepDegV1;
+        final moved = await _safeSendCommandV1('右转', turnDeg);
         if (!moved) {
           canAttemptApproximateReturn = false;
           _envLogV1('[ENV_V1_OBJECT] abort reason=turn_away_failed');
           return;
         }
-        accumulatedTurnDeg += _objectLookAroundTurnStepDeg;
+        accumulatedTurnDeg += turnDeg;
         _envLogV1(
-          '[ENV_V1_OBJECT] turn_away direction=右转 '
-          'angle=$_objectLookAroundTurnStepDeg '
+          '[ENV_V1_OBJECT] round=$round/$_objectLookAroundMaxRoundsV1 '
+          'turn_away direction=右转 angle=$turnDeg '
           'accumulated=$accumulatedTurnDeg',
         );
 
@@ -1372,17 +1473,23 @@ class EnvironMonitorModule {
         }
         await Future<void>.delayed(_settleDelay);
 
-        final result = await _captureAndDetectObjectSnapshotV1(detector);
+        final result = await _captureAndDetectObjectSnapshotV1(
+          detector,
+          round: round,
+          maxRounds: _objectLookAroundMaxRoundsV1,
+        );
         if (result == null) {
-          _envLogV1('[ENV_V1_OBJECT] detection_skipped reason=snapshot_failed');
+          _envLogV1(
+            '[ENV_V1_OBJECT] round=$round/$_objectLookAroundMaxRoundsV1 '
+            'detection_skipped reason=snapshot_failed',
+          );
           break;
         }
 
-        await _speakWeakObjectObservationV1(result);
-        if (result.hasObject) {
-          break;
-        }
+        bestObject = _bestObjectSpeechCandidateV1(bestObject, result);
       }
+
+      await _speakObjectObservationV1(bestObject);
     } finally {
       await detector.close();
       if (_isEnvironmentMonitoring &&
@@ -1409,51 +1516,152 @@ class EnvironMonitorModule {
   }
 
   Future<ObjectDetectionSnapshotResult?> _captureAndDetectObjectSnapshotV1(
-    DesktopObjectDetector detector,
-  ) async {
+    DesktopObjectDetector detector, {
+    required int round,
+    required int maxRounds,
+  }) async {
     try {
       final camera = _cameraService;
       if (camera == null) {
-        _envLogV1('[ENV_V1_OBJECT] snapshot skipped reason=camera_unavailable');
+        _envLogV1(
+          '[ENV_V1_OBJECT] round=$round/$maxRounds '
+          'snapshot skipped reason=camera_unavailable',
+        );
         return null;
       }
 
       final imagePath = await camera.captureImage();
-      _envLogV1('[ENV_V1_OBJECT] snapshot imagePath=$imagePath');
+      _envLogV1(
+        '[ENV_V1_OBJECT] round=$round/$maxRounds snapshot imagePath=$imagePath',
+      );
 
       final result =
           await detector.detectDesktopObjectsFromImagePath(imagePath);
+      final topObject = _firstNonPersonObjectV1(result);
       _envLogV1(
-        '[ENV_V1_OBJECT] result hasObject=${result.hasObject} '
+        '[ENV_V1_OBJECT] round=$round/$maxRounds '
+        'result hasObject=${result.hasObject} '
+        'label=${topObject?.label ?? 'none'} '
+        'score=${_f(topObject?.confidence ?? 0)} '
+        'reason=${result.reason} '
         'rawCount=${result.rawDetectionCount} '
         'filteredCount=${result.objects.length}',
       );
 
       for (final object in result.objects) {
         _envLogV1(
-          '[ENV_V1_OBJECT] object label=${object.label} '
-          'conf=${_f(object.confidence)} '
+          '[ENV_V1_OBJECT] round=$round/$maxRounds '
+          'object label=${object.label} '
+          'score=${_f(object.confidence)} '
           'cx=${_f(object.centerX)} cy=${_f(object.centerY)} '
           'area=${_f(object.areaRatio)}',
         );
       }
       return result;
     } catch (e) {
-      _envLogV1('[ENV_V1_OBJECT] result hasObject=false error=$e');
+      _envLogV1(
+        '[ENV_V1_OBJECT] round=$round/$maxRounds '
+        'result hasObject=false error=$e',
+      );
       return null;
     }
   }
 
-  Future<void> _speakWeakObjectObservationV1(
+  DetectedDesktopObject? _bestObjectSpeechCandidateV1(
+    DetectedDesktopObject? current,
     ObjectDetectionSnapshotResult result,
+  ) {
+    var best = current;
+    for (final object in result.objects) {
+      if (_isPersonObjectLabelV1(object.label)) {
+        continue;
+      }
+      if (best == null || object.confidence > best.confidence) {
+        best = object;
+      }
+    }
+    return best;
+  }
+
+  DetectedDesktopObject? _firstNonPersonObjectV1(
+    ObjectDetectionSnapshotResult result,
+  ) {
+    for (final object in result.objects) {
+      if (!_isPersonObjectLabelV1(object.label)) {
+        return object;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _speakObjectObservationV1(
+    DetectedDesktopObject? object,
   ) async {
-    if (!_enableWeakObjectSpeechV1 || !result.hasObject) {
+    if (!_enableWeakObjectSpeechV1) {
+      _envLogV1(
+          '[ENV_V1_OBJECT] object_speech skipped reason=feature_disabled');
+      return;
+    }
+    if (object == null) {
+      _envLogV1('[ENV_V1_OBJECT] object_speech skipped reason=no_object');
       return;
     }
 
+    final label = object.label.trim();
+    final normalizedLabel = _normalizeObjectLabelV1(label);
+    final score = object.confidence;
+    if (_isPersonObjectLabelV1(label)) {
+      _envLogV1(
+        '[ENV_V1_OBJECT] object_speech skipped '
+        'reason=person label=$label score=${_f(score)}',
+      );
+      return;
+    }
+    if (score < _objectSpeechFallbackConfidenceV1) {
+      _envLogV1(
+        '[ENV_V1_OBJECT] object_speech skipped '
+        'reason=below_min_confidence label=$label score=${_f(score)}',
+      );
+      return;
+    }
+
+    final isSafeLabel = _objectSpeechSafeLabelsV1.contains(normalizedLabel);
+    if (isSafeLabel && score >= _objectSpeechSpecificConfidenceV1) {
+      final spokenLabel = _objectSpeechLabelTextV1(label);
+      final text = '我好像看到一个$spokenLabel。';
+      _envLogV1(
+        '[ENV_V1_OBJECT] object_speech mode=specific '
+        'label=$label score=${_f(score)}',
+      );
+      await speakWithInterruptProtection(text);
+      return;
+    }
+
+    final reason = score < _objectSpeechSpecificConfidenceV1
+        ? 'low_confidence'
+        : 'not_whitelisted';
     const text = '我好像看到一个小东西。';
-    _envLogV1('[ENV_V1_OBJECT] weak_speech text=$text');
+    _envLogV1(
+      '[ENV_V1_OBJECT] object_speech mode=fallback '
+      'reason=$reason label=$label score=${_f(score)}',
+    );
     await speakWithInterruptProtection(text);
+  }
+
+  String _normalizeObjectLabelV1(String label) {
+    return label.toLowerCase().trim();
+  }
+
+  bool _isPersonObjectLabelV1(String label) {
+    final normalized = _normalizeObjectLabelV1(label);
+    return normalized == 'person' ||
+        normalized == 'people' ||
+        normalized == '人';
+  }
+
+  String _objectSpeechLabelTextV1(String label) {
+    final normalized = _normalizeObjectLabelV1(label);
+    return _objectSpeechLabelZhV1[normalized] ?? label.trim();
   }
 
   Future<bool> _returnToOwnerAfterObjectLookV1(
@@ -1465,13 +1673,35 @@ class EnvironMonitorModule {
     }
 
     final boundedTurnDeg =
-        accumulatedTurnDeg > _objectLookAroundMaxAccumulatedTurnDeg
-            ? _objectLookAroundMaxAccumulatedTurnDeg
+        accumulatedTurnDeg > _objectLookAroundMaxAccumulatedDegV1
+            ? _objectLookAroundMaxAccumulatedDegV1
             : accumulatedTurnDeg;
     _monitorStatus = 'OBJECT_RETURN: 回到主人方向';
+    final stoppedBeforeSpeech = await _safeSendCommandV1('停止', 0);
+    if (!stoppedBeforeSpeech) {
+      _envLogV1(
+        '[ENV_V1_OBJECT_RETURN] approximate_return failed reason=pre_speech_stop',
+      );
+      return false;
+    }
+
+    const returnText = '我回来看你啦。';
+    _envLogV1('[ENV_V1_OBJECT_RETURN] speak_return_owner text=$returnText');
+    await speakWithInterruptProtection(returnText);
+    if (!_isEnvironmentMonitoring) {
+      return false;
+    }
+    if (!_isBluetoothConnectedV1()) {
+      _envLogV1(
+        '[ENV_V1_OBJECT_RETURN] approximate_return failed '
+        'reason=bluetooth_disconnected_after_speech',
+      );
+      return false;
+    }
+
     _envLogV1(
-      '[ENV_V1_OBJECT] return_owner_approx '
-      'direction=$returnDirection angle=$boundedTurnDeg',
+      '[ENV_V1_OBJECT_RETURN] return_owner_approx start '
+      'accumulated=$boundedTurnDeg direction=$returnDirection',
     );
 
     final moved = await _safeSendCommandV1(returnDirection, boundedTurnDeg);
@@ -1494,31 +1724,272 @@ class EnvironMonitorModule {
 
   Future<SnapshotAlignResult> _reconfirmOwnerAfterObjectLookV1() async {
     _monitorStatus = 'OBJECT_RETURN: 视觉重确认主人';
-    _envLogV1('[ENV_V1_OBJECT_RETURN] owner_reacquire start');
+    var lastResult = SnapshotAlignResult.noTarget();
+    var failureReason = 'max_attempts';
 
+    for (var attempt = 1;
+        attempt <= _objectReturnOwnerReacquireMaxAttemptsV1;
+        attempt++) {
+      _envLogV1(
+        '[ENV_V1_OBJECT_RETURN] owner_reacquire start '
+        'attempt=$attempt/$_objectReturnOwnerReacquireMaxAttemptsV1',
+      );
+
+      final human = await _detectHumanObservationSafe(
+        phase: 'object_return_reacquire_$attempt',
+      );
+      _envLogV1(
+        '[ENV_V1_OBJECT_RETURN] human hasHuman=${human.hasHuman} '
+        'conf=${_f(human.confidence)} cx=${_f(human.centerX)}',
+      );
+
+      if (!_isEnvironmentMonitoring) {
+        return SnapshotAlignResult.noTarget(humanObservation: human);
+      }
+      if (!_isReliableHumanObservation(human)) {
+        lastResult = SnapshotAlignResult.noTarget(
+          humanObservation: human.hasHuman ? human : null,
+        );
+        failureReason = 'no_reliable_human';
+        _envLogV1(
+          '[ENV_V1_OBJECT_RETURN] final_status='
+          '${lastResult.finalAlignmentStatus}',
+        );
+        _envLogV1(
+          '[ENV_V1_OBJECT_RETURN] owner_reacquire failed '
+          'reason=$failureReason',
+        );
+        break;
+      }
+
+      _envLogV1('[ENV_V1_OBJECT_RETURN] track start');
+      final tracked = await _runTrackOwnerV1(human, maxLoops: 2);
+      if (!_isEnvironmentMonitoring) {
+        return SnapshotAlignResult.noTarget(humanObservation: tracked);
+      }
+
+      _envLogV1('[ENV_V1_OBJECT_RETURN] confirm start');
+      final confirmed = await _runConfirmOwnerBySnapshotV1(tracked);
+      if (!_isEnvironmentMonitoring) {
+        return confirmed;
+      }
+
+      var finalResult = await _runFinalFaceCenteringV1(confirmed);
+      if (!_isEnvironmentMonitoring) {
+        return finalResult;
+      }
+      finalResult = await _runStableVerifyIfCenteredV1(finalResult);
+      lastResult = finalResult;
+
+      final status = finalResult.finalAlignmentStatus;
+      _envLogV1('[ENV_V1_OBJECT_RETURN] final_status=$status');
+
+      if (status == SnapshotAlignStatus.verifiedFaceCentered) {
+        await _finishObjectReturnSuccessV1(finalResult);
+        return finalResult;
+      }
+
+      if (status == SnapshotAlignStatus.verifiedFaceAcceptable) {
+        if (attempt < _objectReturnOwnerReacquireMaxAttemptsV1) {
+          _envLogV1(
+            '[ENV_V1_OBJECT_RETURN] retry reason=verified_face_acceptable',
+          );
+          continue;
+        }
+        await _finishObjectReturnSuccessV1(finalResult);
+        return finalResult;
+      }
+
+      if (status == SnapshotAlignStatus.verifiedPersonAcceptable) {
+        await _finishObjectReturnSuccessV1(finalResult);
+        return finalResult;
+      }
+
+      failureReason = status;
+      _envLogV1(
+        '[ENV_V1_OBJECT_RETURN] owner_reacquire failed '
+        'reason=$failureReason',
+      );
+      break;
+    }
+
+    final researchResult = await _runObjectReturnResearchOwnerV1(
+      reason: 'owner_reacquire_failed',
+    );
+    if (!_isEnvironmentMonitoring) {
+      return researchResult;
+    }
+    if (_isObjectReturnSuccessfulStatusV1(
+      researchResult.finalAlignmentStatus,
+    )) {
+      await _finishObjectReturnSuccessV1(researchResult);
+      return researchResult;
+    }
+
+    _envLogV1(
+      '[ENV_V1_OBJECT_RETURN] owner_reacquire failed '
+      'reason=$failureReason last_status=${lastResult.finalAlignmentStatus}',
+    );
+    await _handleObjectReturnFailedAfterResearchV1();
+    return researchResult;
+  }
+
+  Future<SnapshotAlignResult> _runObjectReturnResearchOwnerV1({
+    required String reason,
+  }) async {
+    _envLogV1('[ENV_V1_OBJECT_RESEARCH] start reason=$reason');
+
+    final localResult = await _runObjectReturnResearchLocalV1();
+    if (!_isEnvironmentMonitoring ||
+        _isObjectReturnSuccessfulStatusV1(localResult.finalAlignmentStatus)) {
+      return localResult;
+    }
+
+    final wideResult = await _runObjectReturnResearchWideV1();
+    if (!_isEnvironmentMonitoring ||
+        _isObjectReturnSuccessfulStatusV1(wideResult.finalAlignmentStatus)) {
+      return wideResult;
+    }
+
+    await _safeSendCommandV1('停止', 0);
+    _envLogV1('[ENV_V1_OBJECT_RESEARCH] failed no_target');
+    return wideResult;
+  }
+
+  Future<SnapshotAlignResult> _runObjectReturnResearchLocalV1() async {
+    _envLogV1('[ENV_V1_OBJECT_RESEARCH] level=local step=center_check');
+    var result = await _detectAndAlignObjectReturnResearchCandidateV1(
+      level: 'local',
+    );
+    if (_isObjectReturnSuccessfulStatusV1(result.finalAlignmentStatus)) {
+      return result;
+    }
+
+    var turned = await _turnObjectReturnResearchLocalV1(
+      command: '左转',
+      turn: 'left',
+      angleDeg: _objectReturnResearchLocalStepDegV1,
+    );
+    if (!turned) return result;
+    result = await _detectAndAlignObjectReturnResearchCandidateV1(
+      level: 'local',
+    );
+    if (_isObjectReturnSuccessfulStatusV1(result.finalAlignmentStatus)) {
+      return result;
+    }
+
+    turned = await _turnObjectReturnResearchLocalV1(
+      command: '右转',
+      turn: 'right',
+      angleDeg: _objectReturnResearchLocalStepDegV1 * 2,
+    );
+    if (!turned) return result;
+    result = await _detectAndAlignObjectReturnResearchCandidateV1(
+      level: 'local',
+    );
+    if (_isObjectReturnSuccessfulStatusV1(result.finalAlignmentStatus)) {
+      return result;
+    }
+
+    turned = await _turnObjectReturnResearchLocalV1(
+      command: '左转',
+      turn: 'left',
+      angleDeg: _objectReturnResearchLocalStepDegV1,
+      returnCenter: true,
+    );
+    if (!turned) return result;
+    return _detectAndAlignObjectReturnResearchCandidateV1(level: 'local');
+  }
+
+  Future<bool> _turnObjectReturnResearchLocalV1({
+    required String command,
+    required String turn,
+    required int angleDeg,
+    bool returnCenter = false,
+  }) async {
+    _envLogV1(
+      '[ENV_V1_OBJECT_RESEARCH] level=local turn=$turn '
+      'angle=$angleDeg${returnCenter ? ' return_center' : ''}',
+    );
+    final moved = await _safeSendCommandV1(command, angleDeg);
+    if (!moved) {
+      _envLogV1('[ENV_V1_OBJECT_RESEARCH] failed reason=local_turn_failed');
+      return false;
+    }
+    final stopped = await _safeSendCommandV1('停止', 0);
+    if (!stopped) {
+      _envLogV1('[ENV_V1_OBJECT_RESEARCH] failed reason=local_stop_failed');
+      return false;
+    }
+    await Future<void>.delayed(_settleDelay);
+    return _isEnvironmentMonitoring;
+  }
+
+  Future<SnapshotAlignResult> _runObjectReturnResearchWideV1() async {
+    var accumulatedDeg = 0;
+    var lastResult = SnapshotAlignResult.noTarget();
+
+    for (var round = 1;
+        round <= _objectReturnResearchWideMaxRoundsV1;
+        round++) {
+      if (!_isEnvironmentMonitoring) return lastResult;
+      if (accumulatedDeg >= _objectReturnResearchWideMaxAccumulatedDegV1) {
+        break;
+      }
+
+      const turnDeg = _objectReturnResearchWideStepDegV1;
+      final nextAccumulated = accumulatedDeg + turnDeg;
+      _envLogV1(
+        '[ENV_V1_OBJECT_RESEARCH] level=wide '
+        'round=$round/$_objectReturnResearchWideMaxRoundsV1 '
+        'turn=right angle=$turnDeg accumulated=$nextAccumulated',
+      );
+      final moved = await _safeSendCommandV1('右转', turnDeg);
+      if (!moved) {
+        _envLogV1('[ENV_V1_OBJECT_RESEARCH] failed reason=wide_turn_failed');
+        return lastResult;
+      }
+      accumulatedDeg = nextAccumulated;
+      final stopped = await _safeSendCommandV1('停止', 0);
+      if (!stopped) {
+        _envLogV1('[ENV_V1_OBJECT_RESEARCH] failed reason=wide_stop_failed');
+        return lastResult;
+      }
+      await Future<void>.delayed(_settleDelay);
+
+      lastResult = await _detectAndAlignObjectReturnResearchCandidateV1(
+        level: 'wide',
+      );
+      if (_isObjectReturnSuccessfulStatusV1(lastResult.finalAlignmentStatus)) {
+        return lastResult;
+      }
+    }
+
+    await _safeSendCommandV1('停止', 0);
+    return lastResult;
+  }
+
+  Future<SnapshotAlignResult> _detectAndAlignObjectReturnResearchCandidateV1({
+    required String level,
+  }) async {
     final human = await _detectHumanObservationSafe(
-      phase: 'object_return_reacquire',
+      phase: 'object_return_research_$level',
     );
     _envLogV1(
-      '[ENV_V1_OBJECT_RETURN] human hasHuman=${human.hasHuman} '
+      '[ENV_V1_OBJECT_RESEARCH] candidate hasHuman=${human.hasHuman} '
       'conf=${_f(human.confidence)} cx=${_f(human.centerX)}',
     );
-
     if (!_isEnvironmentMonitoring) {
       return SnapshotAlignResult.noTarget(humanObservation: human);
     }
     if (!_isReliableHumanObservation(human)) {
-      final noTarget = SnapshotAlignResult.noTarget(
+      return SnapshotAlignResult.noTarget(
         humanObservation: human.hasHuman ? human : null,
       );
-      _envLogV1(
-        '[ENV_V1_OBJECT_RETURN] final_status='
-        '${noTarget.finalAlignmentStatus} reason=no_reliable_human',
-      );
-      return noTarget;
     }
 
-    final tracked = await _runTrackOwnerV1(human);
+    _envLogV1('[ENV_V1_OBJECT_RESEARCH] found level=$level');
+    final tracked = await _runTrackOwnerV1(human, maxLoops: 2);
     if (!_isEnvironmentMonitoring) {
       return SnapshotAlignResult.noTarget(humanObservation: tracked);
     }
@@ -1528,16 +1999,55 @@ class EnvironMonitorModule {
       return confirmed;
     }
 
-    final finalResult = await _runFinalFaceCenteringV1(confirmed);
+    var finalResult = await _runFinalFaceCenteringV1(confirmed);
+    if (!_isEnvironmentMonitoring) {
+      return finalResult;
+    }
+    finalResult = await _runStableVerifyIfCenteredV1(finalResult);
     _envLogV1(
-      '[ENV_V1_OBJECT_RETURN] final_status='
+      '[ENV_V1_OBJECT_RESEARCH] final_status='
       '${finalResult.finalAlignmentStatus}',
     );
-    if (finalResult.finalAlignmentStatus ==
-        SnapshotAlignStatus.verifiedFaceCentered) {
-      await _loadExpression('assets/emotion/face2/可爱/02/可爱 02.json');
-    }
     return finalResult;
+  }
+
+  bool _isObjectReturnSuccessfulStatusV1(String status) {
+    return status == SnapshotAlignStatus.verifiedFaceCentered ||
+        status == SnapshotAlignStatus.verifiedFaceAcceptable ||
+        status == SnapshotAlignStatus.verifiedPersonAcceptable;
+  }
+
+  Future<void> _finishObjectReturnSuccessV1(
+    SnapshotAlignResult result,
+  ) async {
+    final status = result.finalAlignmentStatus;
+    if (status == SnapshotAlignStatus.verifiedFaceCentered) {
+      await _loadExpression('assets/emotion/face2/可爱/02/可爱 02.json');
+      _envLogV1('[ENV_V1_OBJECT_RETURN] centered success');
+      return;
+    }
+    if (status == SnapshotAlignStatus.verifiedFaceAcceptable) {
+      await _loadExpression('assets/emotion/face2/可爱/02/可爱 02.json');
+      _envLogV1('[ENV_V1_OBJECT_RETURN] acceptable fallback');
+      return;
+    }
+    if (status == SnapshotAlignStatus.verifiedPersonAcceptable) {
+      await _loadExpression('assets/emotion/face2/可爱/02/可爱 02.json');
+      _envLogV1('[ENV_V1_OBJECT_RETURN] person acceptable fallback');
+    }
+  }
+
+  Future<void> _handleObjectReturnFailedAfterResearchV1() async {
+    _envLogV1(
+      '[ENV_V1_OBJECT_RETURN] failed give_up '
+      'reason=no_owner_after_research',
+    );
+    const text = '主人，我有点找不到你了，我先停在这里等你。';
+    _envLogV1('[ENV_V1_OBJECT_RETURN] speak_failed_return text=$text');
+    await speakWithInterruptProtection(text);
+    await _safeSendCommandV1('停止', 0);
+    await _loadExpression('assets/emotion/face2/眨眼.json');
+    _envLogV1('[ENV_V1_QUIET] enter reason=object_return_failed');
   }
 
   String? _greetingLineForStatus(String status) {
