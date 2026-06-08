@@ -4093,6 +4093,11 @@ class EnvironMonitorModule {
       '[ENV_V1_CLIFF] turn_interrupted direction=$command '
       'angle=$angleDeg phase=$phase',
     );
+    if (phase == 'idle_recenter') {
+      await _handleIdleRecenterFrontCliffInterruptV1();
+      return false;
+    }
+
     final recovered = await _recoverFromFrontCliffV1(
       phase: phase,
       interruptedCommand: command,
@@ -4131,6 +4136,48 @@ class EnvironMonitorModule {
       _envLogV1('[ENV_V1_CLIFF] resume_chain phase=$phase');
     }
     return resumed;
+  }
+
+  Future<void> _handleIdleRecenterFrontCliffInterruptV1() async {
+    _envLogV1('[ENV_V1_CLIFF] idle_recenter_cliff stop_no_resume');
+    _lastFrontCliffRecoveredTurnPhaseV1 = null;
+    _clearFrontCliffInterruptsV1('idle_recenter');
+
+    if (_isFrontCliffAutoBackoffByBluetoothV1()) {
+      _envLogV1('[ENV_V1_CLIFF] backoff_owner=bluetooth_service');
+      _envLogV1('[ENV_V1_CLIFF] duplicate_backoff_prevented=true');
+    }
+
+    final stopped = await _sendIdleRecenterStopSafeV1();
+    if (!stopped) {
+      _markObjectReturnMovementSafetyStopReasonV1();
+    }
+    await Future<void>.delayed(
+      const Duration(milliseconds: _idleRecenterSettleMsV1),
+    );
+    _stopIdleRecenterAfterObjectReturnV1(reason: 'cliff_detected');
+  }
+
+  Future<bool> _sendIdleRecenterStopSafeV1() async {
+    _envLogV1('[ENV_V1_CHASSIS] send_stop source=ENV_V1_IDLE_RECENTER');
+    final service = _bluetoothService;
+    if (service == null || !service.isConnected) {
+      _envLogV1('[ENV_V1_CHASSIS] unavailable reason=disconnected');
+      await _degradeToVoiceExpressionOnly('disconnected');
+      return false;
+    }
+
+    try {
+      _envV1MotionCommandInFlight = true;
+      await service.sendCommand('停止', 0);
+      return true;
+    } catch (e) {
+      _envLogV1('[ENV_V1_CHASSIS] write_failed command=停止 error=$e');
+      await _degradeToVoiceExpressionOnly('write_failed');
+      return false;
+    } finally {
+      _envV1MotionCommandInFlight = false;
+    }
   }
 
   Future<void> _bestEffortStopAfterWriteFailed(String failedCommand) async {
