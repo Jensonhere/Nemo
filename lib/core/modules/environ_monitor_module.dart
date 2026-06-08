@@ -123,11 +123,15 @@ class EnvironMonitorModule {
   static const int _objectMicroApproachMmV1 = 25;
   static const int _objectMicroApproachMaxMmV1 = 30;
   static const int _objectMicroApproachSettleMsV1 = 300;
-  static const int _frontCliffBackoffMmV1 = 50;
-  static const int _frontCliffBackoffSettleMsV1 = 300;
-  static const int _frontCliffTurnRetryDegV1 = 12;
-  static const int _frontCliffSecondTurnRetryDegV1 = 8;
-  static const int _frontCliffMaxRepeatedInterruptsV1 = 2;
+  static const int _frontCliffBtAutoBackoffMmV1 = 30;
+  static const int _frontCliffSupplementalBackoffMmV1 = 30;
+  static const int _frontCliffSupplementalBackoffLargeMmV1 = 50;
+  static const int _frontCliffBackoffMmV1 =
+      _frontCliffSupplementalBackoffLargeMmV1;
+  static const int _frontCliffRecoverSettleMsV1 = 500;
+  static const int _frontCliffResumeTurnCapDegV1 = 8;
+  static const int _frontCliffResumeTurnMinDegV1 = 3;
+  static const int _frontCliffMaxRepeatedByPhaseV1 = 2;
   static const bool _enableExtendedObjectProbeV1 = false;
   static const int _objectMinProbeCountBeforeEarlyStopV1 = 2;
   static const int _objectReturnOwnerReacquireMaxAttemptsV1 = 2;
@@ -2228,59 +2232,97 @@ class EnvironMonitorModule {
     }
     _envLogV1('[ENV_V1_CLIFF] stop sent');
 
+    var totalBackoffMm = 0;
     if (_isFrontCliffAutoBackoffByBluetoothV1()) {
       _envLogV1('[ENV_V1_CLIFF] backoff_owner=bluetooth_service');
       _envLogV1('[ENV_V1_CLIFF] duplicate_backoff_prevented=true');
+      totalBackoffMm += _frontCliffBtAutoBackoffMmV1;
       _envLogV1(
-        '[ENV_V1_CLIFF] recover skip_backoff '
-        'reason=already_recovered_by_bt',
+        '[ENV_V1_CLIFF] supplemental_backoff start '
+        'mm=$_frontCliffSupplementalBackoffMmV1 '
+        'reason=bt_backoff_may_be_insufficient',
+      );
+      final supplemented = await _sendFrontCliffBackoffSafeV1(
+        phase: phase,
+        mm: _frontCliffSupplementalBackoffMmV1,
+        failureReason: 'backoff_not_safe',
+      );
+      if (!supplemented) {
+        _envLogV1(
+          '[ENV_V1_CLIFF] supplemental_backoff skipped reason=rear_not_safe',
+        );
+        return false;
+      }
+      totalBackoffMm += _frontCliffSupplementalBackoffMmV1;
+      _envLogV1(
+        '[ENV_V1_CLIFF] supplemental_backoff done '
+        'mm=$_frontCliffSupplementalBackoffMmV1',
       );
     } else {
       _envLogV1('[ENV_V1_CLIFF] backoff_owner=env_v1');
-      final service = _bluetoothService;
-      if (service == null || !service.isConnected) {
-        _envLogV1(
-          '[ENV_V1_CLIFF] recover failed '
-          'phase=$phase reason=bluetooth_disconnected',
-        );
-        _markObjectReturnSafetyStopReasonV1('bluetooth_disconnected');
-        return false;
-      }
-      final feedback = await service.sendLinearMotionAndAwaitFeedback(
-        '后退',
-        backoffMm,
-        timeout: const Duration(seconds: 8),
+      final backedOff = await _sendFrontCliffBackoffSafeV1(
+        phase: phase,
+        mm: backoffMm,
+        failureReason: 'front_cliff_recover_failed',
       );
-      if (feedback.kind == LinearMotionEndKind.interrupted &&
-          _isCliffObstacleTypeV1(feedback.obstacleType)) {
-        _envLogV1('[ENV_V1_CLIFF] backward_interrupted phase=$phase');
-        _markObjectReturnSafetyStopReasonV1(
-          'backward_interrupted_by_cliff',
-        );
-        await _safeSendCommandV1('停止', 0);
+      if (!backedOff) {
         return false;
       }
-      if (feedback.kind != LinearMotionEndKind.completed) {
-        _envLogV1(
-          '[ENV_V1_CLIFF] recover failed phase=$phase reason=backoff_failed',
-        );
-        _markObjectReturnSafetyStopReasonV1('chassis_unavailable');
-        await _safeSendCommandV1('停止', 0);
-        return false;
-      }
+      totalBackoffMm += backoffMm;
       _envLogV1('[ENV_V1_CLIFF] recover backoff mm=$backoffMm');
     }
 
     await _safeSendCommandV1('停止', 0);
     _envLogV1('[ENV_V1_CLIFF] recover stop_after_backoff');
     await Future<void>.delayed(
-      const Duration(milliseconds: _frontCliffBackoffSettleMsV1),
+      const Duration(milliseconds: _frontCliffRecoverSettleMsV1),
     );
+    _envLogV1('[ENV_V1_CLIFF] recover totalBackoffMm~=$totalBackoffMm');
     _envLogV1(
-      '[ENV_V1_CLIFF] recover settleMs=$_frontCliffBackoffSettleMsV1',
+      '[ENV_V1_CLIFF] recover settleMs=$_frontCliffRecoverSettleMsV1',
     );
     _envLogV1('[ENV_V1_CLIFF] recover done phase=$phase');
     return true;
+  }
+
+  Future<bool> _sendFrontCliffBackoffSafeV1({
+    required String phase,
+    required int mm,
+    required String failureReason,
+  }) async {
+    final service = _bluetoothService;
+    if (service == null || !service.isConnected) {
+      _envLogV1(
+        '[ENV_V1_CLIFF] recover failed '
+        'phase=$phase reason=bluetooth_disconnected',
+      );
+      _markObjectReturnSafetyStopReasonV1('bluetooth_disconnected');
+      return false;
+    }
+
+    final feedback = await service.sendLinearMotionAndAwaitFeedback(
+      '后退',
+      mm,
+      timeout: const Duration(seconds: 8),
+    );
+    if (feedback.kind == LinearMotionEndKind.completed) {
+      return true;
+    }
+
+    if (feedback.kind == LinearMotionEndKind.interrupted &&
+        _isCliffObstacleTypeV1(feedback.obstacleType)) {
+      _envLogV1('[ENV_V1_CLIFF] backward_interrupted phase=$phase');
+      _markObjectReturnSafetyStopReasonV1('backoff_not_safe');
+      await _safeSendCommandV1('停止', 0);
+      return false;
+    }
+
+    _envLogV1(
+      '[ENV_V1_CLIFF] recover failed phase=$phase reason=$failureReason',
+    );
+    _markObjectReturnSafetyStopReasonV1(failureReason);
+    await _safeSendCommandV1('停止', 0);
+    return false;
   }
 
   Future<bool> _turnBackObjectProbeAfterAbortV1(
@@ -3479,6 +3521,8 @@ class EnvironMonitorModule {
     }
     if (reason == 'front_cliff_recover_failed' ||
         reason == 'cliff_recover_failed' ||
+        reason == 'repeated_front_cliff' ||
+        reason == 'backoff_not_safe' ||
         reason == 'backward_interrupted_by_cliff' ||
         reason == 'cliff_repeated_during_turn' ||
         reason == 'repeated_cliff') {
@@ -4108,22 +4152,21 @@ class EnvironMonitorModule {
       return false;
     }
 
-    if (interruptCount > _frontCliffMaxRepeatedInterruptsV1) {
+    if (interruptCount >= _frontCliffMaxRepeatedByPhaseV1) {
       _envLogV1(
-        '[ENV_V1_CLIFF] recover failed phase=$phase '
-        'reason=repeated_front_cliff count=$interruptCount',
+        '[ENV_V1_CLIFF] repeated_front_cliff '
+        'phase=$phase count=$interruptCount',
       );
-      _markObjectReturnSafetyStopReasonV1('cliff_repeated_during_turn');
+      _markObjectReturnSafetyStopReasonV1('repeated_front_cliff');
       await _safeSendCommandV1('停止', 0);
       return false;
     }
 
-    final retryAngle = interruptCount == 1
-        ? _frontCliffTurnRetryDegV1
-        : _frontCliffSecondTurnRetryDegV1;
+    final retryAngle = _frontCliffResumeAngleDegV1(angleDeg);
     _envLogV1(
       '[ENV_V1_CLIFF] resume_turn direction=$command '
-      'angle=$retryAngle reason=after_front_cliff',
+      'originalAngle=$angleDeg resumeAngle=$retryAngle '
+      'cap=$_frontCliffResumeTurnCapDegV1 reason=after_front_cliff',
     );
     final resumed = await _sendTurnCommandWithFrontCliffResumeV1(
       service,
@@ -4136,6 +4179,19 @@ class EnvironMonitorModule {
       _envLogV1('[ENV_V1_CLIFF] resume_chain phase=$phase');
     }
     return resumed;
+  }
+
+  int _frontCliffResumeAngleDegV1(int originalAngleDeg) {
+    if (originalAngleDeg <= 0) {
+      return _frontCliffResumeTurnMinDegV1;
+    }
+    if (originalAngleDeg < _frontCliffResumeTurnMinDegV1) {
+      return originalAngleDeg;
+    }
+    if (originalAngleDeg > _frontCliffResumeTurnCapDegV1) {
+      return _frontCliffResumeTurnCapDegV1;
+    }
+    return originalAngleDeg;
   }
 
   Future<void> _handleIdleRecenterFrontCliffInterruptV1() async {
