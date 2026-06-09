@@ -4,6 +4,7 @@ import 'package:lottie/lottie.dart';
 import 'package:provider/provider.dart';
 import 'package:voicegpt/core/notifiers/openai.notifier.dart';
 import 'package:voicegpt/core/notifiers/speech_notifier_simplified.dart';
+import 'package:voicegpt/presentation/widgets/owner_voiceprint_library_panel.dart';
 import 'package:voicegpt/core/services/fullscreen_service.dart';
 import 'package:voicegpt/core/services/bluetooth_service.dart';
 import 'package:voicegpt/presentation/widgets/connection_permission_status_strip.dart';
@@ -1149,6 +1150,67 @@ class _HomeViewState extends State<HomeView> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       IconButton(
+                        tooltip: '主人声纹库（1-3条）',
+                        icon: Icon(
+                          speechNotifier.isOwnerVoiceprintLibraryOpen
+                              ? Icons.mic
+                              : speechNotifier.hasOwnerVoiceprint
+                                  ? Icons.mic_external_on
+                                  : Icons.mic_none_outlined,
+                          color: speechNotifier.isOwnerVoiceprintLibraryOpen
+                              ? Colors.orangeAccent
+                              : speechNotifier.isOwnerVoiceprintEnrolling
+                                  ? Colors.redAccent
+                                  : speechNotifier.hasOwnerVoiceprint
+                                      ? Colors.lightGreenAccent
+                                      : Colors.white,
+                          size: 26,
+                        ),
+                        onPressed: speechNotifier.isOwnerVoiceprintEnrolling
+                            ? null
+                            : () {
+                                speechNotifier.toggleOwnerVoiceprintLibrary();
+                              },
+                      ),
+                      IconButton(
+                        tooltip: '主人模式（聆听与打断均需声纹比对）',
+                        icon: Icon(
+                          speechNotifier.isOwnerMode
+                              ? Icons.verified_user
+                              : Icons.verified_user_outlined,
+                          color: speechNotifier.isOwnerMode
+                              ? Colors.amberAccent
+                              : Colors.white,
+                          size: 26,
+                        ),
+                        onPressed: () {
+                          unawaited(
+                            speechNotifier.setOwnerMode(
+                              !speechNotifier.isOwnerMode,
+                            ),
+                          );
+                        },
+                      ),
+                      IconButton(
+                        tooltip: '主人声纹打断播报',
+                        icon: Icon(
+                          speechNotifier.isOwnerVoiceprintBargeInMode
+                              ? Icons.fingerprint
+                              : Icons.fingerprint_outlined,
+                          color: speechNotifier.isOwnerVoiceprintBargeInMode
+                              ? Colors.tealAccent
+                              : Colors.white,
+                          size: 26,
+                        ),
+                        onPressed: () {
+                          unawaited(
+                            speechNotifier.setOwnerVoiceprintBargeInMode(
+                              !speechNotifier.isOwnerVoiceprintBargeInMode,
+                            ),
+                          );
+                        },
+                      ),
+                      IconButton(
                         tooltip: '多人对话（按住说话）',
                         icon: Icon(
                           speechNotifier.isMultiPersonPushToTalkMode
@@ -1194,6 +1256,35 @@ class _HomeViewState extends State<HomeView> {
                       ),
                     ),
                   ),
+                if (speechNotifier.isOwnerVoiceprintLibraryOpen)
+                  Positioned(
+                    top: 96,
+                    right: 6,
+                    child: OwnerVoiceprintLibraryPanel(
+                      speech: speechNotifier,
+                    ),
+                  ),
+                if ((speechNotifier.isOwnerMode ||
+                        speechNotifier.isOwnerVoiceprintBargeInMode) &&
+                    speechNotifier.ownerVoiceprintVerifyStatusLabel != null)
+                  Positioned(
+                    top: 48,
+                    left: 12,
+                    right: 12,
+                    child: Center(
+                      child: _buildVoiceprintVerifyBanner(speechNotifier),
+                    ),
+                  ),
+                if (speechNotifier.showOwnerVoiceprintStatusBanner &&
+                    !speechNotifier.isOwnerVoiceprintLibraryOpen)
+                  Positioned(
+                    left: 20,
+                    right: 20,
+                    bottom: speechNotifier.isMultiPersonPushToTalkMode
+                        ? 100
+                        : 28,
+                    child: _buildOwnerVoiceprintEnrollmentBanner(speechNotifier),
+                  ),
                 Positioned(
                   top: 52,
                   right: 16,
@@ -1236,6 +1327,86 @@ class _HomeViewState extends State<HomeView> {
           ),
         );
       },
+    );
+  }
+
+  /// 采录 / 提取 / 成功 / 失败状态条。
+  Widget _buildOwnerVoiceprintEnrollmentBanner(
+    SpeechNotifierSimplified speech,
+  ) {
+    final ui = speech.ownerVoiceprintUi;
+    Color border;
+    IconData statusIcon;
+    switch (ui) {
+      case OwnerVoiceprintEnrollUi.success:
+        border = Colors.lightGreenAccent;
+        statusIcon = Icons.check_circle_outline;
+        break;
+      case OwnerVoiceprintEnrollUi.failure:
+        border = Colors.redAccent;
+        statusIcon = Icons.error_outline;
+        break;
+      case OwnerVoiceprintEnrollUi.extracting:
+        border = Colors.amberAccent;
+        statusIcon = Icons.hourglass_top;
+        break;
+      case OwnerVoiceprintEnrollUi.capturing:
+      case OwnerVoiceprintEnrollUi.none:
+        border = Colors.orangeAccent;
+        statusIcon = Icons.mic;
+        break;
+    }
+
+    final showPrompt = ui == OwnerVoiceprintEnrollUi.capturing ||
+        ui == OwnerVoiceprintEnrollUi.extracting;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.82),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: border.withOpacity(0.9), width: 1.5),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(statusIcon, color: border, size: 28),
+          const SizedBox(height: 8),
+          if (showPrompt) ...[
+            Text(
+              SpeechNotifierSimplified.ownerVoiceprintEnrollmentPrompt,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 10),
+          ],
+          if (speech.ownerVoiceprintEnrollmentHint.isNotEmpty)
+            Text(
+              speech.ownerVoiceprintEnrollmentHint,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.9),
+                fontSize: 13,
+                height: 1.3,
+              ),
+            ),
+          if (ui == OwnerVoiceprintEnrollUi.capturing &&
+              speech.ownerVoiceprintCaptureMs > 0) ...[
+            const SizedBox(height: 8),
+            LinearProgressIndicator(
+              value: (speech.ownerVoiceprintCaptureMs / 10000).clamp(0.0, 1.0),
+              backgroundColor: Colors.white12,
+              color: Colors.orangeAccent,
+              minHeight: 4,
+            ),
+          ],
+        ],
+      ),
     );
   }
 
@@ -1313,24 +1484,98 @@ class _HomeViewState extends State<HomeView> {
     );
   }
 
+  Widget _buildVoiceprintVerifyBanner(SpeechNotifierSimplified notifier) {
+    final label = notifier.ownerVoiceprintVerifyStatusLabel;
+    if (label == null) return const SizedBox.shrink();
+    final pass = notifier.lastVoiceprintVerifyResult?.pass;
+    final inProgress = notifier.isVoiceprintVerifyInProgress;
+    final bg = inProgress
+        ? Colors.amber.withOpacity(0.92)
+        : (pass == true)
+            ? Colors.teal.withOpacity(0.92)
+            : Colors.deepOrange.withOpacity(0.92);
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 420),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(8),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.35),
+              blurRadius: 6,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Text(
+          label,
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+  }
+
   // 保留语音文本显示（可选）
   Widget _buildSpeechTextIndicator(SpeechNotifierSimplified notifier) {
     String displayText = notifier.getTextSpeech;
     Color textColor = Colors.white;
     // 根据状态显示不同的文本和颜色
     if (notifier.isInConversationMode) {
-      // 边播边听时 isListening 与 isTtsPlaying 可能同时为 true，播报态优先展示
+      final vpLabel = notifier.ownerVoiceprintVerifyStatusLabel;
       if (notifier.isTtsPlaying) {
-        displayText = "🔊 播报中...";
+        if (notifier.isOwnerMode && notifier.hasOwnerVoiceprint) {
+          displayText = '🔊 播报中（主人模式：仅主人可打断）';
+        } else if (notifier.isOwnerMode) {
+          displayText = '🔊 播报中（主人模式：请先录入主人声音）';
+        } else if (notifier.isOwnerVoiceprintBargeInMode &&
+            notifier.hasOwnerVoiceprint) {
+          displayText = '🔊 播报中（仅主人声纹可打断）';
+        } else if (notifier.isOwnerVoiceprintBargeInMode) {
+          displayText = '🔊 播报中（请先录入主人声音）';
+        } else {
+          displayText = '🔊 播报中...';
+        }
         textColor = Colors.blue;
       } else if (notifier.isComplexTaskExecuting) {
         displayText = "🛠️ 复杂任务执行中...";
         textColor = Colors.deepOrangeAccent;
       } else if (notifier.isProcessingUserInput) {
-        // 仅在有「模型/路由/模块处理中」时显示思考；TTS 已结束、正在拉起 ASR 时 isListening 可能尚未为 true，
-        // 不应误显示思考中（否则会出现约 1s 思考→聆听的闪烁）。
         displayText = "💬 思考中...";
         textColor = Colors.amber;
+      } else if ((notifier.isOwnerMode || notifier.isOwnerVoiceprintBargeInMode) &&
+          vpLabel != null) {
+        displayText = vpLabel;
+        if (notifier.isVoiceprintVerifyInProgress) {
+          textColor = Colors.amberAccent;
+        } else if (notifier.lastVoiceprintVerifyResult?.pass == true) {
+          textColor = Colors.lightGreenAccent;
+        } else {
+          textColor = Colors.deepOrangeAccent;
+        }
+      } else if (notifier.isOwnerMode && notifier.hasOwnerVoiceprint) {
+        displayText = '👤 主人模式已开启（仅接受主人语音）';
+        textColor = Colors.amberAccent;
+      } else if (notifier.isOwnerVoiceprintBargeInMode &&
+          notifier.hasOwnerVoiceprint) {
+        displayText = '🔐 主人声纹打断已开启';
+        textColor = Colors.tealAccent;
+      } else if (notifier.isOwnerVoiceprintEnrolling) {
+        displayText = '🎙️ 正在录入主人声音…';
+        textColor = Colors.orangeAccent;
+      } else if (notifier.ownerVoiceprintUi == OwnerVoiceprintEnrollUi.failure) {
+        displayText = '⚠️ 声纹录入失败，请点右上角麦克风重试';
+        textColor = Colors.redAccent;
+      } else if (notifier.getTextSpeech.contains('不可使用')) {
+        displayText = notifier.getTextSpeech;
+        textColor = Colors.redAccent;
       } else if (notifier.isMultiPersonPushToTalkMode) {
         if (notifier.isPttRecordingHold) {
           displayText = "🎙️ 录音中…松开发送";
@@ -1380,24 +1625,24 @@ class _HomeViewState extends State<HomeView> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const ConnectionPermissionStatusStrip(),
-          // 状态指示器
           Container(
-            padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            constraints: const BoxConstraints(maxWidth: 280),
             decoration: BoxDecoration(
               color: Colors.black54,
-              borderRadius: BorderRadius.circular(20),
+              borderRadius: BorderRadius.circular(16),
             ),
             child: Text(
               displayText,
               textAlign: TextAlign.center,
               style: TextStyle(
-                fontSize: 16,
+                fontSize: 13,
                 color: textColor,
                 fontWeight: FontWeight.bold,
               ),
             ),
           ),
-          SizedBox(height: 10),
+          SizedBox(height: 8),
           // 当前表情指示器（调试用）
           Container(
             padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),

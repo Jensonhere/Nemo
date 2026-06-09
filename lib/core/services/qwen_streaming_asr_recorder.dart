@@ -18,6 +18,7 @@ class QwenStreamingAsrRecorder {
     this.androidVoipEchoCapture = false,
     this.isTtsPlaying,
     this.onSpeechDuringTtsBargeIn,
+    this.onSpeechActivity,
     this.silenceAutoFinalize = true,
     this.maxListenMsOverride,
   });
@@ -32,6 +33,9 @@ class QwenStreamingAsrRecorder {
 
   /// TTS 播放中检测到用户抢话时回调（应异步停 TTS，勿在 PCM 线程内阻塞）。
   final void Function()? onSpeechDuringTtsBargeIn;
+
+  /// 本轮听写首次检测到有效人声（能量 VAD），用于暂停空闲超时。
+  final void Function()? onSpeechActivity;
 
   /// 为 false 时不在静音后自动定稿，仅 [finalizeUtteranceForPushToTalk] 松手定稿（多人按住说话）。
   final bool silenceAutoFinalize;
@@ -60,6 +64,14 @@ class QwenStreamingAsrRecorder {
   static const int _duplexBargeWarmupMs = 450;
   static const int _duplexBargeCooldownMs = 900;
 
+  /// 近 2s PCM 环形缓冲，供 TTS 打断声纹比对。
+  static const int _bargeInRingMaxSamples = 32000;
+  final List<double> _bargeInRing = <double>[];
+
+  /// 本轮听写完整 PCM（最多约 10s），供主人模式聆听定稿声纹比对。
+  static const int _utteranceMaxSamples = 160000;
+  final List<double> _utterancePcm = <double>[];
+
   int _duplexLoudMs = 0;
   DateTime? _duplexTtsSince;
   DateTime? _duplexLastFire;
@@ -70,6 +82,7 @@ class QwenStreamingAsrRecorder {
 
   bool _emittedFinal = false;
   bool _speechSeen = false;
+  bool _speechActivityNotified = false;
   int _speechMs = 0;
   int _silenceMs = 0;
   int _totalMs = 0;
@@ -83,6 +96,7 @@ class QwenStreamingAsrRecorder {
     _sessionId = await client.startSession();
     _emittedFinal = false;
     _speechSeen = false;
+    _speechActivityNotified = false;
     _speechMs = 0;
     _silenceMs = 0;
     _totalMs = 0;
@@ -90,6 +104,8 @@ class QwenStreamingAsrRecorder {
     _duplexLoudMs = 0;
     _duplexTtsSince = null;
     _duplexLastFire = null;
+    _bargeInRing.clear();
+    _utterancePcm.clear();
 
     final stream = await MicStream.microphone(
       sampleRate: sampleRate,
@@ -124,9 +140,18 @@ class QwenStreamingAsrRecorder {
     _totalMs += ms;
 
     final rms = _rmsInt16Le(enhanced);
+    _appendBargeInRing(enhanced);
+    _appendUtterancePcm(enhanced);
     _tickDuplexTtsBargeVad(rms, ms);
 
     if (rms >= _rmsSpeech) {
+      if (!_speechActivityNotified) {
+        _speechActivityNotified = true;
+        final activityCb = onSpeechActivity;
+        if (activityCb != null) {
+          scheduleMicrotask(activityCb);
+        }
+      }
       _speechSeen = true;
       _speechMs += ms;
       _silenceMs = 0;
@@ -140,7 +165,9 @@ class QwenStreamingAsrRecorder {
     _buf.addAll(enhanced);
 
     final maxCap = maxListenMsOverride ?? _maxListenMs;
+    final ttsOn = isTtsPlaying?.call() ?? false;
     final shouldEnd = silenceAutoFinalize &&
+        !ttsOn &&
         _speechSeen &&
         _speechMs >= _minSpeechBeforeEndMs &&
         _silenceMs >= _silenceEndMs;
@@ -202,8 +229,43 @@ class QwenStreamingAsrRecorder {
   /// TTS 被同麦 VAD 打断后，重置句尾判定，便于继续收本轮用户后半句。
   void resetSegmentAfterTtsBargeIn() {
     _speechSeen = false;
+    _speechActivityNotified = false;
     _speechMs = 0;
     _silenceMs = 0;
+  }
+
+  /// 声纹打断：取近端 PCM 快照（float32 16kHz）。
+  Float32List snapshotBargeInRingForVerify() {
+    return Float32List.fromList(_bargeInRing);
+  }
+
+  /// 聆听定稿：取本轮完整听写 PCM（优先于 2s 环缓冲做声纹比对）。
+  Float32List snapshotUtterancePcmForVerify() {
+    return Float32List.fromList(_utterancePcm);
+  }
+
+  void _appendUtterancePcm(Uint8List pcm16) {
+    final bd = pcm16.buffer.asByteData(pcm16.offsetInBytes, pcm16.length);
+    final pairs = pcm16.length ~/ 2;
+    for (var i = 0; i < pairs; i++) {
+      _utterancePcm.add(bd.getInt16(i * 2, Endian.little) / 32768.0);
+    }
+    final overflow = _utterancePcm.length - _utteranceMaxSamples;
+    if (overflow > 0) {
+      _utterancePcm.removeRange(0, overflow);
+    }
+  }
+
+  void _appendBargeInRing(Uint8List pcm16) {
+    final bd = pcm16.buffer.asByteData(pcm16.offsetInBytes, pcm16.length);
+    final pairs = pcm16.length ~/ 2;
+    for (var i = 0; i < pairs; i++) {
+      _bargeInRing.add(bd.getInt16(i * 2, Endian.little) / 32768.0);
+    }
+    final overflow = _bargeInRing.length - _bargeInRingMaxSamples;
+    if (overflow > 0) {
+      _bargeInRing.removeRange(0, overflow);
+    }
   }
 
   double _rmsInt16Le(Uint8List bytes) {

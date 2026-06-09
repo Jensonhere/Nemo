@@ -31,8 +31,8 @@ class SherpaKwsWakeService {
   final String assetDir;
   final void Function(String keyword)? onKeyword;
 
-  /// TTS 期间：能量 VAD 检测到人声时回调（与 [onKeyword] 二选一或并存；由上层防抖）。
-  final void Function()? onSpeechBargeIn;
+  /// TTS 期间：能量 VAD 检测到人声时回调，附带最近约 2s 环形缓冲 PCM（供声纹比对）。
+  final void Function(Float32List recentPcm)? onSpeechBargeIn;
 
   /// Android：与 [AndroidVoipAudioRoute] + [MicStream.androidVoipEchoCapture] 协同启用硬件 AEC 采集。
   bool _androidVoipEchoCapture = false;
@@ -103,8 +103,19 @@ class SherpaKwsWakeService {
   static const double _vadPeakFactor = 2.8;
   static const int _vadMinLoudMsVoip = 190;
   static const int _vadMinLoudMsDefault = 260;
+  static const int _vadMinLoudMsVoiceprintVoip = 110;
+  static const int _vadMinLoudMsVoiceprintDefault = 140;
   static const int _vadWarmupMs = 450;
+  static const int _vadWarmupVoiceprintMs = 160;
   static const int _vadCooldownMs = 1100;
+  static const int _vadCooldownRejectMs = 220;
+
+  /// 为 true 时：VAD 触发后先走声纹比对，仅在 [completeBargeInAttempt] 成功后再长冷却。
+  bool _deferBargeInCooldown = false;
+
+  /// TTS 打断声纹比对用环形缓冲（16kHz float mono，约 2s）。
+  static const int _bargeInRingMaxSamples = 32000;
+  final List<double> _bargeInRing = <double>[];
 
   static const _encoder = 'encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx';
   static const _decoder = 'decoder-epoch-13-avg-2-chunk-16-left-64.onnx';
@@ -136,6 +147,10 @@ class SherpaKwsWakeService {
     _vadArmedAt = enabled ? DateTime.now() : null;
     _vadLoudRunSamples = 0;
     _vadCooldownUntil = null;
+    if (!enabled) {
+      _bargeInRing.clear();
+      _deferBargeInCooldown = false;
+    }
     print(
         '🎚️ [SherpaKws] setTtsBargeInVadEnabled=$enabled (rmsThresh=${_vadRmsThreshold.toStringAsFixed(3)} minLoudMs=$_vadMinLoudMs)');
   }
@@ -143,17 +158,55 @@ class SherpaKwsWakeService {
   double get _vadRmsThreshold =>
       _androidVoipEchoCapture ? _vadRmsThreshVoip : _vadRmsThreshDefault;
 
-  int get _vadMinLoudMs =>
-      _androidVoipEchoCapture ? _vadMinLoudMsVoip : _vadMinLoudMsDefault;
+  int get _vadMinLoudMs {
+    if (_deferBargeInCooldown) {
+      return _androidVoipEchoCapture
+          ? _vadMinLoudMsVoiceprintVoip
+          : _vadMinLoudMsVoiceprintDefault;
+    }
+    return _androidVoipEchoCapture ? _vadMinLoudMsVoip : _vadMinLoudMsDefault;
+  }
+
+  int get _vadWarmupMsEffective =>
+      _deferBargeInCooldown ? _vadWarmupVoiceprintMs : _vadWarmupMs;
+
+  /// 声纹打断模式：VAD 先触发，比对成功后再长冷却。
+  void setDeferBargeInCooldown(bool enabled) {
+    _deferBargeInCooldown = enabled;
+    print('🎚️ [SherpaKws] deferBargeInCooldown=$enabled');
+  }
+
+  /// 供声纹比对循环拉取最新环形缓冲（勿在 PCM 回调线程长时间阻塞）。
+  Float32List snapshotBargeInRingForVerify() => _snapshotBargeInRing();
+
+  /// [interruptGranted] true → 长冷却；false → 短冷却便于同一句内再次尝试。
+  void completeBargeInAttempt({required bool interruptGranted}) {
+    final ms = interruptGranted ? _vadCooldownMs : _vadCooldownRejectMs;
+    _vadCooldownUntil = DateTime.now().add(Duration(milliseconds: ms));
+  }
+
+  void _appendBargeInRing(Float32List samples) {
+    if (!_ttsBargeInVadEnabled) return;
+    _bargeInRing.addAll(samples);
+    final overflow = _bargeInRing.length - _bargeInRingMaxSamples;
+    if (overflow > 0) {
+      _bargeInRing.removeRange(0, overflow);
+    }
+  }
+
+  Float32List _snapshotBargeInRing() {
+    return Float32List.fromList(_bargeInRing);
+  }
 
   void _tickSpeechVad(Float32List samples) {
     if (!_ttsBargeInVadEnabled || onSpeechBargeIn == null) return;
+    _appendBargeInRing(samples);
     final now = DateTime.now();
     if (_vadCooldownUntil != null && now.isBefore(_vadCooldownUntil!)) {
       return;
     }
     if (_vadArmedAt != null &&
-        now.difference(_vadArmedAt!).inMilliseconds < _vadWarmupMs) {
+        now.difference(_vadArmedAt!).inMilliseconds < _vadWarmupMsEffective) {
       return;
     }
 
@@ -174,10 +227,17 @@ class SherpaKwsWakeService {
       final ms = (_vadLoudRunSamples * 1000) ~/ _micSampleRate;
       if (ms >= _vadMinLoudMs) {
         print(
-            '🎤 [VAD打断] 检测持续人声 ~${ms}ms rms=${rms.toStringAsFixed(4)} peak=${peak.toStringAsFixed(4)} th=${th.toStringAsFixed(3)}');
+            '🎤 [VAD打断] 检测持续人声 ~${ms}ms rms=${rms.toStringAsFixed(4)} peak=${peak.toStringAsFixed(4)} th=${th.toStringAsFixed(3)} deferCooldown=$_deferBargeInCooldown');
         _vadLoudRunSamples = 0;
-        _vadCooldownUntil = now.add(Duration(milliseconds: _vadCooldownMs));
-        onSpeechBargeIn!();
+        if (_deferBargeInCooldown) {
+          // 声纹比对进行中：极短防抖，避免同帧重复；失败不锁 1.1s。
+          _vadCooldownUntil =
+              now.add(const Duration(milliseconds: 80));
+        } else {
+          _vadCooldownUntil =
+              now.add(Duration(milliseconds: _vadCooldownMs));
+        }
+        onSpeechBargeIn!(_snapshotBargeInRing());
       }
     } else {
       _vadLoudRunSamples = (_vadLoudRunSamples >> 1);

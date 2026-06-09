@@ -264,12 +264,29 @@ class ConversationController extends ChangeNotifier {
   /// 多人模式底部按住说话触发的 TTS 打断（与 Sherpa/VAD 打断区分）。
   static const String kTtsInterruptKeywordMultiPersonPtt = 'multi_person_ptt';
 
+  /// 声纹模式：VAD + embedding 验证通过后的 TTS 打断。
+  static const String kTtsInterruptKeywordOwnerVoiceprint = 'owner_voiceprint';
+
   Future<void> interruptConversationTtsFromKws(String keyword) async {
     try {
       final sn = _speechNotifier;
-      if (sn != null && sn.skipAutoVoiceRecognitionInConversation == true) {
-        if (keyword != kTtsInterruptKeywordMultiPersonPtt) {
+      if (sn != null) {
+        if (sn.skipAutoVoiceRecognitionInConversation == true &&
+            keyword != kTtsInterruptKeywordMultiPersonPtt) {
           print('🛑 [TTS打断] 多人按住说话模式，已禁用 (keyword=$keyword)');
+          return;
+        }
+        final voiceprintGate = sn.isOwnerVoiceprintBargeInMode == true ||
+            sn.isOwnerMode == true;
+        final hasOwner = sn.hasOwnerVoiceprint == true;
+        if (voiceprintGate && hasOwner) {
+          if (keyword != kTtsInterruptKeywordOwnerVoiceprint &&
+              keyword != kTtsInterruptKeywordMultiPersonPtt) {
+            print('🛑 [TTS打断] 主人/声纹模式：未验证声纹，忽略 (keyword=$keyword)');
+            return;
+          }
+        } else if (voiceprintGate && !hasOwner) {
+          print('🛑 [TTS打断] 主人/声纹模式未注册主人，忽略 (keyword=$keyword)');
           return;
         }
       }
@@ -286,12 +303,13 @@ class ConversationController extends ChangeNotifier {
     try {
       print(
           "🛑 [TTS打断] 执行 stop() keyword=$keyword inConversation=$_isInConversationMode");
-      await _ttsService.stop();
-      if (keyword == kTtsInterruptKeywordMultiPersonPtt && _isInConversationMode) {
+      if (_isInConversationMode && _isTtsPlaying) {
         _isTtsPlaying = false;
         notifyListeners();
         _notifySpeechUi();
+        _uiModule.onTtsCompleted();
       }
+      await _ttsService.stop();
     } catch (e) {
       print("❌ [TTS打断] stop 失败: $e");
     } finally {
@@ -1636,6 +1654,21 @@ class ConversationController extends ChangeNotifier {
     } catch (e) {
       print("❌ 恢复唤醒监听失败: $e");
     }
+  }
+
+  /// 用户正在说话（含声纹未通过）：暂停 30 秒空闲超时。
+  void pauseConversationTimeoutForUserSpeech() {
+    if (!_isInConversationMode) return;
+    if (_conversationTimeoutTimer == null) return;
+    _conversationTimeoutTimer!.cancel();
+    _conversationTimeoutTimer = null;
+    ConversationFlowTracer.step('timeout30_paused_user_speaking');
+    print('⏸️ 检测到用户说话，暂停30秒超时');
+  }
+
+  /// 回到空闲聆听：重新启动超时（TTS/处理中时不启动）。
+  void resumeIdleConversationTimeout() {
+    _startConversationTimeout();
   }
 
   /// 启动30秒超时计时器
