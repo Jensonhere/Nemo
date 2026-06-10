@@ -5,12 +5,14 @@ import 'app/provider/app.provider.dart';
 import 'package:flutter/services.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
+import 'package:voicegpt/core/storage/preference_manager.dart';
 
 import 'core/services/bluetooth_service.dart'; // 使用 MyBluetoothService
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   sherpa_onnx.initBindings();
+  await PreferenceManager().init();
 
   // 设置包含刘海区域的全屏显示
   await SystemChrome.setEnabledSystemUIMode(

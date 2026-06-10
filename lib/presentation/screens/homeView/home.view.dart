@@ -1204,7 +1204,9 @@ class _HomeViewState extends State<HomeView> {
                           size: 26,
                         ),
                         onPressed: () {
-                          debugPrint('Settings button tapped');
+                          Navigator.of(context).pushNamed(
+                            AppRoutes.settingsRoute,
+                          );
                         },
                       ),
                     ],
