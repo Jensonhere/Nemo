@@ -51,6 +51,7 @@ flutter:
     - assets/animation/
     - assets/wake_up/
     - assets/sherpa_kws/
+    - assets/sherpa_speaker/
     - assets/cn/
     - assets/face/
     - assets/emotion/

@@ -72,10 +72,12 @@ class ConversationController extends ChangeNotifier {
 
   // 30秒超时设置
   static const Duration _conversationTimeout = Duration(seconds: 30);
+
   /// Planner 单步墙钟：进入具体 step 后等待其执行完成，超时仅作最终兜底。
   static const Duration _plannerStepTimeoutQuick = Duration(seconds: 120);
   static const Duration _plannerStepTimeoutBluetooth = Duration(seconds: 20);
   static const Duration _plannerStepTimeoutVision = Duration(seconds: 240);
+
   /// 蓝牙步内与动作并行的短口播分支上限（勿过长，避免与 5s 整步冲突）。
   static const int _plannerVisionTtsMaxChars = 600;
 
@@ -107,6 +109,7 @@ class ConversationController extends ChangeNotifier {
   bool get forceEnglishTeachingMode => _forceEnglishTeachingMode;
   bool get isComplexTaskExecuting => _isComplexTaskExecuting;
   String get lastRouterDecision => _lastRouterDecision;
+
   /// scene=Agent 且 complexity=C 时 Planner 的多行展示（接在 Router 调试条之后）；否则为空。
   String get lastPlannerPlanDisplay => _lastPlannerPlanDisplay;
   PlanExecutionState get planExecutionState => _planExecutor.state;
@@ -133,11 +136,12 @@ class ConversationController extends ChangeNotifier {
     // 初始化各个模块
     await _intentModule.initialize();
 
-    const tencentAppId = int.fromEnvironment('TENCENT_TTS_APP_ID', defaultValue: 0);
-    const tencentSecretId =
-        String.fromEnvironment('TENCENT_TTS_SECRET_ID', defaultValue: 'AKIDxoT0OaZLuGOJ1d2EE4h7A1wfDfz63pRs');
-    const tencentSecretKey =
-        String.fromEnvironment('TENCENT_TTS_SECRET_KEY', defaultValue: 'HTbZK1Ys12uc7RZWItJdnlrnYCeuztb7');
+    const tencentAppId =
+        int.fromEnvironment('TENCENT_TTS_APP_ID', defaultValue: 0);
+    const tencentSecretId = String.fromEnvironment('TENCENT_TTS_SECRET_ID',
+        defaultValue: 'AKIDxoT0OaZLuGOJ1d2EE4h7A1wfDfz63pRs');
+    const tencentSecretKey = String.fromEnvironment('TENCENT_TTS_SECRET_KEY',
+        defaultValue: 'HTbZK1Ys12uc7RZWItJdnlrnYCeuztb7');
     _ttsService = await VoiceTtsServiceFactory.create(
       tencentAppId: tencentAppId,
       tencentSecretId: tencentSecretId,
@@ -158,9 +162,7 @@ class ConversationController extends ChangeNotifier {
 
     AmbientContextCache.instance.configure(
       isAmbientRefreshAllowed: () =>
-          !isInConversationMode &&
-          !isProcessingUserInput &&
-          !isTtsPlaying,
+          !isInConversationMode && !isProcessingUserInput && !isTtsPlaying,
     );
     try {
       await AmbientContextCache.instance
@@ -170,8 +172,7 @@ class ConversationController extends ChangeNotifier {
       print('⚠️ 启动阶段 IP 缓存预热超时/失败: $e');
     }
     unawaited(AmbientContextCache.instance.refreshNow(force: true));
-    AmbientContextCache.instance
-        .startPeriodic(const Duration(minutes: 30));
+    AmbientContextCache.instance.startPeriodic(const Duration(minutes: 30));
     unawaited(
       Future<void>.delayed(const Duration(seconds: 5), () async {
         if (!isInConversationMode) {
@@ -264,12 +265,29 @@ class ConversationController extends ChangeNotifier {
   /// 多人模式底部按住说话触发的 TTS 打断（与 Sherpa/VAD 打断区分）。
   static const String kTtsInterruptKeywordMultiPersonPtt = 'multi_person_ptt';
 
+  /// 声纹模式：VAD + embedding 验证通过后的 TTS 打断。
+  static const String kTtsInterruptKeywordOwnerVoiceprint = 'owner_voiceprint';
+
   Future<void> interruptConversationTtsFromKws(String keyword) async {
     try {
       final sn = _speechNotifier;
-      if (sn != null && sn.skipAutoVoiceRecognitionInConversation == true) {
-        if (keyword != kTtsInterruptKeywordMultiPersonPtt) {
+      if (sn != null) {
+        if (sn.skipAutoVoiceRecognitionInConversation == true &&
+            keyword != kTtsInterruptKeywordMultiPersonPtt) {
           print('🛑 [TTS打断] 多人按住说话模式，已禁用 (keyword=$keyword)');
+          return;
+        }
+        final voiceprintGate =
+            sn.isOwnerVoiceprintBargeInMode == true || sn.isOwnerMode == true;
+        final hasOwner = sn.hasOwnerVoiceprint == true;
+        if (voiceprintGate && hasOwner) {
+          if (keyword != kTtsInterruptKeywordOwnerVoiceprint &&
+              keyword != kTtsInterruptKeywordMultiPersonPtt) {
+            print('🛑 [TTS打断] 主人/声纹模式：未验证声纹，忽略 (keyword=$keyword)');
+            return;
+          }
+        } else if (voiceprintGate && !hasOwner) {
+          print('🛑 [TTS打断] 主人/声纹模式未注册主人，忽略 (keyword=$keyword)');
           return;
         }
       }
@@ -286,12 +304,13 @@ class ConversationController extends ChangeNotifier {
     try {
       print(
           "🛑 [TTS打断] 执行 stop() keyword=$keyword inConversation=$_isInConversationMode");
-      await _ttsService.stop();
-      if (keyword == kTtsInterruptKeywordMultiPersonPtt && _isInConversationMode) {
+      if (_isInConversationMode && _isTtsPlaying) {
         _isTtsPlaying = false;
         notifyListeners();
         _notifySpeechUi();
+        _uiModule.onTtsCompleted();
       }
+      await _ttsService.stop();
     } catch (e) {
       print("❌ [TTS打断] stop 失败: $e");
     } finally {
@@ -505,7 +524,7 @@ class ConversationController extends ChangeNotifier {
       ConversationFlowTracer.step(
         'router_done',
         'scene=${routerDecision.scene} complexity=${routerDecision.complexity} '
-        'needTools=${routerDecision.needTools} raw=$rjShort',
+            'needTools=${routerDecision.needTools} raw=$rjShort',
       );
       print('🧭 [Router] $_lastRouterDecision');
       _notifySpeechUi();
@@ -565,8 +584,7 @@ class ConversationController extends ChangeNotifier {
         return;
       }
 
-      _isComplexTaskExecuting =
-          routerDecision.scene == RouterScene.agent ||
+      _isComplexTaskExecuting = routerDecision.scene == RouterScene.agent ||
           routerDecision.complexity == RouterComplexity.c;
       if (_isComplexTaskExecuting) {
         _notifySpeechUi();
@@ -595,7 +613,7 @@ class ConversationController extends ChangeNotifier {
       ConversationFlowTracer.step(
         'intent_bert_done',
         '${intentSw.elapsedMilliseconds}ms valid=${intentResult.isValid} '
-        'label=${intentResult.intent}',
+            'label=${intentResult.intent}',
       );
       print(
         '⏱️ [ConvStage][意图识别] ${intentSw.elapsedMilliseconds}ms → $intentResult',
@@ -703,8 +721,7 @@ class ConversationController extends ChangeNotifier {
       final result = await _llmPlanner.plan(userGoal: userInput);
       if (result.steps.isEmpty) {
         print('[Plan] (无有效步骤) raw=${result.rawContent}');
-        _lastPlannerPlanDisplay =
-            '[Plan] (无有效步骤)\n${result.rawContent.trim()}';
+        _lastPlannerPlanDisplay = '[Plan] (无有效步骤)\n${result.rawContent.trim()}';
       } else {
         final buf = StringBuffer();
         for (var i = 0; i < result.steps.length; i++) {
@@ -838,8 +855,7 @@ class ConversationController extends ChangeNotifier {
         await Future.wait<void>([
           _applyPlannerStepExpression(step),
           () async {
-            final actionResult =
-                await _actionModule.processActionCommand(
+            final actionResult = await _actionModule.processActionCommand(
               step.reply,
               playCommandAnimation: false,
             );
@@ -902,7 +918,8 @@ class ConversationController extends ChangeNotifier {
             cameraCapturePriority: CameraTaskPriority.high,
           );
           _plannerCapturedImagePaths.add(shotPath);
-          print('[PlanExec][视觉采集] 已采集: $shotPath, total=${_plannerCapturedImagePaths.length}');
+          print(
+              '[PlanExec][视觉采集] 已采集: $shotPath, total=${_plannerCapturedImagePaths.length}');
           await _applyPlannerStepExpression(step);
           return;
         }
@@ -910,8 +927,7 @@ class ConversationController extends ChangeNotifier {
         await Future.wait<void>([
           _applyPlannerStepExpression(step),
           () async {
-            imageResult = await _imageModule
-                .processImageAnalysis(
+            imageResult = await _imageModule.processImageAnalysis(
               step.reply,
               conversationContext: _getConversationContext(),
               cameraCapturePriority: CameraTaskPriority.high,
@@ -1068,7 +1084,8 @@ class ConversationController extends ChangeNotifier {
     String userInput,
   ) async {
     if (!d.needTools) return false;
-    if (d.scene != RouterScene.bluetoothMotion && d.scene != RouterScene.toolUse) {
+    if (d.scene != RouterScene.bluetoothMotion &&
+        d.scene != RouterScene.toolUse) {
       return false;
     }
     if (d.complexity != RouterComplexity.b) return false;
@@ -1114,8 +1131,8 @@ class ConversationController extends ChangeNotifier {
         recordAssistantForTurns: '机器人未连接',
       );
     } else if (outcome.linearInterrupted) {
-      final cliff = outcome.obstacleType == 0x03 ||
-          outcome.obstacleType == 0x04;
+      final cliff =
+          outcome.obstacleType == 0x03 || outcome.obstacleType == 0x04;
       final safety = cliff ? '要掉下去啦' : '马上碰撞啦';
       await _speakText(
         safety,
@@ -1142,7 +1159,8 @@ class ConversationController extends ChangeNotifier {
         conversationContext: _getConversationContext(),
       );
 
-      final emoLabel = EmotionRecognitionModule.emotionToUiLabel(result.emotion);
+      final emoLabel =
+          EmotionRecognitionModule.emotionToUiLabel(result.emotion);
       if (result.success) {
         await _speakText(
           result.response,
@@ -1262,7 +1280,8 @@ class ConversationController extends ChangeNotifier {
     }
 
     try {
-      if (sceneIntent == IntentType.command && !_actionModule.isBluetoothConnected) {
+      if (sceneIntent == IntentType.command &&
+          !_actionModule.isBluetoothConnected) {
         await _speakText(
           '机器人未连接',
           ttsExpression: TtsAlignedExpression.textChatSpeaking,
@@ -1305,8 +1324,7 @@ class ConversationController extends ChangeNotifier {
       final tts = _ttsService;
       final supportsStream = tts.supportsInputStreaming;
       // command 场景模型输出整段 JSON，流式会把未闭合 JSON 送进 TTS，故强制整段模式
-      final useStream =
-          supportsStream && sceneIntent != IntentType.command;
+      final useStream = supportsStream && sceneIntent != IntentType.command;
       final deviceCtxMode = sceneIntent == IntentType.command
           ? DeviceContextFetchMode.none
           : sceneIntent == IntentType.apiCall
@@ -1573,7 +1591,7 @@ class ConversationController extends ChangeNotifier {
     ConversationFlowTracer.step(
       'tts_speak_enter',
       'len=${text.length} transitionListen=$transitionToListeningAfterTts '
-      'inConvo=$_isInConversationMode',
+          'inConvo=$_isInConversationMode',
     );
     _isTtsPlaying = true;
     notifyListeners();
@@ -1704,6 +1722,21 @@ class ConversationController extends ChangeNotifier {
     }
   }
 
+  /// 用户正在说话（含声纹未通过）：暂停 30 秒空闲超时。
+  void pauseConversationTimeoutForUserSpeech() {
+    if (!_isInConversationMode) return;
+    if (_conversationTimeoutTimer == null) return;
+    _conversationTimeoutTimer!.cancel();
+    _conversationTimeoutTimer = null;
+    ConversationFlowTracer.step('timeout30_paused_user_speaking');
+    print('⏸️ 检测到用户说话，暂停30秒超时');
+  }
+
+  /// 回到空闲聆听：重新启动超时（TTS/处理中时不启动）。
+  void resumeIdleConversationTimeout() {
+    _startConversationTimeout();
+  }
+
   /// 启动30秒超时计时器
   void _startConversationTimeout() {
     _conversationTimeoutTimer?.cancel();
@@ -1801,9 +1834,28 @@ class ConversationController extends ChangeNotifier {
 
   /// 单字汉字且不在白名单：多为环境噪声误识别（如「饭」）；白名单保留应答语气词供意图区分。
   static const Set<String> _asrSingleHanKeep = {
-    '嗯', '唔', '呣', '哼', '哦', '噢', '喔', '啊', '呃', '欸', '诶',
-    '唉', '嘿', '哟', '嗨',
-    '对', '好', '行', '是', '可', '要', '成',
+    '嗯',
+    '唔',
+    '呣',
+    '哼',
+    '哦',
+    '噢',
+    '喔',
+    '啊',
+    '呃',
+    '欸',
+    '诶',
+    '唉',
+    '嘿',
+    '哟',
+    '嗨',
+    '对',
+    '好',
+    '行',
+    '是',
+    '可',
+    '要',
+    '成',
   };
 
   /// 仅一个 CJK 汉字且不在 [_asrSingleHanKeep] 时视为 ASR 垃圾，在 [_isLikelyInvalidInput] 中过滤。
@@ -1840,10 +1892,9 @@ class ConversationController extends ChangeNotifier {
       recentTurnLines: List<String>.from(_dialogTurnLines),
       userEmotionFromVa:
           fusionSummary == null || fusionSummary.isEmpty ? null : fusionSummary,
-      vaValuesSummary:
-          vaValuesSummary == null || vaValuesSummary.isEmpty
-              ? null
-              : vaValuesSummary,
+      vaValuesSummary: vaValuesSummary == null || vaValuesSummary.isEmpty
+          ? null
+          : vaValuesSummary,
       vaTagsSummary:
           vaTagsSummary == null || vaTagsSummary.isEmpty ? null : vaTagsSummary,
       vaPromptHint:
@@ -1851,7 +1902,7 @@ class ConversationController extends ChangeNotifier {
       deviceStateLine: '基座电量与传感器详情：待硬件上报',
       environmentSummary: null,
       idleSinceDescription: _describeIdleSince(),
-      );
+    );
   }
 
   Map<String, dynamic>? _asStringDynamicMap(Object? value) {
@@ -1877,7 +1928,8 @@ class ConversationController extends ChangeNotifier {
     final arousal = _asDouble(fusion['arousal']);
     final dominance = _asDouble(fusion['dominance']);
     final tags = (fusion['va_tags'] is List)
-        ? List<String>.from((fusion['va_tags'] as List).map((e) => e.toString()))
+        ? List<String>.from(
+            (fusion['va_tags'] as List).map((e) => e.toString()))
         : const <String>[];
 
     final state = _describeVaState(emotion, valence, arousal, tags);
@@ -1896,9 +1948,7 @@ class ConversationController extends ChangeNotifier {
 
     final valenceText = valence == null
         ? '未知'
-        : (valence <= -0.25
-            ? '偏负向'
-            : (valence >= 0.25 ? '偏正向' : '接近中性'));
+        : (valence <= -0.25 ? '偏负向' : (valence >= 0.25 ? '偏正向' : '接近中性'));
     final arousalText = arousal == null
         ? '未知'
         : (arousal <= -0.2
@@ -1916,11 +1966,13 @@ class ConversationController extends ChangeNotifier {
     final fusion = _asStringDynamicMap(fusionRaw);
     if (fusion == null || fusion.isEmpty) return null;
     final tags = (fusion['va_tags'] is List)
-        ? List<String>.from((fusion['va_tags'] as List).map((e) => e.toString()))
+        ? List<String>.from(
+            (fusion['va_tags'] as List).map((e) => e.toString()))
         : const <String>[];
     if (tags.isEmpty) return null;
 
-    final mapped = tags.map(_translateVaTagToChinese).where((e) => e.isNotEmpty).toList();
+    final mapped =
+        tags.map(_translateVaTagToChinese).where((e) => e.isNotEmpty).toList();
     if (mapped.isEmpty) return null;
     return '可参考的状态标签：${mapped.join('、')}。';
   }
@@ -1932,7 +1984,8 @@ class ConversationController extends ChangeNotifier {
     final valence = _asDouble(fusion['valence']);
     final arousal = _asDouble(fusion['arousal']);
     final tags = (fusion['va_tags'] is List)
-        ? List<String>.from((fusion['va_tags'] as List).map((e) => e.toString()))
+        ? List<String>.from(
+            (fusion['va_tags'] as List).map((e) => e.toString()))
         : const <String>[];
 
     final state = _describeVaState(emotion, valence, arousal, tags);
@@ -2048,7 +2101,8 @@ class ConversationController extends ChangeNotifier {
 
   /// Router 用：天气/地理问法注入**仅后台缓存**（不在 Router 轮内阻塞 HTTP）；
   /// 由 Router 直接生成 dialogue_reply，时间类用本地块；普通闲聊可附带软缓存。
-  Future<ConversationContextPack> _buildRouterContextPack(String userInput) async {
+  Future<ConversationContextPack> _buildRouterContextPack(
+      String userInput) async {
     final base = _buildContextPack();
     String? deviceBlock;
     final mode = DeviceContextService.fetchModeForQuery(userInput);
@@ -2179,7 +2233,7 @@ class ConversationController extends ChangeNotifier {
 
     // 播放退出语音（播完后再恢复唤醒）
     if (speakExitLine) {
-    await _speakText("我先休息了");
+      await _speakText("我先休息了");
     }
 
     // 清理状态

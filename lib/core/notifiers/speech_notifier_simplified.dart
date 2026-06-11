@@ -22,6 +22,28 @@ import 'package:voicegpt/core/services/va_service_config.dart';
 import 'package:voicegpt/core/services/va_session_manager.dart';
 import 'package:voicegpt/core/config/debug_runtime_flags.dart';
 import 'package:voicegpt/core/debug/conversation_flow_tracer.dart';
+import 'package:voicegpt/core/models/owner_voiceprint_verify_result.dart';
+import 'package:voicegpt/core/models/owner_voiceprint_sample.dart';
+import 'package:voicegpt/core/services/speaker_enrollment_store.dart';
+import 'package:voicegpt/core/services/speaker_enrollment_recorder.dart';
+import 'package:voicegpt/core/services/speaker_enrollment_audio_player.dart';
+import 'package:voicegpt/core/services/sherpa_speaker_embedding_service.dart';
+import 'package:voicegpt/core/services/owner_voiceprint_verifier.dart';
+
+/// 声纹注册 UI 阶段（与右下角麦克风显隐联动）。
+enum OwnerVoiceprintEnrollUi {
+  none,
+  capturing,
+  extracting,
+  success,
+  failure,
+}
+
+/// 声纹比对场景：聆听定稿输入 vs TTS 打断。
+enum OwnerVoiceprintVerifyContext {
+  listeningInput,
+  bargeIn,
+}
 
 /// 简化的语音通知器
 /// 只保留核心基础功能：唤醒词检测、环境监测、手势识别基础功能
@@ -37,8 +59,10 @@ class SpeechNotifierSimplified with ChangeNotifier {
   SherpaKwsWakeService? _sherpaKws;
   bool _wakeWordLock = false;
   bool _ttsBargeInBusy = false;
+
   /// Qwen 主麦「边播边听」：TTS 期间不切 Sherpa，用同一条 PCM 做能量 VAD 打断（依赖 VoIP+AEC）。
   bool _duplexTtsBargeInEnabled = false;
+
   /// 连续对话内 Sherpa 使用 VOICE_COMMUNICATION + VoIP 系统路由（硬件 AEC）
   bool _sherpaUseVoipMic = false;
 
@@ -167,7 +191,8 @@ class SpeechNotifierSimplified with ChangeNotifier {
       }
       final normalized = text.trim();
       if (normalized.isNotEmpty) {
-        final hit = _vaVisionKeywords.any((keyword) => normalized.contains(keyword));
+        final hit =
+            _vaVisionKeywords.any((keyword) => normalized.contains(keyword));
         if (hit) {
           print('🎯 [VA] Router 后命中视觉增强关键词 transcript="$normalized"');
           manager.enableVisionEnhancement();
@@ -196,6 +221,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
   bool get isTtsPlaying => _conversationController.isTtsPlaying;
   bool get isWakeUpActive => _isWakeUpActive;
   bool get isListening => _isListening;
+
   /// 连续对话里 TTS 结束后拉起主 ASR 的短窗口：此时 isListening 仍为 false，但不应显示「思考中/已暂停」。
   bool get isStartingVoiceRecognition => _isStartingVoiceRecognition;
   bool get isReadyToSend => false;
@@ -207,7 +233,96 @@ class SpeechNotifierSimplified with ChangeNotifier {
   bool get isPttRecordingHold => _pttRecordingActive;
   bool get isPttFingerPressed => _pttFingerPressed;
   bool get skipAutoVoiceRecognitionInConversation =>
-      _multiPersonPushToTalkMode && _conversationController.isInConversationMode;
+      _multiPersonPushToTalkMode &&
+      _conversationController.isInConversationMode;
+
+  /// 右上角「主人模式」：所有用户输入（聆听定稿 + TTS 打断）均需通过声纹比对。
+  bool _ownerMode = false;
+
+  /// 右上角「主人声纹打断播报」：仅 TTS 播报期间需主人声纹才可打断。
+  bool _ownerVoiceprintBargeInMode = false;
+  bool _ownerVoiceprintEnrolled = false;
+  OwnerVoiceprintEnrollUi _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.none;
+  String _ownerVoiceprintEnrollmentHint = '';
+  int _ownerVoiceprintCaptureMs = 0;
+  SpeakerEnrollmentRecorder? _enrollmentRecorder;
+  int _enrollmentGeneration = 0;
+  Timer? _ownerVoiceprintResultTimer;
+
+  bool _ownerVoiceprintLibraryOpen = false;
+  String? _ownerVoiceprintPlayingId;
+  String? _ownerVoiceprintSelectedId;
+  OwnerVoiceprintVerifyResult? _lastVoiceprintVerifyResult;
+  OwnerVoiceprintVerifyContext? _lastVoiceprintVerifyContext;
+  Timer? _voiceprintVerifyDisplayTimer;
+  bool _voiceprintVerifyInProgress = false;
+
+  static const int ownerVoiceprintMaxSamples =
+      SpeakerEnrollmentStore.maxSamples;
+
+  static const String ownerVoiceprintEnrollmentPrompt = '请你念出：你好小航，请开始陪伴模式';
+
+  bool get isOwnerMode => _ownerMode;
+  bool get isOwnerVoiceprintBargeInMode => _ownerVoiceprintBargeInMode;
+  bool get hasOwnerVoiceprint => _ownerVoiceprintEnrolled;
+
+  /// 聆听输入或 TTS 打断是否需要声纹闸门。
+  bool get _voiceprintGateForBargeIn =>
+      _ownerVoiceprintBargeInMode || _ownerMode;
+  OwnerVoiceprintEnrollUi get ownerVoiceprintUi => _ownerVoiceprintUi;
+  bool get isOwnerVoiceprintEnrolling =>
+      _ownerVoiceprintUi == OwnerVoiceprintEnrollUi.capturing ||
+      _ownerVoiceprintUi == OwnerVoiceprintEnrollUi.extracting;
+  String get ownerVoiceprintEnrollmentHint => _ownerVoiceprintEnrollmentHint;
+  int get ownerVoiceprintCaptureMs => _ownerVoiceprintCaptureMs;
+
+  /// 采录 / 提取 / 成功 / 失败状态条（与打断模式无关）。
+  bool get showOwnerVoiceprintStatusBanner =>
+      _ownerVoiceprintUi != OwnerVoiceprintEnrollUi.none;
+
+  bool get isOwnerVoiceprintLibraryOpen => _ownerVoiceprintLibraryOpen;
+  List<OwnerVoiceprintSample> get ownerVoiceprintSamples =>
+      SpeakerEnrollmentStore.instance.samplesForUi;
+  String? get ownerVoiceprintPlayingId => _ownerVoiceprintPlayingId;
+  String? get ownerVoiceprintSelectedId =>
+      _ownerVoiceprintSelectedId ??
+      SpeakerEnrollmentStore.instance.activeSampleId;
+  bool get canAddOwnerVoiceprintSample =>
+      SpeakerEnrollmentStore.instance.sampleCount < ownerVoiceprintMaxSamples;
+  bool get canDeleteOwnerVoiceprintSample =>
+      ownerVoiceprintSelectedId != null &&
+      SpeakerEnrollmentStore.instance.sampleCount > 0;
+
+  OwnerVoiceprintVerifyResult? get lastVoiceprintVerifyResult =>
+      _lastVoiceprintVerifyResult;
+
+  /// 声纹比对摘要（聆听输入 / TTS 打断）。
+  String? get ownerVoiceprintVerifyStatusLabel {
+    final r = _lastVoiceprintVerifyResult;
+    if (r == null) return null;
+    final listening = _lastVoiceprintVerifyContext ==
+        OwnerVoiceprintVerifyContext.listeningInput;
+    if (_voiceprintVerifyInProgress) {
+      return listening ? '🔐 聆听输入声纹比对中…' : '🔐 检测到打断人声，声纹比对中…';
+    }
+    if (!r.valid || r.bestScore == null) {
+      final hint = r.reason ?? '未知';
+      return listening ? '🔐 输入被拒：$hint' : '🔐 打断失败：$hint';
+    }
+    final score = r.bestScore!.toStringAsFixed(3);
+    final th = OwnerVoiceprintVerifier.similarityThreshold.toStringAsFixed(2);
+    if (r.pass) {
+      return listening
+          ? '🔐 匹配 $score ≥ $th · 已接受输入'
+          : '🔐 匹配 $score ≥ $th · 允许打断';
+    }
+    return listening ? '🔐 未匹配 $score < $th · 已忽略' : '🔐 未匹配 $score < $th · 忽略';
+  }
+
+  bool get isVoiceprintVerifyInProgress => _voiceprintVerifyInProgress;
+
+  bool get ownerVoiceprintEnrollMicIsReregister => _ownerVoiceprintEnrolled;
+
   bool get isEnvironmentMonitoring =>
       _conversationController.isEnvironmentMonitoring;
   bool get isGestureRecognitionActive => _isGestureRecognitionActive;
@@ -219,8 +334,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
       _conversationController.forceEnglishTeachingMode;
   bool get isComplexTaskExecuting =>
       _conversationController.isComplexTaskExecuting;
-  String get lastRouterDecision =>
-      _conversationController.lastRouterDecision;
+  String get lastRouterDecision => _conversationController.lastRouterDecision;
   String get lastPlannerPlanDisplay =>
       _conversationController.lastPlannerPlanDisplay;
   PlanExecutionState get planExecutionState =>
@@ -244,7 +358,8 @@ class SpeechNotifierSimplified with ChangeNotifier {
     } catch (e) {
       wakeWordSuccess = false;
       print("⛔ 唤醒词初始化失败: $e");
-      print("   请确认 assets/sherpa_kws/ 下已放入 sherpa-onnx KWS 模型文件（见 SherpaKwsWakeService 注释）");
+      print(
+          "   请确认 assets/sherpa_kws/ 下已放入 sherpa-onnx KWS 模型文件（见 SherpaKwsWakeService 注释）");
     }
 
     try {
@@ -263,6 +378,13 @@ class SpeechNotifierSimplified with ChangeNotifier {
       _conversationController.setConversationExitCallback(() {
         _startPostConversationTimer();
       });
+
+      _ownerVoiceprintEnrolled = await SpeakerEnrollmentStore.instance.load();
+      _ownerVoiceprintSelectedId =
+          SpeakerEnrollmentStore.instance.activeSampleId;
+      print(
+        '🔐 声纹本地状态: ${_ownerVoiceprintEnrolled ? "已注册" : "未注册"}',
+      );
 
       // 只有唤醒词成功时才启动时间控制
       if (wakeWordSuccess) {
@@ -410,12 +532,11 @@ class SpeechNotifierSimplified with ChangeNotifier {
 
       _qwenAsrRecorder = QwenStreamingAsrRecorder(
         client: qwenClient,
-        onPartialText: (String t) {
-          _speechText = t;
-          notifyListeners();
-        },
+        onPartialText: _onAsrPartialText,
         onUtteranceFinal: (String t) {
           final s = t.trim();
+          final pcmSnap = _qwenAsrRecorder?.snapshotUtterancePcmForVerify() ??
+              _qwenAsrRecorder?.snapshotBargeInRingForVerify();
           ConversationFlowTracer.asr(
             'ptt_onUtteranceFinal len=${t.length} empty=${s.isEmpty}',
           );
@@ -427,12 +548,15 @@ class SpeechNotifierSimplified with ChangeNotifier {
           _duplexTtsBargeInEnabled = false;
           notifyListeners();
           if (s.isNotEmpty) {
-            unawaited(_processUserInput(s));
+            unawaited(_handleFinalizedUserSpeech(s, pcmSnap: pcmSnap));
+          } else if (!_multiPersonPushToTalkMode) {
+            _scheduleRestartAsrIfConversationIdle();
           }
         },
         androidVoipEchoCapture: _sherpaUseVoipMic,
         isTtsPlaying: () => false,
         onSpeechDuringTtsBargeIn: null,
+        onSpeechActivity: _pauseConversationTimeoutForUserSpeech,
         silenceAutoFinalize: false,
         maxListenMsOverride: 180000,
       );
@@ -497,6 +621,408 @@ class SpeechNotifierSimplified with ChangeNotifier {
     }
   }
 
+  void _pauseConversationTimeoutForUserSpeech() {
+    _conversationController.pauseConversationTimeoutForUserSpeech();
+  }
+
+  void _onAsrPartialText(String t) {
+    if (t.trim().isNotEmpty) {
+      _pauseConversationTimeoutForUserSpeech();
+    }
+    _speechText = t;
+    notifyListeners();
+  }
+
+  void _publishVoiceprintVerifyResult(OwnerVoiceprintVerifyResult result) {
+    _voiceprintVerifyInProgress = false;
+    _lastVoiceprintVerifyResult = result;
+    _voiceprintVerifyDisplayTimer?.cancel();
+    _voiceprintVerifyDisplayTimer = Timer(const Duration(seconds: 8), () {
+      _lastVoiceprintVerifyResult = null;
+      notifyListeners();
+    });
+    notifyListeners();
+  }
+
+  void _beginVoiceprintVerifyUi(OwnerVoiceprintVerifyContext context) {
+    _pauseConversationTimeoutForUserSpeech();
+    _voiceprintVerifyInProgress = true;
+    _lastVoiceprintVerifyContext = context;
+    _lastVoiceprintVerifyResult = OwnerVoiceprintVerifyResult.invalid;
+    _voiceprintVerifyDisplayTimer?.cancel();
+    notifyListeners();
+  }
+
+  Future<bool> _verifyOwnerVoiceprintForBargeIn(Float32List snap) async {
+    _beginVoiceprintVerifyUi(OwnerVoiceprintVerifyContext.bargeIn);
+    final result = await OwnerVoiceprintVerifier.instance.verifyOwnerDetailed(
+      snap,
+      fastBargeIn: true,
+    );
+    _publishVoiceprintVerifyResult(result);
+    return result.pass;
+  }
+
+  /// 主人模式：定稿 ASR 文本入库前先声纹比对。
+  Future<void> _handleFinalizedUserSpeech(
+    String input, {
+    Float32List? pcmSnap,
+    Map<String, dynamic>? vaResult,
+    RouterDecision? precomputedRouterDecision,
+  }) async {
+    final s = input.trim();
+    if (s.isEmpty) return;
+
+    _pauseConversationTimeoutForUserSpeech();
+
+    if (_ownerMode) {
+      if (!_ownerVoiceprintEnrolled) {
+        _speechText = '主人模式：请先录入主人声音';
+        notifyListeners();
+        if (_conversationController.isInConversationMode) {
+          _scheduleRestartAsrIfConversationIdle();
+        }
+        return;
+      }
+
+      var snap = pcmSnap ?? Float32List(0);
+      if (snap.length < OwnerVoiceprintVerifier.minSamplesForVerify) {
+        snap = _qwenAsrRecorder?.snapshotUtterancePcmForVerify() ??
+            _qwenAsrRecorder?.snapshotBargeInRingForVerify() ??
+            snap;
+      }
+      if (snap.length < OwnerVoiceprintVerifier.minSamplesForVerify) {
+        snap = _sherpaKws?.snapshotBargeInRingForVerify() ?? snap;
+      }
+
+      if (snap.isEmpty ||
+          snap.length < OwnerVoiceprintVerifier.minSamplesForVerify) {
+        _beginVoiceprintVerifyUi(OwnerVoiceprintVerifyContext.listeningInput);
+        _publishVoiceprintVerifyResult(
+          const OwnerVoiceprintVerifyResult(
+            bestScore: null,
+            pass: false,
+            valid: false,
+            reason: '音频过短或麦克风流未就绪',
+          ),
+        );
+        _speechText = '主人模式：音频过短，请重说';
+        notifyListeners();
+        if (_conversationController.isInConversationMode) {
+          _scheduleRestartAsrIfConversationIdle();
+        }
+        return;
+      }
+
+      _beginVoiceprintVerifyUi(OwnerVoiceprintVerifyContext.listeningInput);
+      _speechText = '🔐 主人声纹比对中…';
+      notifyListeners();
+      await Future<void>.delayed(Duration.zero);
+      final result =
+          await OwnerVoiceprintVerifier.instance.verifyOwnerDetailed(snap);
+      _publishVoiceprintVerifyResult(result);
+      if (!result.pass) {
+        _speechText = '主人模式：非主人语音，已忽略';
+        notifyListeners();
+        if (_conversationController.isInConversationMode) {
+          _scheduleRestartAsrIfConversationIdle();
+        }
+        return;
+      }
+    }
+
+    var nextVaResult = vaResult;
+    var nextRouterDecision = precomputedRouterDecision;
+    if (nextRouterDecision == null) {
+      nextRouterDecision =
+          await _conversationController.previewRouterDecision(s);
+      print('🧭 [Router][ASR后预判] ${nextRouterDecision.rawJson}');
+    }
+    nextVaResult ??= await _runDeferredVaIfNeeded(s, nextRouterDecision);
+
+    await _processUserInput(
+      s,
+      vaResult: nextVaResult,
+      precomputedRouterDecision: nextRouterDecision,
+    );
+  }
+
+  /// VAD 触发后短等环缓冲（打断快路径，避免近 1s 空等）。
+  Future<Float32List?> _collectBargeInPcmForVerify() async {
+    for (var i = 0; i < 3; i++) {
+      final snap = _qwenAsrRecorder?.snapshotBargeInRingForVerify();
+      if (snap != null &&
+          snap.length >= OwnerVoiceprintVerifier.minSamplesForVerify) {
+        return snap;
+      }
+      if (i < 2) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+    }
+    final last = _qwenAsrRecorder?.snapshotBargeInRingForVerify();
+    if (last != null && last.isNotEmpty) return last;
+    return null;
+  }
+
+  /// 打开 / 关闭右上角声纹库面板。
+  void toggleOwnerVoiceprintLibrary() {
+    if (isOwnerVoiceprintEnrolling) return;
+    _ownerVoiceprintLibraryOpen = !_ownerVoiceprintLibraryOpen;
+    if (_ownerVoiceprintLibraryOpen) {
+      _ownerVoiceprintSelectedId =
+          SpeakerEnrollmentStore.instance.activeSampleId ??
+              (ownerVoiceprintSamples.isNotEmpty
+                  ? ownerVoiceprintSamples.first.id
+                  : null);
+    }
+    notifyListeners();
+  }
+
+  void closeOwnerVoiceprintLibrary() {
+    if (!_ownerVoiceprintLibraryOpen) return;
+    _ownerVoiceprintLibraryOpen = false;
+    notifyListeners();
+  }
+
+  Future<void> selectOwnerVoiceprintSample(String id) async {
+    _ownerVoiceprintSelectedId = id;
+    final ok = await SpeakerEnrollmentStore.instance.setActiveSample(id);
+    if (ok) {
+      _ownerVoiceprintEnrolled = SpeakerEnrollmentStore.instance.hasEnrollment;
+    }
+    notifyListeners();
+  }
+
+  Future<void> deleteSelectedOwnerVoiceprintSample() async {
+    final id = ownerVoiceprintSelectedId;
+    if (id == null) return;
+    if (_ownerVoiceprintPlayingId == id) {
+      await SpeakerEnrollmentAudioPlayer.instance.stop();
+      _ownerVoiceprintPlayingId = null;
+    }
+    await SpeakerEnrollmentStore.instance.deleteSample(id);
+    _ownerVoiceprintEnrolled = SpeakerEnrollmentStore.instance.hasEnrollment;
+    _ownerVoiceprintSelectedId = SpeakerEnrollmentStore.instance.activeSampleId;
+    if (!_ownerVoiceprintEnrolled) {
+      if (_ownerVoiceprintBargeInMode) {
+        _ownerVoiceprintBargeInMode = false;
+      }
+      if (_ownerMode) {
+        _ownerMode = false;
+      }
+      _speechText = '声纹已清空，主人模式与声纹打断已关闭';
+    }
+    notifyListeners();
+  }
+
+  Future<void> playOwnerVoiceprintSample(String id) async {
+    final path = await SpeakerEnrollmentStore.instance.wavAbsolutePath(id);
+    if (path == null) {
+      _speechText = '该条声纹暂无试听文件';
+      notifyListeners();
+      return;
+    }
+    _ownerVoiceprintPlayingId = id;
+    notifyListeners();
+    try {
+      await SpeakerEnrollmentAudioPlayer.instance.play(id, path);
+    } finally {
+      _ownerVoiceprintPlayingId = null;
+      notifyListeners();
+    }
+  }
+
+  /// 从声纹库 [+] 发起新录音（最多 3 条）。
+  Future<void> startOwnerVoiceprintEnrollmentFromLibrary() async {
+    if (!canAddOwnerVoiceprintSample) {
+      _speechText = '最多保存 $ownerVoiceprintMaxSamples 条声纹';
+      notifyListeners();
+      return;
+    }
+    await startOwnerVoiceprintEnrollment();
+  }
+
+  /// 右上角「主人模式」：聆听与打断输入均需声纹比对。
+  Future<void> setOwnerMode(bool enabled) async {
+    if (enabled && !_ownerVoiceprintEnrolled) {
+      _speechText = '不可使用：请先在右上角录入主人声音';
+      notifyListeners();
+      return;
+    }
+    if (_ownerMode == enabled) return;
+    _ownerMode = enabled;
+    if (enabled &&
+        _conversationController.isInConversationMode &&
+        _listeningViaQwen) {
+      _duplexTtsBargeInEnabled = true;
+      _sherpaKws?.setTtsBargeInVadEnabled(false);
+    }
+    notifyListeners();
+  }
+
+  /// 右上角「主人声纹打断播报」：需已录入声纹；未录入时拒绝开启并提示。
+  Future<void> setOwnerVoiceprintBargeInMode(bool enabled) async {
+    if (enabled && !_ownerVoiceprintEnrolled) {
+      _speechText = '不可使用：请先在右上角录入主人声音';
+      notifyListeners();
+      return;
+    }
+    if (_ownerVoiceprintBargeInMode == enabled) return;
+    _ownerVoiceprintBargeInMode = enabled;
+    if (enabled &&
+        _conversationController.isInConversationMode &&
+        _listeningViaQwen) {
+      _duplexTtsBargeInEnabled = true;
+      _sherpaKws?.setTtsBargeInVadEnabled(false);
+    }
+    notifyListeners();
+  }
+
+  void _scheduleOwnerVoiceprintResultDismiss() {
+    _ownerVoiceprintResultTimer?.cancel();
+    _ownerVoiceprintResultTimer = Timer(const Duration(seconds: 4), () {
+      if (_ownerVoiceprintUi == OwnerVoiceprintEnrollUi.success ||
+          _ownerVoiceprintUi == OwnerVoiceprintEnrollUi.failure) {
+        _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.none;
+        _ownerVoiceprintEnrollmentHint = '';
+        notifyListeners();
+      }
+    });
+  }
+
+  /// 右上角声纹库 [+]：采录 PCM 并提取 embedding；首条成功后自动进入连续对话。
+  Future<void> startOwnerVoiceprintEnrollment() async {
+    if (isOwnerVoiceprintEnrolling) return;
+    if (!canAddOwnerVoiceprintSample) {
+      _speechText = '最多保存 $ownerVoiceprintMaxSamples 条声纹，请先删除旧条目';
+      notifyListeners();
+      return;
+    }
+
+    final countBefore = SpeakerEnrollmentStore.instance.sampleCount;
+    final arm = ++_enrollmentGeneration;
+    _ownerVoiceprintResultTimer?.cancel();
+    _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.capturing;
+    _ownerVoiceprintCaptureMs = 0;
+    _ownerVoiceprintEnrollmentHint = '正在聆听…';
+    notifyListeners();
+
+    try {
+      if (_isListening) {
+        await stopVoiceRecognition(resumeSherpaKws: false);
+      }
+      _sherpaKws?.setTtsBargeInVadEnabled(false);
+      await _sherpaKws?.pause();
+
+      _enrollmentRecorder = SpeakerEnrollmentRecorder(
+        androidVoipEchoCapture: _sherpaUseVoipMic,
+        onProgress: ({
+          required int totalMs,
+          required bool speechSeen,
+          required int silenceMs,
+          required double peakRms,
+        }) {
+          if (arm != _enrollmentGeneration) return;
+          _ownerVoiceprintCaptureMs = totalMs;
+          if (speechSeen && silenceMs > 0) {
+            _ownerVoiceprintEnrollmentHint =
+                '已检测到语音，句尾静音 ${(silenceMs / 1000).toStringAsFixed(1)}s…';
+          } else if (speechSeen) {
+            _ownerVoiceprintEnrollmentHint = '正在聆听，请念出引导语…';
+          } else {
+            _ownerVoiceprintEnrollmentHint =
+                '正在聆听… ${(totalMs / 1000).toStringAsFixed(1)}s';
+          }
+          notifyListeners();
+        },
+      );
+      final samples = await _enrollmentRecorder!.capture();
+      _enrollmentRecorder = null;
+
+      if (arm != _enrollmentGeneration) return;
+
+      if (samples == null || samples.isEmpty) {
+        _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.failure;
+        _ownerVoiceprintEnrollmentHint = '采录过短或未检测到有效语音，请重试';
+        _scheduleOwnerVoiceprintResultDismiss();
+        return;
+      }
+
+      _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.extracting;
+      _ownerVoiceprintEnrollmentHint = '采录完成，正在提取声纹…';
+      notifyListeners();
+
+      final ready = await SherpaSpeakerEmbeddingService.instance.ensureReady();
+      if (arm != _enrollmentGeneration) return;
+      if (!ready) {
+        _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.failure;
+        _ownerVoiceprintEnrollmentHint =
+            '声纹模型未就绪，请将模型放入 assets/sherpa_speaker/（见 README）';
+        _scheduleOwnerVoiceprintResultDismiss();
+        return;
+      }
+
+      final embedding =
+          SherpaSpeakerEmbeddingService.instance.computeFromSamples(samples);
+      if (arm != _enrollmentGeneration) return;
+      if (embedding == null || embedding.isEmpty) {
+        _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.failure;
+        _ownerVoiceprintEnrollmentHint = '声纹提取失败，请在安静环境重试';
+        _scheduleOwnerVoiceprintResultDismiss();
+        return;
+      }
+
+      await SpeakerEnrollmentStore.instance.addSample(
+        embedding: embedding,
+        pcmSamples: samples,
+        durationMs: _ownerVoiceprintCaptureMs,
+      );
+      _ownerVoiceprintEnrolled = SpeakerEnrollmentStore.instance.hasEnrollment;
+      _ownerVoiceprintSelectedId =
+          SpeakerEnrollmentStore.instance.activeSampleId;
+      _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.success;
+      _ownerVoiceprintEnrollmentHint =
+          '已保存第 ${SpeakerEnrollmentStore.instance.sampleCount} 条声纹';
+      _speechText = '主人声纹已保存';
+      print(
+        '✅ [Speaker] 已保存声纹库 count=${SpeakerEnrollmentStore.instance.sampleCount}',
+      );
+      notifyListeners();
+      if (countBefore == 0 && !_conversationController.isInConversationMode) {
+        await _enterConversationAfterVoiceEnrollment();
+      }
+      _scheduleOwnerVoiceprintResultDismiss();
+    } catch (e, st) {
+      print('❌ [Speaker] 注册失败: $e\n$st');
+      _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.failure;
+      _ownerVoiceprintEnrollmentHint = '声纹注册失败，请重试';
+      _scheduleOwnerVoiceprintResultDismiss();
+    } finally {
+      if (arm == _enrollmentGeneration) {
+        _enrollmentRecorder = null;
+        if (_isWakeUpActive &&
+            _sherpaKws != null &&
+            !_conversationController.isInConversationMode) {
+          try {
+            await _sherpaKws!.resume();
+          } catch (_) {}
+        }
+        notifyListeners();
+      }
+    }
+  }
+
+  Future<void> cancelOwnerVoiceprintEnrollment() async {
+    _enrollmentGeneration++;
+    _ownerVoiceprintResultTimer?.cancel();
+    await _enrollmentRecorder?.cancel();
+    _enrollmentRecorder = null;
+    _ownerVoiceprintUi = OwnerVoiceprintEnrollUi.none;
+    _ownerVoiceprintEnrollmentHint = '';
+    _ownerVoiceprintCaptureMs = 0;
+    notifyListeners();
+  }
+
   /// 设置界面动画回调
   void setInterfaceServiceCallback(Function(String) callback) {
     _uiModule.initialize(animationCallback: callback);
@@ -515,7 +1041,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
       await _sherpaKws?.stop();
       _sherpaKws = SherpaKwsWakeService(
         onKeyword: _onSherpaKeyword,
-        onSpeechBargeIn: _onSherpaSpeechOnlyBargeIn,
+        onSpeechBargeIn: _onSherpaSpeechBargeInWithPcm,
       );
       final ok = await _sherpaKws!.init();
       if (!ok) {
@@ -553,6 +1079,10 @@ class SpeechNotifierSimplified with ChangeNotifier {
         _conversationController.isTtsPlaying) {
       if (_multiPersonPushToTalkMode) {
         print('🎧 [KWS] 多人按住说话模式：TTS 期间忽略唤醒/关键词打断');
+        return;
+      }
+      if (_voiceprintGateForBargeIn) {
+        print('🎧 [KWS] 主人/声纹打断模式：TTS 期间忽略关键词打断（仅声纹+VAD）');
         return;
       }
       print(
@@ -601,6 +1131,32 @@ class SpeechNotifierSimplified with ChangeNotifier {
     }
     _ttsBargeInBusy = true;
     try {
+      if (_voiceprintGateForBargeIn) {
+        _pauseConversationTimeoutForUserSpeech();
+        if (!_ownerVoiceprintEnrolled) return;
+        final snap = await _collectBargeInPcmForVerify();
+        if (snap == null || snap.isEmpty) {
+          _publishVoiceprintVerifyResult(
+            const OwnerVoiceprintVerifyResult(
+              bestScore: null,
+              pass: false,
+              valid: false,
+              reason: '麦克风流未就绪',
+            ),
+          );
+          return;
+        }
+        final ok = await _verifyOwnerVoiceprintForBargeIn(snap);
+        if (!ok) {
+          print('🔐 [Duplex] 人声未通过主人声纹比对');
+          return;
+        }
+        _qwenAsrRecorder?.resetSegmentAfterTtsBargeIn();
+        await _conversationController.interruptConversationTtsFromKws(
+          ConversationController.kTtsInterruptKeywordOwnerVoiceprint,
+        );
+        return;
+      }
       _qwenAsrRecorder?.resetSegmentAfterTtsBargeIn();
       await _conversationController
           .interruptConversationTtsFromKws('duplex_pcm_vad');
@@ -609,14 +1165,68 @@ class SpeechNotifierSimplified with ChangeNotifier {
     }
   }
 
-  /// Sherpa 麦克风流上的能量 VAD：不限固定词条，持续人声即打断 TTS。
-  void _onSherpaSpeechOnlyBargeIn() {
+  /// TTS 期间 Sherpa 能量 VAD：声纹模式下仅主人 embedding 通过才打断。
+  void _onSherpaSpeechBargeInWithPcm(Float32List recentPcm) {
     if (_multiPersonPushToTalkMode) return;
-    if (_conversationController.isInConversationMode &&
-        _conversationController.isTtsPlaying) {
-      print(
-          '🎤 [VAD] 人声活动打断 (voip=${AndroidVoipAudioRoute.instance.isVoipRouteEnabled})');
-      unawaited(_handleTtsBargeInKeyword('语音活动'));
+    if (!_conversationController.isInConversationMode ||
+        !_conversationController.isTtsPlaying) {
+      return;
+    }
+
+    if (_voiceprintGateForBargeIn) {
+      if (!_ownerVoiceprintEnrolled) {
+        print('🔐 [VAD] 主人/声纹模式未注册主人，忽略人声');
+        return;
+      }
+      unawaited(_handleOwnerVoiceprintTtsBargeIn(recentPcm));
+      return;
+    }
+
+    print(
+      '🎤 [VAD] 人声活动打断 (voip=${AndroidVoipAudioRoute.instance.isVoipRouteEnabled})',
+    );
+    unawaited(_handleTtsBargeInKeyword('语音活动'));
+  }
+
+  Future<void> _handleOwnerVoiceprintTtsBargeIn(Float32List recentPcm) async {
+    if (_ttsBargeInBusy) return;
+    _pauseConversationTimeoutForUserSpeech();
+    _ttsBargeInBusy = true;
+    final kws = _sherpaKws;
+    try {
+      final snap = kws?.snapshotBargeInRingForVerify() ?? recentPcm;
+      if (snap.isEmpty) {
+        _beginVoiceprintVerifyUi(OwnerVoiceprintVerifyContext.bargeIn);
+        _publishVoiceprintVerifyResult(
+          const OwnerVoiceprintVerifyResult(
+            bestScore: null,
+            pass: false,
+            valid: false,
+            reason: '无有效 PCM',
+          ),
+        );
+        kws?.completeBargeInAttempt(interruptGranted: false);
+        return;
+      }
+      _beginVoiceprintVerifyUi(OwnerVoiceprintVerifyContext.bargeIn);
+      final result = await OwnerVoiceprintVerifier.instance.verifyOwnerDetailed(
+        snap,
+        fastBargeIn: true,
+      );
+      _publishVoiceprintVerifyResult(result);
+      final ok = result.pass;
+      if (ok) {
+        print('🔐 [VAD] 主人声纹通过，允许打断 TTS');
+        await _conversationController.interruptConversationTtsFromKws(
+          ConversationController.kTtsInterruptKeywordOwnerVoiceprint,
+        );
+        kws?.completeBargeInAttempt(interruptGranted: true);
+      } else {
+        print('🔐 [VAD] 本轮人声未通过主人声纹比对');
+        kws?.completeBargeInAttempt(interruptGranted: false);
+      }
+    } finally {
+      _ttsBargeInBusy = false;
     }
   }
 
@@ -630,10 +1240,22 @@ class SpeechNotifierSimplified with ChangeNotifier {
       print('🎧 [prepareSherpa] 多人按住说话：不启用 TTS 前打断监听');
       return;
     }
-    if (_duplexTtsBargeInEnabled) {
+    if (_voiceprintGateForBargeIn && !_ownerVoiceprintEnrolled) {
+      print('🎧 [prepareSherpa] 主人/声纹模式未录入：跳过');
+      return;
+    }
+    if (_voiceprintGateForBargeIn) {
+      _duplexTtsBargeInEnabled = true;
+    }
+    // 边播边听：主人/声纹模式必须 TTS 前拉起 Qwen 同麦，否则无法打断。
+    if (_duplexTtsBargeInEnabled || _voiceprintGateForBargeIn) {
       if (!_isListening) {
         print('🎧 [prepareSherpa] 边播边听：TTS 前预启动主 ASR');
         await startVoiceRecognition();
+      }
+      if (_voiceprintGateForBargeIn && _listeningViaQwen) {
+        _duplexTtsBargeInEnabled = true;
+        _sherpaKws?.setTtsBargeInVadEnabled(false);
       }
       print('🎧 [prepareSherpa] 边播边听，跳过 Sherpa resume');
       return;
@@ -655,10 +1277,48 @@ class SpeechNotifierSimplified with ChangeNotifier {
       }
       await _sherpaKws!.resume();
       _sherpaKws!.setTtsBargeInVadEnabled(true);
-      print('🎧 [prepareSherpa] resume 完成，已开启 TTS 人声 VAD');
+      _sherpaKws!.setDeferBargeInCooldown(false);
+      print('🎧 [prepareSherpa] resume 完成，已开启 TTS 人声 VAD（VOSK 回退路径）');
     } catch (e, st) {
       print('⚠️ [prepareSherpa] 失败: $e\n$st');
     }
+  }
+
+  Future<void> _enterConversationAfterVoiceEnrollment() async {
+    print('🔐 [Speaker] 声纹录入完成，启动连续对话');
+    if (_conversationController.isInConversationMode) {
+      if (!_multiPersonPushToTalkMode && !_isListening) {
+        unawaited(startVoiceRecognition());
+      }
+      return;
+    }
+
+    _idleTimer?.cancel();
+    _postConversationTimer?.cancel();
+    await _stopEnvironmentMonitoring();
+
+    if (Platform.isAndroid) {
+      await AndroidVoipAudioRoute.instance.setConversationVoipEnabled(
+        true,
+        speakerphone: true,
+        debugTag: 'voiceprint→conversation',
+      );
+      _sherpaUseVoipMic = true;
+      _sherpaKws?.setAndroidVoipEchoCapture(true);
+      if (_sherpaKws != null && _isWakeUpActive) {
+        await _sherpaKws!.pause();
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+        await _sherpaKws!.start();
+      }
+    }
+
+    if (!_multiPersonPushToTalkMode) {
+      unawaited(_prewarmAsrAfterWake());
+    }
+
+    await _conversationController.enterConversationMode();
+    _speechText = '💬 连续对话中';
+    notifyListeners();
   }
 
   Future<void> _onWakeWordEnterConversation() async {
@@ -704,7 +1364,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
     print(
         '⏱️ [Pipeline][Wake] enterConversation+首句TTS整段 ${convSw.elapsedMilliseconds}ms');
     print(
-        '⏱️ [Pipeline][Wake] 唤醒词命中→首句播完总耗时 ${wakeSw.elapsedMilliseconds}ms（含上述各段）',
+      '⏱️ [Pipeline][Wake] 唤醒词命中→首句播完总耗时 ${wakeSw.elapsedMilliseconds}ms（含上述各段）',
     );
 
     Timer(const Duration(seconds: 1), () {
@@ -970,14 +1630,50 @@ class SpeechNotifierSimplified with ChangeNotifier {
     stopGestureRecognition();
   }
 
+  /// 句末判定触发但无有效文本时，麦已由 [QwenStreamingAsrRecorder] 关闭，需延迟重开听写。
+  void _scheduleRestartAsrIfConversationIdle() {
+    if (!_conversationController.isInConversationMode) return;
+    if (_multiPersonPushToTalkMode) return;
+    ConversationFlowTracer.asr(
+      'scheduleRestartAsrIfConversationIdle armed delay=180ms',
+    );
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 180), () async {
+      if (!_conversationController.isInConversationMode) return;
+      if (_conversationController.isProcessingUserInput) return;
+      if (_isListening || _isStartingVoiceRecognition) return;
+      ConversationFlowTracer.asr(
+        'scheduleRestartAsrIfConversationIdle firing startVoiceRecognition',
+      );
+      await startVoiceRecognition();
+      if (_conversationController.isInConversationMode &&
+          !_conversationController.isProcessingUserInput &&
+          !_conversationController.isTtsPlaying) {
+        _conversationController.resumeIdleConversationTimeout();
+      }
+    }));
+  }
+
   /// 启动语音识别监听
   Future<void> startVoiceRecognition() async {
     if (_isListening) {
-      if (_conversationController.isInConversationMode && _listeningViaQwen) {
-        _duplexTtsBargeInEnabled = true;
+      final qwenStale = _listeningViaQwen && _qwenAsrRecorder == null;
+      if (!qwenStale) {
+        if (_conversationController.isInConversationMode && _listeningViaQwen) {
+          _duplexTtsBargeInEnabled = true;
+        }
+        ConversationFlowTracer.asr(
+          'startVoiceRecognition SKIP already_listening '
+          'qwen=$_listeningViaQwen duplex=$_duplexTtsBargeInEnabled',
+        );
+        print("🎙️ 语音识别已在运行");
+        return;
       }
-      print("🎙️ 语音识别已在运行");
-      return;
+      ConversationFlowTracer.asr(
+        'startVoiceRecognition STALE_STATE clearing flags and restarting',
+      );
+      print('⚠️ Qwen ASR 假运行：监听标志为真但录音器已释放，将重新启动');
+      _isListening = false;
+      _listeningViaQwen = false;
     }
     if (_isStartingVoiceRecognition) {
       print("🎙️ 语音识别启动中，跳过重复请求");
@@ -994,48 +1690,36 @@ class SpeechNotifierSimplified with ChangeNotifier {
       await _sherpaKws?.pause();
       await Future<void>.delayed(const Duration(milliseconds: 120));
 
-        final qwenClient = QwenCloudAsrClient();
-        print('════════════════ QWEN ASR ENDPOINT ════════════════');
-        print('🌐 [QWEN_ASR_BASE_URL] ${qwenClient.baseUrl}');
-        print('════════════════════════════════════════════════════');
-        print('🌐 [VA_BASE_URL] ${VaServiceConfig.baseUrl}');
-        final qwenUp = await qwenClient.healthz();
-      print('🩺 [QWEN /healthz] ${qwenUp ? "OK" : "FAIL"} @ ${qwenClient.baseUrl}/healthz');
+      final qwenClient = QwenCloudAsrClient();
+      print('════════════════ QWEN ASR ENDPOINT ════════════════');
+      print('🌐 [QWEN_ASR_BASE_URL] ${qwenClient.baseUrl}');
+      print('════════════════════════════════════════════════════');
+      print('🌐 [VA_BASE_URL] ${VaServiceConfig.baseUrl}');
+      final qwenUp = await qwenClient.healthz();
+      print(
+          '🩺 [QWEN /healthz] ${qwenUp ? "OK" : "FAIL"} @ ${qwenClient.baseUrl}/healthz');
       if (qwenUp) {
         try {
           _qwenAsrRecorder = QwenStreamingAsrRecorder(
             client: qwenClient,
-            onPartialText: (String t) {
-              _speechText = t;
-              if (t.trim().isNotEmpty) {
-                _vaSessionManager ??= VaSessionManager();
-                _vaSessionManager!.beginSpeechWindowImageBuffering();
-              }
-              notifyListeners();
-            },
-            onUtteranceFinal: (String t) async {
+            onPartialText: _onAsrPartialText,
+            onUtteranceFinal: (String t) {
               final s = t.trim();
-              Map<String, dynamic>? vaResult;
-              RouterDecision? routerDecision;
-              if (s.isNotEmpty) {
-                routerDecision =
-                    await _conversationController.previewRouterDecision(s);
-                print('🧭 [Router][ASR后预判] ${routerDecision.rawJson}');
-                vaResult = await _runDeferredVaIfNeeded(s, routerDecision);
-              }
+              final pcmSnap =
+                  _qwenAsrRecorder?.snapshotUtterancePcmForVerify() ??
+                      _qwenAsrRecorder?.snapshotBargeInRingForVerify();
+              ConversationFlowTracer.asr(
+                'onUtteranceFinal len=${t.length} trimmedEmpty=${s.isEmpty}',
+              );
               _qwenAsrRecorder = null;
               _listeningViaQwen = false;
               _listeningViaVosk = false;
               _isListening = false;
               notifyListeners();
               if (s.isNotEmpty) {
-                unawaited(
-                  _processUserInput(
-                    s,
-                    vaResult: vaResult,
-                    precomputedRouterDecision: routerDecision,
-                  ),
-                );
+                unawaited(_handleFinalizedUserSpeech(s, pcmSnap: pcmSnap));
+              } else {
+                _scheduleRestartAsrIfConversationIdle();
               }
               _resetPendingVaCapture();
             },
@@ -1047,6 +1731,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
             onSpeechDuringTtsBargeIn: () {
               unawaited(_handleDuplexTtsBargeInFromVad());
             },
+            onSpeechActivity: _pauseConversationTimeoutForUserSpeech,
           );
           await _qwenAsrRecorder!.start();
           _listeningViaQwen = true;
@@ -1242,7 +1927,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
               }
             }
             print("🎤 语音识别结果: $text");
-            await _processUserInput(
+            await _handleFinalizedUserSpeech(
               text,
               vaResult: vaResult,
               precomputedRouterDecision: routerDecision,
@@ -1259,6 +1944,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
           final result = jsonDecode(partial) as Map<String, dynamic>;
           final text = (result['partial'] ?? '').toString().trim();
           if (text.isNotEmpty) {
+            _pauseConversationTimeoutForUserSpeech();
             _speechText = text;
             _maybeEnableVaVisionFromTranscript(text);
             notifyListeners();
@@ -1318,7 +2004,11 @@ class SpeechNotifierSimplified with ChangeNotifier {
     // 避免「Sherpa 打断 → 再切 Qwen」丢前几个字；否则沿用停麦再处理。
     if (_conversationController.isInConversationMode) {
       // 复杂任务执行中保持 ASR 常开，允许新语音随时打断当前任务。
-      final keepAsrForInterrupt = _conversationController.isComplexTaskExecuting;
+      final keepAsrForInterrupt =
+          _conversationController.isComplexTaskExecuting ||
+              _ownerMode ||
+              _ownerVoiceprintBargeInMode ||
+              _duplexTtsBargeInEnabled;
       if (!_duplexTtsBargeInEnabled && !keepAsrForInterrupt) {
         await stopVoiceRecognition(resumeSherpaKws: false);
       }
@@ -1343,7 +2033,8 @@ class SpeechNotifierSimplified with ChangeNotifier {
     if (manager == null || manager.sessionId == null) return;
     final normalized = text.trim();
     if (normalized.isEmpty) return;
-    final hit = _vaVisionKeywords.any((keyword) => normalized.contains(keyword));
+    final hit =
+        _vaVisionKeywords.any((keyword) => normalized.contains(keyword));
     if (!hit) return;
     print('🎯 [VA] 命中视觉增强关键词 transcript="$normalized"');
     manager.enableVisionEnhancement();
