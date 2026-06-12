@@ -1,10 +1,12 @@
-import 'dart:convert';
-
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:voicegpt/core/storage/app_database.dart';
+import 'package:voicegpt/core/models/conversation_history_turn.dart';
 import 'package:voicegpt/core/models/private_agent_profile.dart';
+import 'package:voicegpt/core/models/tts_voice_option.dart';
 
-/// 本地存储管理器
-/// 用于登录/注册/设置/私人智能体配置等功能（不接入 mem0/记忆层）
+/// 本地偏好管理器。
+///
+/// 设置项仍在 SharedPreferences；账号、私人智能体、对话历史已迁到 SQLite。
 class PreferenceManager {
   static final PreferenceManager _instance = PreferenceManager._internal();
   factory PreferenceManager() => _instance;
@@ -19,6 +21,7 @@ class PreferenceManager {
   static const String _ttsEnabled = 'tts_enabled';
   static const String _ttsSpeed = 'tts_speed';
   static const String _ttsVolume = 'tts_volume';
+  static const String _ttsVoiceType = 'tts_voice_type';
   static const String _wakeWordEnabled = 'wake_word_enabled';
 
   static const String _conversationTimeout = 'conversation_timeout';
@@ -33,12 +36,6 @@ class PreferenceManager {
 
   static const String _robotName = 'robot_name';
   static const String _robotPersonality = 'robot_personality';
-
-  static const String _authUser = 'auth_user';
-  static const String _userId = 'user_id';
-
-  static String _privateAgentProfileKey(String userId) =>
-      'private_agent_profile_$userId';
 
   // ========== 初始化 ==========
   Future<void> init() async {
@@ -76,6 +73,15 @@ class PreferenceManager {
   }
 
   double getTtsVolume() => _prefs.getDouble(_ttsVolume) ?? 1.0;
+
+  Future<void> setTtsVoiceType(int value) async {
+    await _prefs.setInt(_ttsVoiceType, value);
+  }
+
+  int getTtsVoiceType() => _prefs.getInt(_ttsVoiceType) ?? defaultTtsVoiceType;
+
+  TtsVoiceOption getTtsVoiceOption() =>
+      ttsVoiceOptionForType(getTtsVoiceType());
 
   Future<void> setWakeWordEnabled(bool value) async {
     await _prefs.setBool(_wakeWordEnabled, value);
@@ -132,42 +138,52 @@ class PreferenceManager {
   String getRobotPersonality() =>
       _prefs.getString(_robotPersonality) ?? 'friendly';
 
-  // ========== 登录状态 ==========
+  // ========== 登录状态（SQLite） ==========
   Future<void> setUserId(String value) async {
-    await _prefs.setString(_userId, value);
+    await AppDatabase.instance
+        .setActiveUser(value.trim().isEmpty ? null : value);
   }
 
-  String getUserId() => _prefs.getString(_userId) ?? '';
+  String getUserId() => '';
 
   Future<void> setAuthUser(String jsonValue) async {
-    await _prefs.setString(_authUser, jsonValue);
+    // 账号数据已迁移到 SQLite；保留方法避免旧调用崩溃。
   }
 
-  String getAuthUser() => _prefs.getString(_authUser) ?? '';
+  String getAuthUser() => '';
 
   Future<void> clearAuthUser() async {
-    await _prefs.remove(_authUser);
+    await AppDatabase.instance.setActiveUser(null);
   }
 
-  // ========== 私人智能体配置 ==========
+  // ========== 私人智能体配置（SQLite） ==========
   Future<PrivateAgentProfile?> getPrivateAgentProfileModel(
       String userId) async {
-    if (userId.trim().isEmpty) return null;
-    final key = _privateAgentProfileKey(userId.trim());
-    final jsonStr = _prefs.getString(key);
-    if (jsonStr == null || jsonStr.isEmpty) return null;
-    try {
-      final jsonMap = jsonDecode(jsonStr) as Map<String, dynamic>;
-      return PrivateAgentProfile.fromJson(jsonMap);
-    } catch (_) {
-      return null;
-    }
+    return AppDatabase.instance.getPrivateAgentProfile(userId);
   }
 
   Future<bool> setPrivateAgentProfileModel(PrivateAgentProfile profile) async {
-    if (profile.userId.trim().isEmpty || !profile.isValid) return false;
-    final key = _privateAgentProfileKey(profile.userId.trim());
-    await _prefs.setString(key, jsonEncode(profile.toJson()));
-    return true;
+    return AppDatabase.instance.upsertPrivateAgentProfile(profile);
+  }
+
+  // ========== 对话历史（SQLite） ==========
+  Future<List<ConversationHistoryTurn>> getConversationHistory(String userId) {
+    return AppDatabase.instance.getConversationHistory(userId);
+  }
+
+  Future<void> addConversationHistoryTurn(
+    String userId,
+    ConversationHistoryTurn turn, {
+    int maxTurns = 80,
+  }) async {
+    await AppDatabase.instance.addConversationHistoryTurn(
+      userId,
+      turn,
+      maxTurns: maxTurns,
+    );
+  }
+
+  Future<void> clearConversationHistory(String userId) async {
+    await AppDatabase.instance.clearConversationHistory(userId);
   }
 }

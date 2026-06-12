@@ -1636,6 +1636,7 @@ class _HomeViewState extends State<HomeView> {
     String thinkingLabel = '';
     final asrDisplay = notifier.getTextSpeech.trim();
     const asrIdlePlaceholder = '等待唤醒词...';
+    final asrLabel = notifier.isVaRecognitionActive ? '情绪识别' : '识别';
 
     // --- 新增：获取手势识别状态 ---
     String gestureStatusLabel = '';
@@ -1738,7 +1739,7 @@ class _HomeViewState extends State<HomeView> {
                 borderRadius: BorderRadius.circular(10),
               ),
               child: Text(
-                '🎙️ 识别：$asrDisplay',
+                '🎙️ $asrLabel：$asrDisplay',
                 maxLines: 8,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(

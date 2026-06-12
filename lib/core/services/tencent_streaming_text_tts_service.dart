@@ -195,9 +195,8 @@ class TencentStreamingTextTtsService extends VoiceTtsService {
       await _drainAudioQueue();
     }
     if (_streamSessionTtsStart != null) {
-      final wall = DateTime.now()
-          .difference(_streamSessionTtsStart!)
-          .inMilliseconds;
+      final wall =
+          DateTime.now().difference(_streamSessionTtsStart!).inMilliseconds;
       print(
         '⏱️ [ConvStage][腾讯流式TTS·本轮] 自 READY 至收尾 wall=${wall}ms '
         'connect=${_lastWsConnectMs}ms readyWait=${_lastReadyWaitMs}ms',
@@ -326,10 +325,10 @@ class TencentStreamingTextTtsService extends VoiceTtsService {
     final keys = params.keys.toList()..sort();
     final canonical = keys.map((k) => '$k=${params[k]}').join('&');
     final signRaw = 'GETtts.cloud.tencent.com/stream_wsv2?$canonical';
-    final sig = base64Encode(Hmac(sha1, utf8.encode(secretKey)).convert(utf8.encode(signRaw)).bytes);
-    final query = keys
-        .map((k) => '$k=${Uri.encodeQueryComponent(params[k]!)}')
-        .join('&');
+    final sig = base64Encode(
+        Hmac(sha1, utf8.encode(secretKey)).convert(utf8.encode(signRaw)).bytes);
+    final query =
+        keys.map((k) => '$k=${Uri.encodeQueryComponent(params[k]!)}').join('&');
     return 'wss://tts.cloud.tencent.com/stream_wsv2?$query&Signature=${Uri.encodeQueryComponent(sig)}';
   }
 

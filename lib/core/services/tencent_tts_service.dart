@@ -35,7 +35,7 @@ class TencentTtsService {
     int voiceType = 501003,
     int voiceLanguage = 1,
     double voiceSpeed = 0,
-    double voiceVolume = 1,
+    double voiceVolume = 0,
     String codec = "mp3",
   }) {
     _controller.config = TTSControllerConfig()

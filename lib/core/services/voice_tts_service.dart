@@ -50,7 +50,7 @@ class TencentVoiceTtsService extends VoiceTtsService {
     this.voiceType = 101028,
     this.voiceLanguage = 1,
     this.voiceSpeed = 0,
-    this.voiceVolume = 1,
+    this.voiceVolume = 0,
     this.codec = 'mp3',
   });
 

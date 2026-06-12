@@ -21,11 +21,17 @@ import 'package:voicegpt/core/llm/conversation_context_pack.dart';
 import 'package:voicegpt/core/services/ambient_context_cache.dart';
 import 'package:voicegpt/core/services/device_context_service.dart';
 import 'package:voicegpt/core/services/local_music_service.dart';
+import 'package:voicegpt/core/storage/app_database.dart';
+import 'package:voicegpt/core/storage/preference_manager.dart';
+import 'package:voicegpt/core/models/conversation_history_turn.dart';
+import 'package:voicegpt/core/models/tts_voice_option.dart';
 import 'package:voicegpt/core/utils/input_language_gate.dart';
 import 'package:voicegpt/core/services/camera_resource_manager.dart'
     show CameraTaskPriority;
 import 'package:voicegpt/core/config/debug_runtime_flags.dart';
 import 'package:voicegpt/core/debug/conversation_flow_tracer.dart';
+
+enum _VaValueKind { valence, arousal, dominance }
 
 /// 连续对话控制器
 /// 统一管理连续对话模式的主流程，协调各个功能模块
@@ -54,6 +60,7 @@ class ConversationController extends ChangeNotifier {
   final UserDetectionModule _userDetectionModule = UserDetectionModule();
   final EnvironMonitorModule _environModule = EnvironMonitorModule();
   late VoiceTtsService _ttsService;
+  bool _ttsServiceReady = false;
 
   // 连续对话状态
   bool _isInConversationMode = false;
@@ -82,9 +89,6 @@ class ConversationController extends ChangeNotifier {
   static const int _plannerVisionTtsMaxChars = 600;
 
   bool _planExecutorListenerAttached = false;
-
-  /// 腾讯云 TTS 音色 ID；见腾讯云语音合成文档
-  static const int _tencentVoiceType = 101028;
 
   // 对话历史和上下文
   String _lastUserInput = "";
@@ -136,18 +140,14 @@ class ConversationController extends ChangeNotifier {
     // 初始化各个模块
     await _intentModule.initialize();
 
-    const tencentAppId =
-        int.fromEnvironment('TENCENT_TTS_APP_ID', defaultValue: 0);
-    const tencentSecretId = String.fromEnvironment('TENCENT_TTS_SECRET_ID',
-        defaultValue: 'AKIDxoT0OaZLuGOJ1d2EE4h7A1wfDfz63pRs');
-    const tencentSecretKey = String.fromEnvironment('TENCENT_TTS_SECRET_KEY',
-        defaultValue: 'HTbZK1Ys12uc7RZWItJdnlrnYCeuztb7');
-    _ttsService = await VoiceTtsServiceFactory.create(
-      tencentAppId: tencentAppId,
-      tencentSecretId: tencentSecretId,
-      tencentSecretKey: tencentSecretKey,
-      tencentVoiceType: _tencentVoiceType,
+    final selectedVoiceType = PreferenceManager().getTtsVoiceType();
+    final selectedVoice = ttsVoiceOptionForType(selectedVoiceType);
+    print(
+      '🎙️ TTS 声线: ${selectedVoice.name} '
+      '(${selectedVoice.category}, ${selectedVoice.voiceType})',
     );
+    _ttsService = await _createTtsService(selectedVoice.voiceType);
+    _ttsServiceReady = true;
 
     // 设置UI动画回调
     _uiModule.initialize();
@@ -187,6 +187,43 @@ class ConversationController extends ChangeNotifier {
     }
 
     print("✅ 连续对话控制器初始化完成");
+  }
+
+  Future<VoiceTtsService> _createTtsService(int voiceType) {
+    const tencentAppId =
+        int.fromEnvironment('TENCENT_TTS_APP_ID', defaultValue: 0);
+    const tencentSecretId = String.fromEnvironment('TENCENT_TTS_SECRET_ID',
+        defaultValue: 'AKIDxoT0OaZLuGOJ1d2EE4h7A1wfDfz63pRs');
+    const tencentSecretKey = String.fromEnvironment('TENCENT_TTS_SECRET_KEY',
+        defaultValue: 'HTbZK1Ys12uc7RZWItJdnlrnYCeuztb7');
+    return VoiceTtsServiceFactory.create(
+      tencentAppId: tencentAppId,
+      tencentSecretId: tencentSecretId,
+      tencentSecretKey: tencentSecretKey,
+      tencentVoiceType: voiceType,
+    );
+  }
+
+  Future<void> updateTtsVoiceType(int voiceType) async {
+    final selectedVoice = ttsVoiceOptionForType(voiceType);
+    if (!_ttsServiceReady) {
+      print(
+        '🎙️ TTS 尚未初始化，已保存声线，稍后使用: '
+        '${selectedVoice.name} (${selectedVoice.voiceType})',
+      );
+      return;
+    }
+    print(
+      '🎙️ 切换 TTS 声线: ${selectedVoice.name} '
+      '(${selectedVoice.category}, ${selectedVoice.voiceType})',
+    );
+    try {
+      await _ttsService.release();
+    } catch (e) {
+      print('⚠️ 释放旧 TTS 服务失败: $e');
+    }
+    _ttsService = await _createTtsService(selectedVoice.voiceType);
+    _environModule.setTTSService(_ttsService);
   }
 
   void _onPlanExecutorChanged() {
@@ -1280,6 +1317,14 @@ class ConversationController extends ChangeNotifier {
     }
 
     try {
+      final contextPack = _buildContextPack(vaResult: vaResult);
+      if (sceneIntent == IntentType.comfort && vaResult != null) {
+        print(
+          '🧩 [Companion][VA_CONTEXT] '
+          '${contextPack.formatContextBlock().replaceAll('\n', ' | ')}',
+        );
+      }
+
       if (sceneIntent == IntentType.command &&
           !_actionModule.isBluetoothConnected) {
         await _speakText(
@@ -1324,7 +1369,10 @@ class ConversationController extends ChangeNotifier {
       final tts = _ttsService;
       final supportsStream = tts.supportsInputStreaming;
       // command 场景模型输出整段 JSON，流式会把未闭合 JSON 送进 TTS，故强制整段模式
-      final useStream = supportsStream && sceneIntent != IntentType.command;
+      final hasVisualVa = _hasAvailableVaImage(vaResult);
+      final useStream = supportsStream &&
+          sceneIntent != IntentType.command &&
+          !(sceneIntent == IntentType.comfort && hasVisualVa);
       final deviceCtxMode = sceneIntent == IntentType.command
           ? DeviceContextFetchMode.none
           : sceneIntent == IntentType.apiCall
@@ -1374,7 +1422,7 @@ class ConversationController extends ChangeNotifier {
             [],
             sceneIntent: sceneIntent,
             englishTeachingScene: englishTeachingScene,
-            contextPack: _buildContextPack(vaResult: vaResult),
+            contextPack: contextPack,
             replyLengthMode: _replyLengthModeHint(),
             deviceContextMode: deviceCtxMode,
             onDelta: (delta) async {
@@ -1458,7 +1506,7 @@ class ConversationController extends ChangeNotifier {
           [],
           sceneIntent: sceneIntent,
           englishTeachingScene: englishTeachingScene,
-          contextPack: _buildContextPack(vaResult: vaResult),
+          contextPack: contextPack,
           replyLengthMode: _replyLengthModeHint(),
           deviceContextMode: deviceCtxMode,
         );
@@ -1468,12 +1516,18 @@ class ConversationController extends ChangeNotifier {
           '（细项见上文 [TextQA·整段]）',
         );
         final swTtsRound = Stopwatch()..start();
-        await _speakText(
+        final responseToSpeak = _ensureVisualVaVisible(
           result.response,
+          vaResult: vaResult,
+          userInput: userInput,
+          sceneIntent: sceneIntent,
+        );
+        await _speakText(
+          responseToSpeak,
           ttsExpression: sceneIntent == IntentType.command
               ? TtsAlignedExpression.actionCommandSpeaking
               : TtsAlignedExpression.textChatSpeaking,
-          recordAssistantForTurns: result.response,
+          recordAssistantForTurns: responseToSpeak,
         );
         swTtsRound.stop();
         print(
@@ -1518,6 +1572,7 @@ class ConversationController extends ChangeNotifier {
 
       if (useStream && result.response.trim().isNotEmpty) {
         _pushDialogLine('小航：${result.response.trim()}');
+        unawaited(_recordConversationHistoryTurn(userInput, result.response));
       }
     } catch (e) {
       print("❌ 文本问答处理失败: $e");
@@ -1625,6 +1680,12 @@ class ConversationController extends ChangeNotifier {
       if (recordAssistantForTurns != null &&
           recordAssistantForTurns.trim().isNotEmpty) {
         _pushDialogLine('小航：${recordAssistantForTurns.trim()}');
+        unawaited(
+          _recordConversationHistoryTurn(
+            _lastUserInput,
+            recordAssistantForTurns,
+          ),
+        );
       }
 
       print("✅ TTS播放完成");
@@ -1814,6 +1875,27 @@ class ConversationController extends ChangeNotifier {
     }
   }
 
+  Future<void> _recordConversationHistoryTurn(
+    String userText,
+    String assistantText,
+  ) async {
+    final user = userText.trim();
+    final assistant = assistantText.trim();
+    if (user.isEmpty || assistant.isEmpty) return;
+    if (user == assistant) return;
+    final activeUser = await AppDatabase.instance.getActiveUser();
+    final userId = activeUser?.id.trim() ?? '';
+    if (userId.isEmpty) return;
+    await AppDatabase.instance.addConversationHistoryTurn(
+      userId,
+      ConversationHistoryTurn(
+        userText: user,
+        assistantText: assistant,
+        createdAt: DateTime.now(),
+      ),
+    );
+  }
+
   /// 仅拦截明显调试串；英文里常出现 chat/model/message 等词，不可做简单 [String.contains]。
   bool _shouldSkipTtsAsLikelyDebug(String text) {
     if (text.contains('utterance_')) return true;
@@ -1886,15 +1968,23 @@ class ConversationController extends ChangeNotifier {
     final fusionRaw = vaResult?['fusion_summary'];
     final fusionSummary = _summarizeVaForCompanion(fusionRaw);
     final vaValuesSummary = _summarizeVaValuesForCompanion(fusionRaw);
+    final vaModalitySummary = _summarizeVaModalitiesForCompanion(vaResult);
     final vaTagsSummary = _summarizeVaTagsForCompanion(fusionRaw);
-    final vaPromptHint = _buildVaPromptHintForCompanion(fusionRaw);
+    final vaPromptHint = _buildVaPromptHintForCompanion(
+      fusionRaw,
+      vaResult: vaResult,
+    );
+    final combinedVaValues = [
+      if (vaValuesSummary != null && vaValuesSummary.isNotEmpty)
+        vaValuesSummary,
+      if (vaModalitySummary != null && vaModalitySummary.isNotEmpty)
+        vaModalitySummary,
+    ].join(' ');
     return ConversationContextPack(
       recentTurnLines: List<String>.from(_dialogTurnLines),
       userEmotionFromVa:
           fusionSummary == null || fusionSummary.isEmpty ? null : fusionSummary,
-      vaValuesSummary: vaValuesSummary == null || vaValuesSummary.isEmpty
-          ? null
-          : vaValuesSummary,
+      vaValuesSummary: combinedVaValues.isEmpty ? null : combinedVaValues,
       vaTagsSummary:
           vaTagsSummary == null || vaTagsSummary.isEmpty ? null : vaTagsSummary,
       vaPromptHint:
@@ -1918,6 +2008,84 @@ class ConversationController extends ChangeNotifier {
   double? _asDouble(Object? value) {
     if (value is num) return value.toDouble();
     return double.tryParse(value?.toString() ?? '');
+  }
+
+  bool _hasAvailableVaImage(Map<String, dynamic>? vaResult) {
+    final image = _asStringDynamicMap(vaResult?['image_summary']);
+    return image?['available'] == true;
+  }
+
+  String _ensureVisualVaVisible(
+    String rawReply, {
+    required Map<String, dynamic>? vaResult,
+    required String userInput,
+    required IntentType sceneIntent,
+  }) {
+    final reply = rawReply.trim();
+    if (reply.isEmpty || sceneIntent != IntentType.comfort) return rawReply;
+
+    final image = _asStringDynamicMap(vaResult?['image_summary']);
+    if (image == null || image['available'] != true) return rawReply;
+
+    final firstSentence = reply.split(RegExp(r'(?<=[。！？!?])')).first.trim();
+    final visualAlreadyVisible = RegExp(
+      r'看起来|看上去|脸上|表情|笑着|带笑|皱眉|绷着|不太轻松|有点累',
+    ).hasMatch(firstSentence);
+    if (visualAlreadyVisible) return rawReply;
+
+    final opener = _buildVisualVaReplyOpener(image, userInput);
+    if (opener == null || opener.isEmpty) return rawReply;
+
+    final revised = '$opener$reply';
+    print('🧩 [Companion][VA_VISUAL_REWRITE] "$reply" -> "$revised"');
+    return revised;
+  }
+
+  String? _buildVisualVaReplyOpener(
+    Map<String, dynamic> image,
+    String userInput,
+  ) {
+    final valence = _asDouble(image['valence']);
+    final arousal = _asDouble(image['arousal']);
+    final label = image['latest_emotion_label']?.toString().trim();
+    final normalizedLabel = (label ?? '').toLowerCase();
+    final hasNegativeText =
+        RegExp(r'烦|难过|不开心|累|崩溃|焦虑|生气|难受').hasMatch(userInput);
+
+    final smileLabel = _isVaPositiveVisualLabel(normalizedLabel);
+    final frownLabel = _isVaNegativeVisualLabel(normalizedLabel);
+    final positiveVisual = smileLabel || (valence ?? 0) >= 0.16;
+    final negativeVisual = frownLabel ||
+        (valence ?? 0) <= -0.16 ||
+        ((valence ?? 0) <= -0.08 && (arousal ?? 0) >= 0.45);
+    final highVisualArousal = (arousal ?? 0) >= 0.25;
+    final lowVisualArousal = (arousal ?? 0) <= -0.2;
+
+    if (positiveVisual && hasNegativeText) {
+      return '你是笑着说这个的欸，像是在逗我，也像有点苦笑。';
+    }
+    if (positiveVisual) {
+      return '你看起来还带着点笑意。';
+    }
+    if (negativeVisual && highVisualArousal) {
+      return '你看起来也有点绷着，不太轻松。';
+    }
+    if (negativeVisual && lowVisualArousal) {
+      return '你看起来也有点累，没什么劲。';
+    }
+    if (negativeVisual) {
+      return '你看起来不太轻松。';
+    }
+    if (highVisualArousal) {
+      return '你看起来也有点绷着。';
+    }
+    if (lowVisualArousal) {
+      return '你看起来有点累。';
+    }
+    if (hasNegativeText) {
+      return '你看起来还在撑着。';
+    }
+    return null;
   }
 
   String? _summarizeVaForCompanion(Object? fusionRaw) {
@@ -1962,6 +2130,233 @@ class ConversationController extends ChangeNotifier {
     return 'VA数值可解释为：情绪倾向=$valenceText；激活程度=$arousalText；掌控感=$dominanceText。';
   }
 
+  String? _summarizeVaModalitiesForCompanion(Map<String, dynamic>? vaResult) {
+    if (vaResult == null || vaResult.isEmpty) return null;
+    final audio = _asStringDynamicMap(vaResult['audio_summary']);
+    final image = _asStringDynamicMap(vaResult['image_summary']);
+    final fusion = _asStringDynamicMap(vaResult['fusion_summary']);
+    final parts = <String>[];
+
+    final audioLine = _describeVaModalityLine(
+      '语音线索',
+      audio,
+      includeDominance: true,
+    );
+    if (audioLine != null) parts.add(audioLine);
+
+    final imageLine = _describeVaModalityLine(
+      '画面线索',
+      image,
+      includeImageLabel: true,
+    );
+    if (imageLine != null) parts.add(imageLine);
+    final visualCue = _describeVaVisualCue(image);
+    if (visualCue != null) parts.add(visualCue);
+
+    final contrast = _describeVaModalityContrast(audio, image, fusion);
+    if (contrast != null) parts.add(contrast);
+
+    if (parts.isEmpty) return null;
+    return 'VA多模态摘要：${parts.join('；')}。';
+  }
+
+  String? _describeVaModalityLine(
+    String label,
+    Map<String, dynamic>? summary, {
+    bool includeDominance = false,
+    bool includeImageLabel = false,
+  }) {
+    if (summary == null || summary.isEmpty) return null;
+    final available = summary['available'] == true;
+    final count = (summary['count'] as num?)?.toInt();
+    if (!available && (count == null || count <= 0)) {
+      return '$label=暂无有效数据';
+    }
+
+    final valence = _asDouble(summary['valence']);
+    final arousal = _asDouble(summary['arousal']);
+    final dominance = _asDouble(summary['dominance']);
+    final bits = <String>[
+      '$label=${available ? '有效' : '弱可用'}',
+      '情绪倾向${_describeVaValueBand(valence, kind: _VaValueKind.valence)}',
+      '唤醒${_describeVaValueBand(arousal, kind: _VaValueKind.arousal)}',
+    ];
+    if (includeDominance && dominance != null) {
+      bits.add(
+          '掌控感${_describeVaValueBand(dominance, kind: _VaValueKind.dominance)}');
+    }
+    if (includeImageLabel) {
+      final imageLabel = summary['latest_emotion_label']?.toString().trim();
+      if (imageLabel != null && imageLabel.isNotEmpty) {
+        bits.add('表情标签=$imageLabel');
+      }
+    }
+    return bits.join('，');
+  }
+
+  String? _describeVaVisualCue(Map<String, dynamic>? image) {
+    if (image == null || image.isEmpty || image['available'] != true) {
+      return null;
+    }
+    final valence = _asDouble(image['valence']);
+    final arousal = _asDouble(image['arousal']);
+    final label = image['latest_emotion_label']?.toString().trim();
+    final normalizedLabel = (label ?? '').toLowerCase();
+
+    final smileLabel = _isVaPositiveVisualLabel(normalizedLabel);
+    final frownLabel = _isVaNegativeVisualLabel(normalizedLabel);
+    final positiveVisual = smileLabel || (valence ?? 0) >= 0.16;
+    final negativeVisual = frownLabel ||
+        (valence ?? 0) <= -0.16 ||
+        ((valence ?? 0) <= -0.08 && (arousal ?? 0) >= 0.45);
+    final highVisualArousal = (arousal ?? 0) >= 0.25;
+    final lowVisualArousal = (arousal ?? 0) <= -0.2;
+
+    if (positiveVisual) {
+      if (highVisualArousal) {
+        return '视觉状态提示=画面看起来偏轻松/带笑，而且能量不低；如果用户说烦或难过，回复要明显体现“嘴上说难受但表情有点撑着/带笑”的反差';
+      }
+      return '视觉状态提示=画面看起来偏轻松或带笑；如果用户说烦或难过，回复可以先轻轻点出“你是笑着说的欸，是在逗我，还是有点苦笑”';
+    }
+    if (negativeVisual && highVisualArousal) {
+      return '视觉状态提示=画面看起来不太放松，像有点皱眉/绷着；回复要把“看起来也有点紧”体现出来，不要只说听起来';
+    }
+    if (negativeVisual && lowVisualArousal) {
+      return '视觉状态提示=画面看起来偏低落或疲惫；回复要更轻一点，体现“看起来也有点累/没什么劲”';
+    }
+    if (negativeVisual) {
+      return '视觉状态提示=画面看起来不太轻松；回复中要体现视觉上的低落或紧绷，不要只根据语音判断';
+    }
+    if (highVisualArousal) {
+      return '视觉状态提示=画面激活程度偏高，可能有点紧或很专注；回复可以说“看起来也有点绷/有点顶着”';
+    }
+    if (lowVisualArousal) {
+      return '视觉状态提示=画面能量偏低；回复可以说“看起来有点累/慢下来也没关系”';
+    }
+    return '视觉状态提示=画面整体偏平静；若语音或文字很烦，回复可体现“看起来还在撑着/表面还算稳”';
+  }
+
+  bool _isVaPositiveVisualLabel(String label) {
+    return _vaLabelContainsAny(label, const [
+      'happy',
+      'happiness',
+      'joy',
+      'smile',
+      'laugh',
+      'positive',
+      '高兴',
+      '开心',
+      '愉快',
+      '微笑',
+      '笑',
+    ]);
+  }
+
+  bool _isVaNegativeVisualLabel(String label) {
+    return _vaLabelContainsAny(label, const [
+      'angry',
+      'anger',
+      'mad',
+      'frown',
+      'disgust',
+      'fear',
+      'sad',
+      'sadness',
+      'negative',
+      '皱眉',
+      '生气',
+      '愤怒',
+      '厌烦',
+      '害怕',
+      '悲伤',
+      '难过',
+      '低落',
+    ]);
+  }
+
+  bool _vaLabelContainsAny(String label, List<String> needles) {
+    if (label.isEmpty) return false;
+    return needles.any(label.contains);
+  }
+
+  String _describeVaValueBand(double? value, {required _VaValueKind kind}) {
+    if (value == null) return '未知';
+    switch (kind) {
+      case _VaValueKind.valence:
+        if (value >= 0.25) return '偏正向';
+        if (value <= -0.25) return '偏负向';
+        return '接近中性';
+      case _VaValueKind.arousal:
+        if (value >= 0.25) return '偏高/更激动';
+        if (value <= -0.2) return '偏低/更疲惫';
+        return '中等';
+      case _VaValueKind.dominance:
+        if (value >= 0.2) return '偏能撑住';
+        if (value <= -0.2) return '偏没底气';
+        return '中等';
+    }
+  }
+
+  String? _describeVaModalityContrast(
+    Map<String, dynamic>? audio,
+    Map<String, dynamic>? image,
+    Map<String, dynamic>? fusion,
+  ) {
+    if (audio == null || image == null) return null;
+    if (audio['available'] != true || image['available'] != true) return null;
+
+    final audioValence = _asDouble(audio['valence']);
+    final audioArousal = _asDouble(audio['arousal']);
+    final imageValence = _asDouble(image['valence']);
+    final imageArousal = _asDouble(image['arousal']);
+    final imageLabel = image['latest_emotion_label']?.toString().toLowerCase();
+    final fusionValence = _asDouble(fusion?['valence']);
+
+    final imagePositiveLabel = _isVaPositiveVisualLabel(imageLabel ?? '');
+    final imageNegativeLabel = _isVaNegativeVisualLabel(imageLabel ?? '');
+    final imageLooksPositive = imagePositiveLabel ||
+        (imageValence ?? 0) >= 0.16 ||
+        imageLabel == 'happy' ||
+        imageLabel == 'joy' ||
+        imageLabel == 'smile';
+    final imageLooksNegative = imageNegativeLabel ||
+        (imageValence ?? 0) <= -0.16 ||
+        ((imageValence ?? 0) <= -0.08 && (imageArousal ?? 0) >= 0.45);
+    final audioSoundsNegative = (audioValence ?? 0) <= -0.16;
+    final audioSoundsPositive = (audioValence ?? 0) >= 0.2;
+    final overallNegative =
+        audioSoundsNegative || (fusionValence ?? 0) <= -0.05;
+    final overallPositive = audioSoundsPositive || (fusionValence ?? 0) >= 0.18;
+    final valenceGap = (audioValence != null && imageValence != null)
+        ? (audioValence - imageValence).abs()
+        : 0.0;
+    final arousalGap = (audioArousal != null && imageArousal != null)
+        ? (audioArousal - imageArousal).abs()
+        : 0.0;
+
+    if ((imageLooksPositive && overallNegative) ||
+        (imageLooksNegative && overallPositive) ||
+        valenceGap >= 0.45 ||
+        arousalGap >= 0.75) {
+      if (imageLooksPositive &&
+          (audioSoundsNegative || (fusionValence ?? 0) <= 0)) {
+        return '一致性判断=语音/文本偏负向但画面偏笑或偏正向，可自然点出“你是笑着说难过/烦的，是在逗我，还是有点苦笑或硬撑呀”这类轻松确认';
+      }
+      if (imageLooksNegative && overallPositive) {
+        return '一致性判断=语音听起来还行但画面偏低落，可自然点出“你声音像在撑着，但看起来没那么轻松”';
+      }
+      return '一致性判断=语音和画面线索不完全一致，回复中要轻轻点出这种反差，并用一个温和问题确认';
+    }
+
+    if (imageLooksPositive && !audioSoundsNegative) {
+      return '一致性判断=画面状态相对轻松，可用略轻快的方式回应，但仍接住用户主诉';
+    }
+    if (imageLooksNegative || audioSoundsNegative) {
+      return '一致性判断=语音和画面整体偏不轻松，优先认真接住情绪';
+    }
+    return null;
+  }
+
   String? _summarizeVaTagsForCompanion(Object? fusionRaw) {
     final fusion = _asStringDynamicMap(fusionRaw);
     if (fusion == null || fusion.isEmpty) return null;
@@ -1977,12 +2372,21 @@ class ConversationController extends ChangeNotifier {
     return '可参考的状态标签：${mapped.join('、')}。';
   }
 
-  String? _buildVaPromptHintForCompanion(Object? fusionRaw) {
+  String? _buildVaPromptHintForCompanion(
+    Object? fusionRaw, {
+    Map<String, dynamic>? vaResult,
+  }) {
     final fusion = _asStringDynamicMap(fusionRaw);
-    if (fusion == null || fusion.isEmpty) return null;
+    final visualInstruction =
+        _buildVaVisualPromptInstruction(vaResult?['image_summary']);
+    if (fusion == null || fusion.isEmpty) {
+      if (visualInstruction == null || visualInstruction.isEmpty) return null;
+      return '$visualInstruction 禁止提“看不到表情/无法看到你”，禁止机械复述标签名。';
+    }
     final emotion = (fusion['emotion'] ?? '').toString().trim();
     final valence = _asDouble(fusion['valence']);
     final arousal = _asDouble(fusion['arousal']);
+    final dominance = _asDouble(fusion['dominance']);
     final tags = (fusion['va_tags'] is List)
         ? List<String>.from(
             (fusion['va_tags'] as List).map((e) => e.toString()))
@@ -1990,7 +2394,17 @@ class ConversationController extends ChangeNotifier {
 
     final state = _describeVaState(emotion, valence, arousal, tags);
     final advice = _buildCompanionReplyAdvice(emotion, valence, arousal, tags);
-    return '请把用户理解为：$state。回复时先做柔和观察，再做共情安抚；$advice 禁止提“看不到表情/无法看到你”，禁止机械复述标签名。';
+    final arousalContrast = _buildVaArousalContrastInstruction(
+      valence,
+      arousal,
+      dominance,
+      tags,
+    );
+    final modalityContrast = _buildVaModalityPromptInstruction(vaResult);
+    final visualPart = visualInstruction == null || visualInstruction.isEmpty
+        ? ''
+        : '$visualInstruction ';
+    return '请把用户理解为：$state。回复时先做柔和观察，再做共情安抚；$advice $arousalContrast $visualPart$modalityContrast 禁止提“看不到表情/无法看到你”，禁止机械复述标签名。';
   }
 
   String _describeVaState(
@@ -1999,26 +2413,32 @@ class ConversationController extends ChangeNotifier {
     double? arousal,
     List<String> tags,
   ) {
-    if (emotion == 'tense_negative' ||
-        tags.contains('negative_valence') && tags.contains('high_arousal')) {
-      return '偏紧张、心里压着事，像是在硬撑';
+    final highArousal = tags.contains('high_arousal') || (arousal ?? 0) >= 0.25;
+    final lowArousal = tags.contains('low_arousal') || (arousal ?? 0) <= -0.2;
+    final negative = emotion == 'tense_negative' ||
+        tags.contains('negative_valence') ||
+        (valence ?? 0) <= -0.15;
+    final positive = tags.contains('positive_valence') || (valence ?? 0) > 0.2;
+
+    if (highArousal && negative) {
+      return '烦躁感偏强，像是有点急、有点绷，心里压着事';
     }
-    if (tags.contains('negative_valence') && tags.contains('low_arousal')) {
-      return '偏疲惫、低落，像是有点提不起劲';
+    if (lowArousal && negative) {
+      return '烦躁下面更像疲惫和低落，像是有点提不起劲';
     }
-    if (tags.contains('positive_valence') && tags.contains('low_arousal')) {
+    if (positive && lowArousal) {
       return '整体比较平稳，情绪不算糟，但也偏安静';
     }
+    if (highArousal) {
+      return '语气/状态偏紧，像是有点被事情顶住了';
+    }
+    if (lowArousal) {
+      return '状态偏慢偏累，需要轻声接住';
+    }
     if (emotion == 'neutral' || tags.contains('neutral')) {
-      return '整体比较平静，但可能有些没说出来的心事';
+      return '表面比较平静，但可能有些没说出来的心事';
     }
-    if ((valence ?? 0) < -0.2 && (arousal ?? 0) > 0.2) {
-      return '情绪偏紧、偏烦，内心不太放松';
-    }
-    if ((valence ?? 0) < -0.2 && (arousal ?? 0) <= 0.2) {
-      return '情绪偏低，像是累了或者有点没精神';
-    }
-    if ((valence ?? 0) > 0.2) {
+    if (positive) {
       return '状态还算稳，没有明显低落';
     }
     return '状态总体平稳，但值得用温和方式继续确认感受';
@@ -2056,20 +2476,80 @@ class ConversationController extends ChangeNotifier {
     double? arousal,
     List<String> tags,
   ) {
-    if (emotion == 'tense_negative' ||
-        tags.contains('negative_valence') && tags.contains('high_arousal')) {
-      return '更适合先接住紧张和不安，再给一句“慢慢来/先缓一口气也行”这类低压力安抚；';
+    final highArousal = tags.contains('high_arousal') || (arousal ?? 0) >= 0.25;
+    final lowArousal = tags.contains('low_arousal') || (arousal ?? 0) <= -0.2;
+    final negative = emotion == 'tense_negative' ||
+        tags.contains('negative_valence') ||
+        (valence ?? 0) <= -0.15;
+
+    if (highArousal && negative) {
+      return '更适合先点出“有点急/有点绷/烦躁顶上来”，再用短句帮用户降速；';
     }
-    if (tags.contains('negative_valence') && tags.contains('low_arousal')) {
-      return '更适合先承认“你可能有点累了”，再允许休息，给很轻的照顾建议；';
+    if (lowArousal && negative) {
+      return '更适合先点出“烦下面有点累/提不起劲”，再允许休息，给很轻的照顾建议；';
+    }
+    if (highArousal) {
+      return '更适合先说“听起来有点绷/节奏有点急”，再帮助放缓，不要输出建议清单；';
+    }
+    if (lowArousal) {
+      return '更适合轻声接住疲惫感，少追问，少催促；';
     }
     if (emotion == 'neutral' || tags.contains('neutral')) {
-      return '更适合用“看起来还算平静，但像是有点心事”这类保守观察，不要夸大；';
+      return '更适合用“表面还算平静，但像是有点心事/有点在撑着”这类保守观察，不要夸大；';
     }
     if ((valence ?? 0) > 0.2 && (arousal ?? 0) < 0.2) {
       return '更适合说状态总体还稳，但仍认真接住用户主诉，不要只报喜；';
     }
     return '更适合先观察、再陪伴、最后轻轻追问，不要一上来就给很多建议；';
+  }
+
+  String _buildVaArousalContrastInstruction(
+    double? valence,
+    double? arousal,
+    double? dominance,
+    List<String> tags,
+  ) {
+    final highArousal = tags.contains('high_arousal') || (arousal ?? 0) >= 0.25;
+    final lowArousal = tags.contains('low_arousal') || (arousal ?? 0) <= -0.2;
+    final negative =
+        tags.contains('negative_valence') || (valence ?? 0) <= -0.15;
+    final lowDominance =
+        tags.contains('low_dominance') || (dominance ?? 0) <= -0.2;
+
+    if (highArousal && negative) {
+      return '本轮必须体现“高唤醒烦躁”和普通烦的区别：第一句用“听起来有点急/绷/烦躁顶上来”一类自然观察，句子短一点，先降速，不要立刻讲大道理。';
+    }
+    if (lowArousal && negative) {
+      return '本轮必须体现“低唤醒疲惫”和普通烦的区别：第一句用“听起来烦下面还有点累/没劲”一类自然观察，语气更轻，不要催用户振作。';
+    }
+    if (highArousal) {
+      return '本轮要明显体现高唤醒：回复节奏更短、更稳，先帮助用户慢下来。';
+    }
+    if (lowArousal || lowDominance) {
+      return '本轮要明显体现低能量/低掌控感：回复更轻、更少压迫，先允许用户不用马上解决。';
+    }
+    return '若用户文本表达了烦躁，即使 VA 较中性，也要在第一句承认烦躁感，再用“表面还算稳/可能有点在撑着”作保守观察。';
+  }
+
+  String _buildVaModalityPromptInstruction(Map<String, dynamic>? vaResult) {
+    final audio = _asStringDynamicMap(vaResult?['audio_summary']);
+    final image = _asStringDynamicMap(vaResult?['image_summary']);
+    final contrast = _describeVaModalityContrast(
+      audio,
+      image,
+      _asStringDynamicMap(vaResult?['fusion_summary']),
+    );
+    if (contrast == null || contrast.isEmpty) {
+      return '若语音与画面都可用，回复时同时参考两者；同一句“我好烦”在笑着说和皱眉说时，开头必须不一样，不要只看语音。';
+    }
+    return '多模态反差很重要：$contrast。若用户文字情绪和画面表情相反，第一句要自然点出反差，可以带一点轻松感，但不要嘲笑用户。';
+  }
+
+  String? _buildVaVisualPromptInstruction(Object? imageRaw) {
+    final image = _asStringDynamicMap(imageRaw);
+    final cue = _describeVaVisualCue(image);
+    if (cue == null || cue.isEmpty) return null;
+    return '视觉 VA 必须进入回复：$cue。若用户问心情或表达烦/难过，第一句必须先体现画面状态，再补语音状态；画面偏笑就点出“笑着说/有点苦笑”，画面偏皱眉或紧绷就点出“看起来也有点绷/不太轻松”。禁止只用“听起来”开头。';
   }
 
   String _translateVaTagToChinese(String tag) {

@@ -1,11 +1,9 @@
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:voicegpt/core/models/login_result.dart';
-import 'package:voicegpt/core/storage/preference_manager.dart';
+import 'package:voicegpt/core/storage/app_database.dart';
 
 /// 用户状态管理通知器
-/// 负责登录/注册/会话恢复与私人智能体配置所需的用户 ID
+/// 负责数据库登录/注册/会话恢复与私人智能体配置所需的用户 ID
 class UserNotifier with ChangeNotifier {
   User? _currentUser;
   bool _isLoading = false;
@@ -17,84 +15,49 @@ class UserNotifier with ChangeNotifier {
   String? get errorMessage => _errorMessage;
   bool get isLoggedIn => _currentUser != null;
 
-  /// 登录方法（本地模拟登录）
   Future<LoginResult> login(String username, String password) async {
     _isLoading = true;
     _errorMessage = null;
     notifyListeners();
 
     try {
-      await Future.delayed(const Duration(milliseconds: 700));
-
-      if (username.trim().isEmpty || password.isEmpty) {
+      final result = await AppDatabase.instance.login(username, password);
+      if (!result.success || result.user == null) {
         _isLoading = false;
-        _errorMessage = '请输入用户名和密码';
+        _errorMessage = _messageForLoginError(result.errorCode);
         notifyListeners();
-        return LoginResult(
-          success: false,
-          errorCode: 'invalid-input',
-        );
+        return result;
       }
 
-      final normalizedUsername = username.trim();
-      final bool isEmail = normalizedUsername.contains('@');
-      final localUserId = isEmail
-          ? 'local_email_${normalizedUsername.toLowerCase()}'
-          : 'local_name_${normalizedUsername.toLowerCase()}';
-
-      final user = User(
-        id: localUserId,
-        username: normalizedUsername,
-        email: isEmail
-            ? normalizedUsername
-            : '${normalizedUsername}_local@example.com',
-        isFirstLogin: true,
-      );
-
-      _currentUser = user;
+      _currentUser = result.user;
       _isLoading = false;
       _errorMessage = null;
       notifyListeners();
-
-      final prefs = PreferenceManager();
-      await prefs.setUserId(user.id);
-      await prefs.setAuthUser(jsonEncode(user.toJson()));
-
-      return LoginResult(success: true, user: user);
+      return result;
     } catch (e) {
       _isLoading = false;
       _errorMessage = '登录失败: $e';
       notifyListeners();
-      return LoginResult(success: false, errorCode: 'network-error');
+      return LoginResult(success: false, errorCode: 'database-error');
     }
   }
 
-  /// 注册方法（本地模拟注册）
   Future<bool> register(String username, String email, String password) async {
     _isLoading = true;
     _errorMessage = null;
     notifyListeners();
 
     try {
-      await Future.delayed(const Duration(milliseconds: 700));
-
-      if (username.trim().isEmpty || email.trim().isEmpty || password.isEmpty) {
-        _isLoading = false;
-        _errorMessage = '请填写完整信息';
-        notifyListeners();
-        return false;
-      }
-      if (password.length < 6) {
-        _isLoading = false;
-        _errorMessage = '密码至少需要6位';
-        notifyListeners();
-        return false;
-      }
-
+      final result = await AppDatabase.instance.register(
+        username: username,
+        email: email,
+        password: password,
+      );
       _isLoading = false;
-      _errorMessage = null;
+      _errorMessage =
+          result.success ? null : _messageForRegisterError(result.errorCode);
       notifyListeners();
-      return true;
+      return result.success;
     } catch (e) {
       _isLoading = false;
       _errorMessage = '注册失败: $e';
@@ -103,7 +66,6 @@ class UserNotifier with ChangeNotifier {
     }
   }
 
-  /// 完成首次设置（本地标记）
   Future<bool> completeFirstTimeSetup() async {
     if (_currentUser == null) return false;
 
@@ -112,17 +74,12 @@ class UserNotifier with ChangeNotifier {
     notifyListeners();
 
     try {
-      await Future.delayed(const Duration(milliseconds: 500));
-
+      await AppDatabase.instance.updateFirstLogin(_currentUser!.id, false);
       _currentUser = User(
         id: _currentUser!.id,
         username: _currentUser!.username,
         email: _currentUser!.email,
         isFirstLogin: false,
-      );
-
-      await PreferenceManager().setAuthUser(
-        jsonEncode(_currentUser!.toJson()),
       );
 
       _isLoading = false;
@@ -137,45 +94,57 @@ class UserNotifier with ChangeNotifier {
     }
   }
 
-  /// 登出
   Future<void> logout() async {
     _currentUser = null;
     _errorMessage = null;
     _isLoading = false;
     notifyListeners();
 
-    final prefs = PreferenceManager();
-    await prefs.clearAuthUser();
-    await prefs.setUserId('');
+    await AppDatabase.instance.setActiveUser(null);
   }
 
-  /// 从本地恢复会话（只执行一次）
   Future<void> restoreSession() async {
     if (_hasRestored) return;
     _hasRestored = true;
 
-    final prefs = PreferenceManager();
-    final stored = prefs.getAuthUser();
-    if (stored.isEmpty) return;
-
     try {
-      final jsonMap = jsonDecode(stored) as Map<String, dynamic>;
-      final user = User.fromJson(jsonMap);
-      _currentUser = user;
-
-      final currentUserId = prefs.getUserId();
-      if (currentUserId.trim().isEmpty || currentUserId.trim() != user.id) {
-        await prefs.setUserId(user.id);
-      }
-
-      notifyListeners();
-    } catch (_) {
-      // 忽略解析失败
-    }
+      _currentUser = await AppDatabase.instance.getActiveUser();
+      if (_currentUser != null) notifyListeners();
+    } catch (_) {}
   }
 
   void clearError() {
     _errorMessage = null;
     notifyListeners();
+  }
+
+  String _messageForLoginError(String? code) {
+    switch (code) {
+      case 'invalid-input':
+        return '请输入用户名/邮箱和密码';
+      case 'user-not-found':
+        return '账号不存在，请先注册';
+      case 'wrong-password':
+        return '密码不正确';
+      default:
+        return '登录失败';
+    }
+  }
+
+  String _messageForRegisterError(String? code) {
+    switch (code) {
+      case 'invalid-input':
+        return '请填写完整信息';
+      case 'invalid-email':
+        return '邮箱格式不正确';
+      case 'weak-password':
+        return '密码至少需要6位';
+      case 'username-already-in-use':
+        return '用户名已被注册';
+      case 'email-already-in-use':
+        return '邮箱已被注册';
+      default:
+        return '注册失败';
+    }
   }
 }

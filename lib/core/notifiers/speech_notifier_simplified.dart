@@ -90,9 +90,14 @@ class SpeechNotifierSimplified with ChangeNotifier {
   VaPcmRecorder? _vaPcmRecorder;
   bool _listeningViaQwen = false;
   bool _listeningViaVosk = false;
+  bool _isVaRecognitionActive = false;
+  Timer? _vaRecognitionDisplayTimer;
+  DateTime? _vaRecognitionDisplayStartedAt;
   bool _isListening = false;
   bool _isStartingVoiceRecognition = false;
   final String _voskAssetDir = "assets/cn/vosk-model-small-cn-0.22/";
+
+  static const Duration _vaRecognitionMinDisplayDuration = Duration(seconds: 5);
 
   static const List<String> _vaVisionKeywords = <String>[
     '心情',
@@ -142,6 +147,46 @@ class SpeechNotifierSimplified with ChangeNotifier {
     }
   }
 
+  List<Uint8List> _snapshotPendingVaAudioChunks() {
+    return _pendingVaAudioChunks
+        .map((chunk) => Uint8List.fromList(chunk))
+        .toList(growable: false);
+  }
+
+  void _showVaRecognitionDisplay() {
+    _vaRecognitionDisplayTimer?.cancel();
+    _vaRecognitionDisplayTimer = null;
+    _vaRecognitionDisplayStartedAt = DateTime.now();
+    if (_isVaRecognitionActive) return;
+    _isVaRecognitionActive = true;
+    notifyListeners();
+  }
+
+  void _hideVaRecognitionDisplayAfterMinimum() {
+    final startedAt = _vaRecognitionDisplayStartedAt;
+    final elapsed = startedAt == null
+        ? _vaRecognitionMinDisplayDuration
+        : DateTime.now().difference(startedAt);
+    final remaining = _vaRecognitionMinDisplayDuration - elapsed;
+    _vaRecognitionDisplayTimer?.cancel();
+    if (remaining <= Duration.zero) {
+      _vaRecognitionDisplayTimer = null;
+      _vaRecognitionDisplayStartedAt = null;
+      if (!_isVaRecognitionActive) return;
+      _isVaRecognitionActive = false;
+      notifyListeners();
+      return;
+    }
+
+    _vaRecognitionDisplayTimer = Timer(remaining, () {
+      _vaRecognitionDisplayTimer = null;
+      _vaRecognitionDisplayStartedAt = null;
+      if (!_isVaRecognitionActive) return;
+      _isVaRecognitionActive = false;
+      notifyListeners();
+    });
+  }
+
   List<Uint8List> _coalescePendingVaAudioChunks(
     List<Uint8List> chunks, {
     int targetBytes = 128000,
@@ -167,6 +212,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
   Future<Map<String, dynamic>?> _runDeferredVaIfNeeded(
     String text,
     RouterDecision routerDecision,
+    List<Uint8List>? audioChunks,
   ) async {
     if (routerDecision.scene != RouterScene.companion) {
       print('ℹ️ [VA] Router 未命中 Companion，跳过 VA');
@@ -176,16 +222,20 @@ class SpeechNotifierSimplified with ChangeNotifier {
     print('💞 [VA] Router 命中 Companion，开始补跑当前轮 VA');
     final manager = _vaSessionManager ?? VaSessionManager();
     _vaSessionManager = manager;
+    _showVaRecognitionDisplay();
     try {
       final vaSid = await manager.startSession();
       if (vaSid == null) {
         print('ℹ️ [VA] 延后启动失败，当前轮降级为仅文本陪伴');
         return null;
       }
-      final mergedChunks = _coalescePendingVaAudioChunks(_pendingVaAudioChunks);
+      final rawAudioChunks = audioChunks ?? _pendingVaAudioChunks;
+      final rawAudioBytes =
+          rawAudioChunks.fold<int>(0, (sum, chunk) => sum + chunk.length);
+      final mergedChunks = _coalescePendingVaAudioChunks(rawAudioChunks);
       print(
-        '🎧 [VA] 回放当前轮音频 rawChunks=${_pendingVaAudioChunks.length} '
-        'mergedChunks=${mergedChunks.length} sid=$vaSid',
+        '🎧 [VA] 回放当前轮音频 rawChunks=${rawAudioChunks.length} '
+        'rawBytes=$rawAudioBytes mergedChunks=${mergedChunks.length} sid=$vaSid',
       );
       for (final chunk in mergedChunks) {
         await manager.sendAudioChunk(chunk);
@@ -212,6 +262,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
       if (identical(_vaSessionManager, manager)) {
         _vaSessionManager = null;
       }
+      _hideVaRecognitionDisplayAfterMinimum();
     }
   }
 
@@ -222,6 +273,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
   bool get isTtsPlaying => _conversationController.isTtsPlaying;
   bool get isWakeUpActive => _isWakeUpActive;
   bool get isListening => _isListening;
+  bool get isVaRecognitionActive => _isVaRecognitionActive;
 
   /// 连续对话里 TTS 结束后拉起主 ASR 的短窗口：此时 isListening 仍为 false，但不应显示「思考中/已暂停」。
   bool get isStartingVoiceRecognition => _isStartingVoiceRecognition;
@@ -549,7 +601,12 @@ class SpeechNotifierSimplified with ChangeNotifier {
           _duplexTtsBargeInEnabled = false;
           notifyListeners();
           if (s.isNotEmpty) {
-            unawaited(_handleFinalizedUserSpeech(s, pcmSnap: pcmSnap));
+            final vaAudioChunks = _snapshotPendingVaAudioChunks();
+            unawaited(_handleFinalizedUserSpeech(
+              s,
+              pcmSnap: pcmSnap,
+              vaAudioChunks: vaAudioChunks,
+            ));
           } else if (!_multiPersonPushToTalkMode) {
             _scheduleRestartAsrIfConversationIdle();
           }
@@ -670,6 +727,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
     Float32List? pcmSnap,
     Map<String, dynamic>? vaResult,
     RouterDecision? precomputedRouterDecision,
+    List<Uint8List>? vaAudioChunks,
   }) async {
     final s = input.trim();
     if (s.isEmpty) return;
@@ -739,7 +797,11 @@ class SpeechNotifierSimplified with ChangeNotifier {
           await _conversationController.previewRouterDecision(s);
       print('🧭 [Router][ASR后预判] ${nextRouterDecision.rawJson}');
     }
-    nextVaResult ??= await _runDeferredVaIfNeeded(s, nextRouterDecision);
+    nextVaResult ??= await _runDeferredVaIfNeeded(
+      s,
+      nextRouterDecision,
+      vaAudioChunks,
+    );
 
     await _processUserInput(
       s,
@@ -1619,6 +1681,9 @@ class SpeechNotifierSimplified with ChangeNotifier {
     _cancelIdleEnvironmentMonitoring();
     _postConversationTimer?.cancel();
     _wakeWordHealthCheck?.cancel();
+    _vaRecognitionDisplayTimer?.cancel();
+    _vaRecognitionDisplayTimer = null;
+    _vaRecognitionDisplayStartedAt = null;
 
     await _sherpaKws?.stop();
     _sherpaKws = null;
@@ -1653,6 +1718,10 @@ class SpeechNotifierSimplified with ChangeNotifier {
     _duplexTtsBargeInEnabled = false;
     _cancelIdleEnvironmentMonitoring();
     _postConversationTimer?.cancel();
+    _vaRecognitionDisplayTimer?.cancel();
+    _vaRecognitionDisplayTimer = null;
+    _vaRecognitionDisplayStartedAt = null;
+    _isVaRecognitionActive = false;
     await _qwenAsrRecorder?.stopWithoutSubmit();
     _qwenAsrRecorder = null;
     await _vaPcmRecorder?.stop(flushRemainder: false);
@@ -1760,7 +1829,12 @@ class SpeechNotifierSimplified with ChangeNotifier {
               _isListening = false;
               notifyListeners();
               if (s.isNotEmpty) {
-                unawaited(_handleFinalizedUserSpeech(s, pcmSnap: pcmSnap));
+                final vaAudioChunks = _snapshotPendingVaAudioChunks();
+                unawaited(_handleFinalizedUserSpeech(
+                  s,
+                  pcmSnap: pcmSnap,
+                  vaAudioChunks: vaAudioChunks,
+                ));
               } else {
                 _scheduleRestartAsrIfConversationIdle();
               }
@@ -1955,14 +2029,20 @@ class SpeechNotifierSimplified with ChangeNotifier {
             _vaSessionManager!.beginSpeechWindowImageBuffering();
             Map<String, dynamic>? vaResult;
             RouterDecision? routerDecision;
+            List<Uint8List>? vaAudioChunks;
             if (_listeningViaVosk) {
               try {
                 await _vaPcmRecorder?.stop(flushRemainder: true);
                 _vaPcmRecorder = null;
+                vaAudioChunks = _snapshotPendingVaAudioChunks();
                 routerDecision =
                     await _conversationController.previewRouterDecision(text);
                 print('🧭 [Router][VOSK后预判] ${routerDecision.rawJson}');
-                vaResult = await _runDeferredVaIfNeeded(text, routerDecision);
+                vaResult = await _runDeferredVaIfNeeded(
+                  text,
+                  routerDecision,
+                  vaAudioChunks,
+                );
               } catch (e, st) {
                 print('❌ [VA][VOSK] 延后补跑异常: $e\n$st');
               } finally {
@@ -1974,6 +2054,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
               text,
               vaResult: vaResult,
               precomputedRouterDecision: routerDecision,
+              vaAudioChunks: vaAudioChunks,
             );
           }
         } catch (e, st) {

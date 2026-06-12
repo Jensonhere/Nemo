@@ -26,10 +26,12 @@ dependencies:
   tflite_flutter: ^0.10.4
   image: ^4.0.17
   permission_handler: ^10.4.5
-  wakelock_plus: ^1.1.6
+  wakelock_plus: ^1.1.4
   just_audio: ^0.9.37
   audioplayers: ^1.1.1
   shared_preferences: ^2.2.2
+  sqflite: ^2.3.2
+  sqflite_common_ffi: 2.3.0
   geolocator: ^11.1.0
   sherpa_onnx:
     path: packages/sherpa_onnx

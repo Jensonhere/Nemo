@@ -99,6 +99,9 @@ class TextQAModule {
       final merged = ConversationContextPack(
         recentTurnLines: pack.recentTurnLines,
         userEmotionFromVa: pack.userEmotionFromVa,
+        vaValuesSummary: pack.vaValuesSummary,
+        vaTagsSummary: pack.vaTagsSummary,
+        vaPromptHint: pack.vaPromptHint,
         deviceStateLine: pack.deviceStateLine,
         environmentSummary: pack.environmentSummary,
         deviceContextBlock: pack.deviceContextBlock ?? deviceBlock,
@@ -233,6 +236,9 @@ class TextQAModule {
       final merged = ConversationContextPack(
         recentTurnLines: pack.recentTurnLines,
         userEmotionFromVa: pack.userEmotionFromVa,
+        vaValuesSummary: pack.vaValuesSummary,
+        vaTagsSummary: pack.vaTagsSummary,
+        vaPromptHint: pack.vaPromptHint,
         deviceStateLine: pack.deviceStateLine,
         environmentSummary: pack.environmentSummary,
         deviceContextBlock: pack.deviceContextBlock ?? deviceBlock,

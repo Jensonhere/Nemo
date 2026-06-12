@@ -33,3 +33,7 @@ doc/api/
 assets/sherpa_tts/
 assets/cn/
 assets/models/
+
+# Local research notes / generated docs
+docs/
+research_experiment_discussion_2026_06_03/
