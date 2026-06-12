@@ -72,6 +72,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
   Timer? _idleTimer; // 10秒空闲计时器
   Timer? _postConversationTimer; // 退出对话后120秒计时器
   Timer? _wakeWordHealthCheck; // 唤醒词健康检查计时器
+  bool _idleTimerScheduled = false;
 
   // === 手势识别 ===
   bool _isGestureRecognitionActive = false;
@@ -386,20 +387,20 @@ class SpeechNotifierSimplified with ChangeNotifier {
         '🔐 声纹本地状态: ${_ownerVoiceprintEnrolled ? "已注册" : "未注册"}',
       );
 
-      // 只有唤醒词成功时才启动时间控制
+      // 健康检查需要常驻：初始 KWS 失败时也负责后续重试和恢复空闲计时器。
+      print("💓 第四步：启动唤醒词健康检查");
+      _startWakeWordHealthCheck();
+
+      // 只有唤醒词成功时才启动空闲监测；失败时等待健康检查重启成功后再补挂。
       if (wakeWordSuccess) {
         // 启动10秒空闲监测
-        print("⏰ 第四步：启动10秒空闲监测");
-        _startIdleTimer();
-
-        // 启动唤醒词健康检查（每5秒检查一次）
-        print("💓 第五步：启动唤醒词健康检查");
-        _startWakeWordHealthCheck();
+        print("⏰ 第五步：启动10秒空闲监测");
+        _scheduleIdleEnvironmentMonitoring(reason: 'initialize');
 
         print("✅ 简化版语音通知器初始化完成（唤醒词正常）");
       } else {
         print("⚠️ 简化版语音通知器初始化完成（唤醒词功能受限）");
-        print("💡 应用可以使用，但无法通过语音唤醒");
+        print("💡 将通过健康检查继续尝试恢复唤醒词，恢复后再启动空闲环境监测");
       }
     } catch (e) {
       print("❌ 其他模块初始化失败: $e");
@@ -1293,7 +1294,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
       return;
     }
 
-    _idleTimer?.cancel();
+    _cancelIdleEnvironmentMonitoring();
     _postConversationTimer?.cancel();
     await _stopEnvironmentMonitoring();
 
@@ -1327,7 +1328,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
 
     final wakeSw = Stopwatch()..start();
 
-    _idleTimer?.cancel();
+    _cancelIdleEnvironmentMonitoring();
     _postConversationTimer?.cancel();
     await _stopEnvironmentMonitoring();
     print('⏱️ [Pipeline][Wake] 停环境监测 ${wakeSw.elapsedMilliseconds}ms');
@@ -1385,21 +1386,61 @@ class SpeechNotifierSimplified with ChangeNotifier {
   }
 
   /// 启动10秒空闲监测
-  void _startIdleTimer() {
+  void _scheduleIdleEnvironmentMonitoring({required String reason}) {
+    if (!DebugRuntimeFlags.enableEnvironmentMonitoring) {
+      print(
+        '════════ 空闲环境监测未启动（DebugRuntimeFlags.enableEnvironmentMonitoring=false）════════',
+      );
+      return;
+    }
+    if (_conversationController.isEnvironmentMonitoring) {
+      print("⏰ 空闲环境监测计时器跳过：环境监测已运行 reason=$reason");
+      return;
+    }
+    if (isInConversationMode) {
+      print("⏰ 空闲环境监测计时器跳过：连续对话中 reason=$reason");
+      return;
+    }
+    if (_isListening || _isStartingVoiceRecognition || _pttRecordingActive) {
+      print(
+        "⏰ 空闲环境监测计时器跳过：主麦/按住说话占用中 reason=$reason "
+        "listening=$_isListening starting=$_isStartingVoiceRecognition ptt=$_pttRecordingActive",
+      );
+      return;
+    }
+    if (_idleTimerScheduled && _idleTimer?.isActive == true) {
+      print("⏰ 10秒空闲计时器已在运行，跳过重复启动 reason=$reason");
+      return;
+    }
+    _startIdleTimer(reason: reason);
+  }
+
+  void _cancelIdleEnvironmentMonitoring() {
     _idleTimer?.cancel();
-    _idleTimer = Timer(Duration(seconds: 10), () {
+    _idleTimer = null;
+    _idleTimerScheduled = false;
+  }
+
+  void _startIdleTimer({required String reason}) {
+    _cancelIdleEnvironmentMonitoring();
+    _idleTimerScheduled = true;
+    _idleTimer = Timer(const Duration(seconds: 10), () {
+      _idleTimer = null;
+      _idleTimerScheduled = false;
       if (!isInConversationMode) {
-        print("⏰ 10秒无唤醒词活动，启动环境监测");
+        print("⏰ 10秒无唤醒词活动，启动环境监测 reason=$reason");
         _startEnvironmentMonitoring();
+      } else {
+        print("⏰ 10秒空闲计时器触发时仍在连续对话中，跳过环境监测 reason=$reason");
       }
     });
-    print("⏰ 10秒空闲计时器已启动");
+    print("⏰ 10秒空闲计时器已启动 reason=$reason");
   }
 
   /// 启动退出对话后120秒监测
   void _startPostConversationTimer() {
     _postConversationTimer?.cancel();
-    _postConversationTimer = Timer(Duration(seconds: 120), () {
+    _postConversationTimer = Timer(const Duration(seconds: 120), () {
       if (!isInConversationMode) {
         print("⏰ 退出对话120秒后，启动环境监测");
         _startEnvironmentMonitoring();
@@ -1440,6 +1481,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
     print("🎤 确认：唤醒词检测状态 = $_isWakeUpActive");
 
     // 使用异步启动，不阻塞唤醒词检测
+    _cancelIdleEnvironmentMonitoring();
     _conversationController.startEnvironmentMonitoring();
 
     notifyListeners();
@@ -1447,8 +1489,6 @@ class SpeechNotifierSimplified with ChangeNotifier {
 
   /// 停止环境监测
   Future<void> _stopEnvironmentMonitoring() async {
-    _idleTimer?.cancel();
-    _postConversationTimer?.cancel();
     _conversationController.stopEnvironmentMonitoring();
     print("🛑 环境监测已停止");
     notifyListeners();
@@ -1510,7 +1550,8 @@ class SpeechNotifierSimplified with ChangeNotifier {
     _wakeWordHealthCheck?.cancel();
     int consecutiveFailures = 0; // 连续失败计数
 
-    _wakeWordHealthCheck = Timer.periodic(Duration(seconds: 5), (timer) async {
+    _wakeWordHealthCheck =
+        Timer.periodic(const Duration(seconds: 5), (timer) async {
       // 检查唤醒词检测状态
       if (_sherpaKws == null || !_isWakeUpActive) {
         consecutiveFailures++;
@@ -1527,6 +1568,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
       } else {
         consecutiveFailures = 0; // 重置失败计数
         print("💓 【健康检查】唤醒词检测正常运行");
+        _scheduleIdleEnvironmentMonitoring(reason: 'wake_health_ok');
       }
     });
     print("✅ 唤醒词健康检查已启动（每5秒检查一次）");
@@ -1551,6 +1593,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
       // 只有在真正成功时才打印成功日志
       if (_isWakeUpActive) {
         print("✅ 唤醒词检测重启成功");
+        _scheduleIdleEnvironmentMonitoring(reason: 'wake_restart_ok');
       }
     } catch (e) {
       print("❌ 重启唤醒词检测失败");
@@ -1573,7 +1616,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
 
     _duplexTtsBargeInEnabled = false;
     // 取消所有计时器
-    _idleTimer?.cancel();
+    _cancelIdleEnvironmentMonitoring();
     _postConversationTimer?.cancel();
     _wakeWordHealthCheck?.cancel();
 
@@ -1608,7 +1651,7 @@ class SpeechNotifierSimplified with ChangeNotifier {
   /// 强制停止所有活动
   Future<void> forceStop() async {
     _duplexTtsBargeInEnabled = false;
-    _idleTimer?.cancel();
+    _cancelIdleEnvironmentMonitoring();
     _postConversationTimer?.cancel();
     await _qwenAsrRecorder?.stopWithoutSubmit();
     _qwenAsrRecorder = null;
