@@ -1,15 +1,4 @@
 n ǐ h ǎo x iǎo h áng @你好小航
-n ǐ h ǎo x iǎo h áng a @你好小航
-n i h ao x iao h ang @你好小航
-n i h ao x iao h ang a @你好小航
-n í h ǎo x iǎo h áng @你好小航
-n ǐ h ao x iǎo h áng @你好小航
-n ǐ h ǎo x iao h áng @你好小航
-n ǐ h ǎo x iǎo h án @你好小航
-n i h ao x iao h an @你好小航
-n i o x iao h ang @你好小航
-n i o x iao h an @你好小航
-n i o x iao h ang a @你好小航
 t íng y ī x ià :1.0 #0.32 @停一下
 d ěng y ī x ià :1.0 #0.32 @等一下
 b ié sh uō l e :1.0 #0.32 @别说了
