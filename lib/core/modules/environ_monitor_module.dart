@@ -14,6 +14,15 @@ enum SnapshotTargetType {
   person,
 }
 
+enum EnvV1ObjectPolicy {
+  officeInteractable,
+  toyLike,
+  largeBackground,
+  officeImpossible,
+  officeAnimal,
+  unknown,
+}
+
 class SnapshotAlignStatus {
   SnapshotAlignStatus._();
 
@@ -117,14 +126,19 @@ class EnvironMonitorModule {
   static const int _objectProbeDefaultForwardMmV1 = 60;
   static const int _objectProbeForwardMmV1 = _objectProbeDefaultForwardMmV1;
   static const int _objectProbeSettleMsV1 = 300;
-  static const int _objectFoundPauseMsV1 = 2000;
-  static const int _objectProbeMaxCountV1 = 3;
-  static const bool _enableObjectMicroApproachOnFoundV1 = true;
+  static const int _objectFoundPauseBeforeSpeechMsV1 = 500;
+  static const int _objectFoundPauseAfterSpeechMsV1 = 1500;
+  static const int _objectLookProbeCountV1 = 2;
+  static const int _objectProbeMaxCountV1 = _objectLookProbeCountV1;
+  static const int _objectGenericSpeechMaxPerSessionV1 = 1;
+  static const int _objectSpecificSpeechMaxPerSessionV1 = 2;
+  static const int _objectPerProbeMaxSpeechCountV1 = 1;
+  static const bool _enableObjectMicroApproachOnFoundV1 = false;
   static const int _objectMicroApproachMmV1 = 25;
   static const int _objectMicroApproachMaxMmV1 = 30;
   static const int _objectMicroApproachSettleMsV1 = 300;
-  static const int _frontCliffBtAutoBackoffMmV1 = 30;
-  static const int _frontCliffSupplementalBackoffMmV1 = 30;
+  static const int _frontCliffBtAutoBackoffMmV1 =
+      MyBluetoothService.kFrontSafetyRecoverDistanceMm;
   static const int _frontCliffSupplementalBackoffLargeMmV1 = 50;
   static const int _frontCliffBackoffMmV1 =
       _frontCliffSupplementalBackoffLargeMmV1;
@@ -132,7 +146,10 @@ class EnvironMonitorModule {
   static const int _frontCliffResumeTurnCapDegV1 = 8;
   static const int _frontCliffResumeTurnMinDegV1 = 3;
   static const int _frontCliffMaxRepeatedByPhaseV1 = 2;
-  static const bool _enableExtendedObjectProbeV1 = false;
+  static const Duration _edgeCautiousDurationV1 = Duration(seconds: 60);
+  static const int _edgeCautiousTurnLargeCapDegV1 = 5;
+  static const int _edgeCautiousTurnSmallCapDegV1 = 3;
+  static const int _edgeCautiousLinearCapMmV1 = 10;
   static const int _objectMinProbeCountBeforeEarlyStopV1 = 2;
   static const int _objectReturnOwnerReacquireMaxAttemptsV1 = 2;
   static const int _objectReturnResearchLocalStepDegV1 = 20;
@@ -187,47 +204,172 @@ class EnvironMonitorModule {
   static const Duration _ownerReplyWaitTimeoutV1 = Duration(seconds: 8);
   static const Duration _ownerReplyWaitPollIntervalV1 =
       Duration(milliseconds: 250);
-  static const double _objectSpeechSpecificConfidenceV1 = 0.65;
-  static const double _objectSpeechFallbackConfidenceV1 = 0.30;
-  static const Set<String> _objectSpeechSafeLabelsV1 = {
-    'cup',
+  static const double _objectSpecificSpeechScoreV1 = 0.65;
+  static const double _objectSnapshotWeakScoreV1 = 0.30;
+  static const double _objectRealtimeCandidateScoreV1 = 0.18;
+  static const double _objectRealtimeCandidateAreaV1 = 0.003;
+  static const double _objectRealtimeSpeechScoreV1 = 0.30;
+  static const double _objectRealtimeSingleHitGenericScoreV1 = 0.35;
+  static const double _objectRealtimeSpeechAreaV1 = 0.006;
+  static const double _objectSmallAreaMinV1 = 0.003;
+  static const double _objectSmallAreaMaxV1 = 0.12;
+  static const double _objectLargeAreaThresholdV1 = 0.15;
+  static const double _objectSpeechSpecificConfidenceV1 =
+      _objectSpecificSpeechScoreV1;
+  static const double _objectSpeechFallbackConfidenceV1 =
+      _objectRealtimeSpeechScoreV1;
+  static const double _realtimeObjectCandidateConfidenceV1 =
+      _objectRealtimeCandidateScoreV1;
+  static const double _realtimeObjectCandidateMinAreaRatioV1 =
+      _objectRealtimeCandidateAreaV1;
+  static const double _realtimeObjectCandidateMaxAreaRatioV1 = 0.65;
+  static const int _objectProbeRealtimeCollectMsV1 = 1200;
+  static const int _objectRealtimeStableMinHitsV1 = 3;
+  static const int _objectRealtimeStableWindowMsV1 = 1200;
+  static const int _objectWeakFallbackSilentObserveMsV1 = 800;
+  static const Duration _realtimeObjectProbeWaitV1 =
+      Duration(milliseconds: _objectProbeRealtimeCollectMsV1);
+  static const Set<String> _officeInteractableObjectLabelsV1 = {
     'bottle',
+    'wine glass',
+    'cup',
+    'bowl',
     'book',
     'laptop',
-    'keyboard',
     'mouse',
-    'remote',
+    'keyboard',
     'cell phone',
+    'remote',
+    'backpack',
+    'handbag',
+    'suitcase',
+    'clock',
+    'vase',
     'potted plant',
+    'scissors',
+    'toothbrush',
+    'apple',
+    'banana',
+    'orange',
+    'teddy bear',
   };
-  static const Map<String, String> _objectSpeechLabelZhV1 = {
-    'cup': '杯子',
+  static const Set<String> _toyLikeObjectLabelsV1 = {
+    'teddy bear',
+    'sports ball',
+    'frisbee',
+    'toy',
+  };
+  static const Set<String> _officeLargeBackgroundLabelsV1 = {
+    'tv',
+    'chair',
+    'couch',
+    'dining table',
+    'bench',
+  };
+  static const Set<String> _officeImpossibleObjectLabelsV1 = {
+    'airplane',
+    'bus',
+    'train',
+    'truck',
+    'boat',
+    'motorcycle',
+    'bicycle',
+    'car',
+    'traffic light',
+    'fire hydrant',
+    'stop sign',
+    'parking meter',
+    'skis',
+    'snowboard',
+    'surfboard',
+    'skateboard',
+    'baseball bat',
+    'baseball glove',
+    'kite',
+    'tennis racket',
+    'toilet',
+    'sink',
+    'refrigerator',
+    'oven',
+    'microwave',
+    'toaster',
+    'horse',
+    'sheep',
+    'cow',
+    'elephant',
+    'bear',
+    'zebra',
+    'giraffe',
+  };
+  static const Set<String> _officeAnimalLabelsV1 = {
+    'bird',
+    'cat',
+    'dog',
+  };
+  static const Set<String> _objectSpecificSpeechLabelsV1 = {
+    'bottle',
+    'wine glass',
+    'cup',
+    'bowl',
+    'book',
+    'laptop',
+    'mouse',
+    'keyboard',
+    'cell phone',
+    'remote',
+    'backpack',
+    'handbag',
+    'suitcase',
+    'clock',
+    'vase',
+    'potted plant',
+    'scissors',
+    'toothbrush',
+    'apple',
+    'banana',
+    'orange',
+    'teddy bear',
+  };
+  static const Map<String, String> _officeObjectZhNameV1 = {
     'bottle': '瓶子',
+    'wine glass': '杯子',
+    'cup': '杯子',
+    'bowl': '碗',
     'book': '书',
     'laptop': '电脑',
-    'keyboard': '键盘',
     'mouse': '鼠标',
+    'keyboard': '键盘',
     'cell phone': '手机',
     'remote': '遥控器',
+    'backpack': '背包',
+    'handbag': '包',
+    'suitcase': '箱子',
+    'clock': '时钟',
+    'vase': '花瓶',
     'potted plant': '小植物',
+    'scissors': '剪刀',
+    'toothbrush': '牙刷',
+    'apple': '苹果',
+    'banana': '香蕉',
+    'orange': '橙子',
+    'teddy bear': '小熊',
+    'sports ball': '球',
+    'frisbee': '飞盘',
+    'toy': '玩具',
   };
+  static const Map<String, String> _objectSpeechLabelZhV1 =
+      _officeObjectZhNameV1;
   static const List<_ObjectProbePlanV1> _objectProbePlansV1 = [
     _ObjectProbePlanV1(
       turnCommand: '右转',
       turnLabel: 'right',
-      turnAngleDeg: 25,
-      turnBackCommand: '左转',
-    ),
-    _ObjectProbePlanV1(
-      turnCommand: '右转',
-      turnLabel: 'right',
-      turnAngleDeg: 45,
+      turnAngleDeg: 30,
       turnBackCommand: '左转',
     ),
     _ObjectProbePlanV1(
       turnCommand: '左转',
       turnLabel: 'left',
-      turnAngleDeg: 25,
+      turnAngleDeg: 30,
       turnBackCommand: '右转',
     ),
   ];
@@ -242,17 +384,22 @@ class EnvironMonitorModule {
   Timer? _pendingObjectLookAroundTimerV1;
   Timer? _idleRecenterTimerV1;
   StreamSubscription<List<dynamic>>? _envRealtimeHumanSubscription;
+  StreamSubscription<List<dynamic>>? _envRealtimeObjectSubscription;
 
   bool _isEnvironmentMonitoring = false;
   bool _isAnswering = false;
   bool _isTtsPlaying = false;
   bool _degradedToVoiceExpressionOnly = false;
   bool _envRealtimeHumanRunning = false;
+  bool _envRealtimeObjectRunning = false;
+  int _objectGenericSpeechCountV1 = 0;
+  int _objectSpecificSpeechCountV1 = 0;
   bool _quietCompanionActiveV1 = false;
   bool _ownerAlignmentActiveV1 = false;
   bool _envV1MotionCommandInFlight = false;
   bool _objectLookAroundExecutedV1 = false;
   bool _objectLookAroundRunningV1 = false;
+  bool _envV1EdgeCautiousMode = false;
   String? _pendingObjectLookAroundReasonV1;
   String? _pendingObjectLookAroundOwnerStatusV1;
   bool _objectReturnSafeStopWaitingV1 = false;
@@ -263,9 +410,14 @@ class EnvironMonitorModule {
   String? _idleRecenterLastDirectionV1;
   String? _objectReturnPendingSafeStopReasonV1;
   String? _lastFrontCliffRecoveredTurnPhaseV1;
+  DateTime? _envV1EdgeCautiousUntil;
   final Map<String, int> _frontCliffInterruptsByPhaseV1 = <String, int>{};
   HumanObservation? _recentRealtimeHuman;
   DateTime? _recentRealtimeHumanAt;
+  DetectedDesktopObject? _recentRealtimeObject;
+  DetectedDesktopObject? _recentIgnoredRealtimeObject;
+  final List<_RealtimeObjectSampleV1> _recentRealtimeObjectSamplesV1 =
+      <_RealtimeObjectSampleV1>[];
   DateTime? _ownerFoundAtV1;
   String _monitorStatus = '环境监测已关闭';
   bool Function()? _isAnsweringProvider;
@@ -1582,6 +1734,10 @@ class EnvironMonitorModule {
     var forceReturnResearch = false;
     var foundAnyObject = false;
     var microApproachUsed = false;
+    var objectLookAborted = false;
+    var objectLookFinished = false;
+    _objectGenericSpeechCountV1 = 0;
+    _objectSpecificSpeechCountV1 = 0;
     DetectedDesktopObject? bestObject;
     String? bestObjectSource;
     try {
@@ -1589,13 +1745,14 @@ class EnvironMonitorModule {
         _envLogV1('[ENV_V1_OBJECT] skipped reason=forward_probe_disabled');
         return;
       }
+      await _startRealtimeObjectDetectionForEnvV1();
 
       final forwardMm = _boundedObjectProbeForwardMmV1();
       final probePlans =
           _objectProbePlansV1.take(_objectProbeMaxCountV1).toList();
       _envLogV1(
         '[ENV_V1_OBJECT] probe_plan count=${probePlans.length} '
-        'mode=anchored default extended=$_enableExtendedObjectProbeV1',
+        'mode=anchored realtime_candidate_snapshot_confirm',
       );
       for (var i = 0; i < probePlans.length; i++) {
         if (!_isEnvironmentMonitoring) return;
@@ -1607,9 +1764,13 @@ class EnvironMonitorModule {
           total: probePlans.length,
           forwardMm: forwardMm,
           allowMicroApproach: !microApproachUsed,
+          sessionGenericSpeechCount: _objectGenericSpeechCountV1,
+          sessionSpecificSpeechCount: _objectSpecificSpeechCountV1,
         );
         foundAnyObject = foundAnyObject || probeResult.foundObject;
         microApproachUsed = microApproachUsed || probeResult.usedMicroApproach;
+        _objectGenericSpeechCountV1 += probeResult.genericSpeechCountDelta;
+        _objectSpecificSpeechCountV1 += probeResult.specificSpeechCountDelta;
 
         final candidate = probeResult.bestObject;
         if (candidate != null &&
@@ -1625,6 +1786,7 @@ class EnvironMonitorModule {
         }
         if (!probeResult.shouldContinue) {
           forceReturnResearch = !probeResult.restoredToAnchor;
+          objectLookAborted = true;
           break;
         }
 
@@ -1645,10 +1807,17 @@ class EnvironMonitorModule {
         }
       }
 
-      if (!foundAnyObject) {
-        await _speakObjectObservationV1(null);
+      if (!foundAnyObject && !objectLookAborted) {
+        _envLogV1(
+          '[ENV_V1_OBJECT] no_object_found probes=${probePlans.length} '
+          'speech_skipped=true',
+        );
       }
+      objectLookFinished = !objectLookAborted;
     } finally {
+      await _stopRealtimeObjectDetectionForEnvV1(
+        reason: objectLookFinished ? 'object_look_finished' : 'cleanup/aborted',
+      );
       await detector.close();
       if (_isEnvironmentMonitoring) {
         await _safeSendCommandV1('停止', 0);
@@ -1715,12 +1884,18 @@ class EnvironMonitorModule {
     required int total,
     required int forwardMm,
     required bool allowMicroApproach,
+    required int sessionGenericSpeechCount,
+    required int sessionSpecificSpeechCount,
   }) async {
     _envLogV1(
       '[ENV_V1_OBJECT_PROBE] start index=$index/$total '
       'turn=${plan.turnLabel} angle=${plan.turnAngleDeg} '
       'forwardMm=$forwardMm',
     );
+    _clearRealtimeObjectCandidateV1();
+    var probeSpeechCount = 0;
+    var genericSpeechCountDelta = 0;
+    var specificSpeechCountDelta = 0;
 
     final turnedOut = await _safeSendCommandV1WithPhase(
       plan.turnCommand,
@@ -1794,49 +1969,136 @@ class EnvironMonitorModule {
       const Duration(milliseconds: _objectProbeSettleMsV1),
     );
 
+    _envLogV1(
+      '[ENV_V1_OBJECT_PROBE] collect_realtime start index=$index '
+      'durationMs=$_objectProbeRealtimeCollectMsV1',
+    );
+    final realtimeAnalysis = await _collectRealtimeObjectCandidateForProbeV1(
+      phase: 'probe_$index',
+      timeout: _realtimeObjectProbeWaitV1,
+    );
     final result = await _captureAndDetectObjectProbeSnapshotV1(detector);
-    final object = result == null ? null : _firstNonPersonObjectV1(result);
+    final snapshotObject =
+        result == null ? null : _firstNonPersonObjectV1(result);
+    _envLogV1(
+      '[ENV_V1_OBJECT_PROBE] snapshot_confirm '
+      'hasObject=${snapshotObject != null} '
+      'label=${snapshotObject?.label ?? 'none'} '
+      'score=${_f(snapshotObject?.confidence ?? 0)}',
+    );
+    final decision = _decideObjectProbeCandidateV1(
+      snapshotObject: snapshotObject,
+      realtimeAnalysis: realtimeAnalysis,
+    );
+    final object = decision.object;
+    final mergeSource = decision.source;
+    _envLogV1(
+      '[ENV_V1_OBJECT_PROBE] merged_result found=${object != null} '
+      'source=$mergeSource '
+      'label=${decision.logObject?.label ?? 'none'} '
+      'policy=${_objectPolicyNameV1(decision.policy)} '
+      'score=${_f(decision.logObject?.confidence ?? 0)} '
+      'area=${_f(decision.logObject?.areaRatio ?? 0)} '
+      'hits=${decision.realtimeHits} reason=${decision.reason}',
+    );
     var foundObject = false;
     var usedMicroApproach = false;
     DetectedDesktopObject? bestObject;
     String? bestSource;
-    if (object != null &&
-        object.confidence >= _objectSpeechFallbackConfidenceV1) {
+    if (object == null && mergeSource == 'realtime_low_only') {
+      await _speakObjectObservationV1(
+        decision,
+        probeIndex: index,
+        sessionGenericSpeechCount:
+            sessionGenericSpeechCount + genericSpeechCountDelta,
+        sessionSpecificSpeechCount:
+            sessionSpecificSpeechCount + specificSpeechCountDelta,
+        probeSpeechCount: probeSpeechCount,
+      );
+    }
+    if (object != null) {
       foundObject = true;
       bestObject = object;
-      bestSource = 'probe_$index';
+      bestSource = 'probe_${index}_$mergeSource';
       await _safeSendCommandV1('停止', 0);
+      await _loadExpression('assets/emotion/face2/观察/01/观察 01.json');
       _envLogV1(
-        '[ENV_V1_OBJECT_PROBE] found pauseMs=$_objectFoundPauseMsV1',
+        '[ENV_V1_OBJECT_PROBE] found source=$bestSource '
+        'label=${object.label} score=${_f(object.confidence)} '
+        'pauseBeforeSpeechMs=$_objectFoundPauseBeforeSpeechMsV1 '
+        'pauseAfterSpeechMs=$_objectFoundPauseAfterSpeechMsV1',
       );
       await Future<void>.delayed(
-        const Duration(milliseconds: _objectFoundPauseMsV1),
+        const Duration(milliseconds: _objectFoundPauseBeforeSpeechMsV1),
       );
-      await _speakObjectObservationV1(object);
-
-      final microResult = await _runObjectMicroApproachConfirmV1(
-        detector,
-        beforeObject: object,
-        allowMicroApproach: allowMicroApproach,
+      final spokenMode = await _speakObjectObservationV1(
+        decision,
+        probeIndex: index,
+        sessionGenericSpeechCount:
+            sessionGenericSpeechCount + genericSpeechCountDelta,
+        sessionSpecificSpeechCount:
+            sessionSpecificSpeechCount + specificSpeechCountDelta,
+        probeSpeechCount: probeSpeechCount,
       );
-      usedMicroApproach = microResult.usedMicroApproach;
-      if (microResult.cliffDetected) {
-        _envLogV1('[ENV_V1_OBJECT_PROBE] aborted reason=cliff_detected');
-        await _turnBackObjectProbeAfterAbortV1(plan, index: index);
-        return _ObjectProbeRunResultV1(
-          restoredToAnchor: false,
-          foundObject: foundObject,
-          shouldContinue: false,
-          bestObject: bestObject,
-          bestSource: bestSource,
-          usedMicroApproach: usedMicroApproach,
+      if (spokenMode != _ObjectSpeechModeV1.none) {
+        probeSpeechCount++;
+        if (spokenMode == _ObjectSpeechModeV1.generic) {
+          genericSpeechCountDelta++;
+        } else if (spokenMode == _ObjectSpeechModeV1.specific) {
+          specificSpeechCountDelta++;
+        }
+        await Future<void>.delayed(
+          const Duration(milliseconds: _objectFoundPauseAfterSpeechMsV1),
+        );
+      } else if (_shouldSilentObserveObjectDecisionV1(decision)) {
+        _envLogV1(
+          '[ENV_V1_OBJECT] object_interact silent_observe '
+          'ms=$_objectWeakFallbackSilentObserveMsV1 '
+          'reason=generic_speech_already_spoken',
+        );
+        await Future<void>.delayed(
+          const Duration(milliseconds: _objectWeakFallbackSilentObserveMsV1),
         );
       }
-      final confirmedObject = microResult.confirmedObject;
-      if (confirmedObject != null &&
-          confirmedObject.confidence >= bestObject.confidence) {
-        bestObject = confirmedObject;
-        bestSource = 'micro_confirm';
+
+      if (_enableObjectMicroApproachOnFoundV1 &&
+          object.confidence >= _objectSpeechFallbackConfidenceV1) {
+        final microResult = await _runObjectMicroApproachConfirmV1(
+          detector,
+          beforeObject: object,
+          allowMicroApproach: allowMicroApproach,
+        );
+        usedMicroApproach = microResult.usedMicroApproach;
+        if (microResult.cliffDetected) {
+          _envLogV1('[ENV_V1_OBJECT_PROBE] aborted reason=cliff_detected');
+          await _turnBackObjectProbeAfterAbortV1(plan, index: index);
+          return _ObjectProbeRunResultV1(
+            restoredToAnchor: false,
+            foundObject: foundObject,
+            shouldContinue: false,
+            bestObject: bestObject,
+            bestSource: bestSource,
+            usedMicroApproach: usedMicroApproach,
+            genericSpeechCountDelta: genericSpeechCountDelta,
+            specificSpeechCountDelta: specificSpeechCountDelta,
+          );
+        }
+        final confirmedObject = microResult.confirmedObject;
+        if (confirmedObject != null &&
+            confirmedObject.confidence >= bestObject.confidence) {
+          bestObject = confirmedObject;
+          bestSource = 'micro_confirm';
+        }
+      } else if (!_enableObjectMicroApproachOnFoundV1) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_MICRO] skipped reason=feature_disabled '
+          'label=${object.label} score=${_f(object.confidence)}',
+        );
+      } else {
+        _envLogV1(
+          '[ENV_V1_OBJECT_MICRO] skipped reason=realtime_weak_candidate '
+          'label=${object.label} score=${_f(object.confidence)}',
+        );
       }
     }
 
@@ -1862,6 +2124,8 @@ class EnvironMonitorModule {
         bestObject: bestObject,
         bestSource: bestSource,
         usedMicroApproach: usedMicroApproach,
+        genericSpeechCountDelta: genericSpeechCountDelta,
+        specificSpeechCountDelta: specificSpeechCountDelta,
       );
     }
     _envLogV1(
@@ -1882,6 +2146,8 @@ class EnvironMonitorModule {
         bestObject: bestObject,
         bestSource: bestSource,
         usedMicroApproach: usedMicroApproach,
+        genericSpeechCountDelta: genericSpeechCountDelta,
+        specificSpeechCountDelta: specificSpeechCountDelta,
       );
     }
 
@@ -1903,6 +2169,8 @@ class EnvironMonitorModule {
         bestObject: bestObject,
         bestSource: bestSource,
         usedMicroApproach: usedMicroApproach,
+        genericSpeechCountDelta: genericSpeechCountDelta,
+        specificSpeechCountDelta: specificSpeechCountDelta,
       );
     }
     _envLogV1('[ENV_V1_OBJECT_PROBE] turn_back done index=$index');
@@ -1921,6 +2189,8 @@ class EnvironMonitorModule {
         bestObject: bestObject,
         bestSource: bestSource,
         usedMicroApproach: usedMicroApproach,
+        genericSpeechCountDelta: genericSpeechCountDelta,
+        specificSpeechCountDelta: specificSpeechCountDelta,
       );
     }
     await Future<void>.delayed(_settleDelay);
@@ -1932,6 +2202,8 @@ class EnvironMonitorModule {
       bestObject: bestObject,
       bestSource: bestSource,
       usedMicroApproach: usedMicroApproach,
+      genericSpeechCountDelta: genericSpeechCountDelta,
+      specificSpeechCountDelta: specificSpeechCountDelta,
     );
   }
 
@@ -2057,8 +2329,11 @@ class EnvironMonitorModule {
 
       final imagePath = await camera.captureImage();
       _envLogV1('[ENV_V1_OBJECT_MICRO] snapshot imagePath=$imagePath');
-      final result =
-          await detector.detectDesktopObjectsFromImagePath(imagePath);
+      final result = await detector.detectDesktopObjectsFromImagePath(
+        imagePath,
+        minAreaRatio: _objectSmallAreaMinV1,
+        maxAreaRatio: _realtimeObjectCandidateMaxAreaRatioV1,
+      );
       final topObject = _firstNonPersonObjectV1(result);
       _envLogV1(
         '[ENV_V1_OBJECT_MICRO] detect hasObject=${result.hasObject} '
@@ -2091,9 +2366,10 @@ class EnvironMonitorModule {
 
     try {
       _envV1MotionCommandInFlight = true;
+      final effectiveMm = _edgeCautiousLinearDistanceV1(mm, phase: phase);
       final feedback = await service.sendLinearMotionAndAwaitFeedback(
         command,
-        mm,
+        effectiveMm,
         timeout: const Duration(seconds: 8),
       );
       if (feedback.kind == LinearMotionEndKind.completed) {
@@ -2105,53 +2381,64 @@ class EnvironMonitorModule {
           if (command == '后退') {
             _envLogV1(
               '[ENV_V1_CLIFF] interrupted command=$command '
-              'distanceMm=$mm phase=$phase '
+              'distanceMm=$effectiveMm phase=$phase '
               'obstacle=0x${feedback.obstacleType.toRadixString(16)}',
             );
-            _envLogV1('[ENV_V1_CLIFF] backward_interrupted phase=$phase');
-            _markObjectReturnSafetyStopReasonV1(
-              'backward_interrupted_by_cliff',
-            );
-            await _safeSendCommandV1('停止', 0);
-            return const _LinearMotionGuardResultV1(
-              success: false,
-              cliffDetected: true,
-              safeStopRequired: true,
-              error: 'backward_interrupted_by_cliff',
-            );
+            if (!_isRearCliffObstacleTypeV1(feedback.obstacleType)) {
+              _envLogV1('[ENV_V1_CLIFF] backward_interrupted phase=$phase');
+              _markObjectReturnSafetyStopReasonV1(
+                'backward_interrupted_by_cliff',
+              );
+              await _safeSendCommandV1('停止', 0);
+              return const _LinearMotionGuardResultV1(
+                success: false,
+                cliffDetected: true,
+                safeStopRequired: true,
+                error: 'backward_interrupted_by_cliff',
+              );
+            }
           }
 
           final recovered = await _recoverFromFrontCliffV1(
             phase: phase,
             interruptedCommand: command,
-            interruptedDistanceMm: mm,
+            interruptedDistanceMm: effectiveMm,
             obstacleType: feedback.obstacleType,
           );
           if (!recovered) {
             _markObjectReturnSafetyStopReasonV1(
-              'front_cliff_recover_failed',
+              'cliff_recover_failed',
             );
             return const _LinearMotionGuardResultV1(
               success: false,
               cliffDetected: true,
               safeStopRequired: true,
-              error: 'front_cliff_recover_failed',
+              error: 'cliff_recover_failed',
             );
           }
           if (command == '前进') {
             _envLogV1(
               '[ENV_V1_CLIFF] forward_interrupted '
-              'phase=$phase distanceMm=$mm',
-            );
-            _envLogV1(
-              '[ENV_V1_CLIFF] forward_aborted_do_not_resume phase=$phase',
+              'phase=$phase distanceMm=$effectiveMm',
             );
           }
           return const _LinearMotionGuardResultV1(
-            success: false,
+            success: true,
             cliffDetected: true,
             recoverySucceeded: true,
-            error: 'cliff_detected',
+            error: 'cliff_recovered',
+          );
+        }
+        if (_isEdgeCautiousActiveV1()) {
+          await _markEdgeRiskSafeStopV1(
+            reason: 'unknown_obstacle_after_cliff_recover',
+            phase: phase,
+          );
+          return _LinearMotionGuardResultV1(
+            success: false,
+            safeStopRequired: true,
+            error:
+                'motion_interrupted_0x${feedback.obstacleType.toRadixString(16)}',
           );
         }
         await _safeSendCommandV1('停止', 0);
@@ -2190,8 +2477,157 @@ class EnvironMonitorModule {
     return obstacleType == 0x03;
   }
 
+  bool _isRearCliffObstacleTypeV1(int obstacleType) {
+    return obstacleType == 0x04;
+  }
+
   bool _isFrontCliffAutoBackoffByBluetoothV1() {
     return MyBluetoothService.kEnableFrontSafetyRecover;
+  }
+
+  bool _isRearCliffAutoBackoffByBluetoothV1() {
+    return MyBluetoothService.kEnableRearSafetyRecover;
+  }
+
+  bool _isEdgeCautiousActiveV1() {
+    if (!_envV1EdgeCautiousMode) {
+      return false;
+    }
+    final until = _envV1EdgeCautiousUntil;
+    if (until != null && DateTime.now().isAfter(until)) {
+      _envV1EdgeCautiousMode = false;
+      _envV1EdgeCautiousUntil = null;
+      _envLogV1('[ENV_V1_EDGE] cautious_mode exit reason=expired');
+      return false;
+    }
+    return true;
+  }
+
+  void _enterEdgeCautiousModeV1({required String reason}) {
+    _envV1EdgeCautiousMode = true;
+    _envV1EdgeCautiousUntil = DateTime.now().add(_edgeCautiousDurationV1);
+    _envLogV1(
+      '[ENV_V1_EDGE] cautious_mode enter '
+      'durationSec=${_edgeCautiousDurationV1.inSeconds} '
+      'reason=$reason',
+    );
+  }
+
+  String _edgePhaseLabelV1(String phase) {
+    if (phase == 'probe_forward') {
+      return 'object_probe_forward';
+    }
+    if (phase == 'probe_backward') {
+      return 'object_probe_backward';
+    }
+    if (phase == 'object_return_full_circle_scan') {
+      return 'object_return_scan';
+    }
+    if (phase == 'object_return_candidate_local_search') {
+      return 'object_return_local_search';
+    }
+    return phase;
+  }
+
+  int _edgeCautiousTurnAngleV1(int angleDeg, {required String phase}) {
+    if (!_isEdgeCautiousActiveV1() || angleDeg <= 3) {
+      return angleDeg;
+    }
+    final cap = angleDeg <= 6
+        ? _edgeCautiousTurnSmallCapDegV1
+        : _edgeCautiousTurnLargeCapDegV1;
+    final capped = angleDeg > cap ? cap : angleDeg;
+    if (capped != angleDeg) {
+      _envLogV1(
+        '[ENV_V1_EDGE] cautious cap turnAngle '
+        'original=$angleDeg capped=$capped '
+        'phase=${_edgePhaseLabelV1(phase)}',
+      );
+    }
+    return capped;
+  }
+
+  int _edgeCautiousLinearDistanceV1(int distanceMm, {required String phase}) {
+    if (!_isEdgeCautiousActiveV1() ||
+        distanceMm <= _edgeCautiousLinearCapMmV1) {
+      return distanceMm;
+    }
+    _envLogV1(
+      '[ENV_V1_EDGE] cautious cap linearDistance '
+      'original=$distanceMm capped=$_edgeCautiousLinearCapMmV1 '
+      'phase=${_edgePhaseLabelV1(phase)}',
+    );
+    return _edgeCautiousLinearCapMmV1;
+  }
+
+  bool _isBluetoothEdgeRiskHighV1() {
+    final service = _bluetoothService;
+    return service != null &&
+        (service.edgeRiskHigh ||
+            service.wheelMayBeOffTable ||
+            service.lastSafetyRecoverFailed);
+  }
+
+  Future<bool> _waitForBluetoothSafetyRecoverIdleV1({
+    required int obstacleType,
+  }) async {
+    final service = _bluetoothService;
+    if (service == null) {
+      return true;
+    }
+    final observedAfter = DateTime.now().subtract(
+      const Duration(milliseconds: 300),
+    );
+    bool recoveryObserved() {
+      final recoverAt = service.lastSafetyRecoverAt;
+      return service.isSafetyRecovering ||
+          (service.lastSafetyRecoverObstacleType == obstacleType &&
+              recoverAt != null &&
+              !recoverAt.isBefore(observedAfter));
+    }
+
+    final startDeadline = DateTime.now().add(
+      const Duration(milliseconds: 700),
+    );
+    while (!recoveryObserved() && DateTime.now().isBefore(startDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+    }
+    if (!recoveryObserved()) {
+      return false;
+    }
+
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (service.isSafetyRecovering && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+    }
+    return !service.isSafetyRecovering;
+  }
+
+  Future<void> _markEdgeRiskSafeStopV1({
+    required String reason,
+    required String phase,
+  }) async {
+    _envLogV1(
+      '[ENV_V1_SAFE_STOP] reason=$reason phase=${_edgePhaseLabelV1(phase)}',
+    );
+    _markObjectReturnSafetyStopReasonV1(reason);
+    if (phase.startsWith('object_probe') || phase.startsWith('probe_')) {
+      _envLogV1('[ENV_V1_OBJECT] aborted reason=edge_risk_high');
+      await _stopRealtimeObjectDetectionForEnvV1(reason: 'edge_risk_high');
+    }
+    await _safeSendCommandV1('停止', 0);
+  }
+
+  void _logContinueAfterEdgeRecoverV1(String phase) {
+    if (phase.startsWith('object_probe') || phase.startsWith('probe_')) {
+      _envLogV1('[ENV_V1_OBJECT] continue_after_edge_recover cautious=true');
+      return;
+    }
+    if (phase.startsWith('object_return') || phase == 'final_center_recenter') {
+      _envLogV1(
+        '[ENV_V1_OBJECT_RETURN] continue_after_edge_recover cautious=true',
+      );
+    }
   }
 
   Future<bool> _recoverFromFrontCliffV1({
@@ -2202,14 +2638,18 @@ class EnvironMonitorModule {
     int? interruptedDistanceMm,
     int backoffMm = _frontCliffBackoffMmV1,
   }) async {
-    if (!_isFrontCliffObstacleTypeV1(obstacleType)) {
+    if (!_isCliffObstacleTypeV1(obstacleType)) {
       _envLogV1(
         '[ENV_V1_CLIFF] recover failed phase=$phase '
-        'reason=not_front_cliff obstacle=0x${obstacleType.toRadixString(16)}',
+        'reason=not_cliff obstacle=0x${obstacleType.toRadixString(16)}',
       );
       return false;
     }
 
+    final isFrontCliff = _isFrontCliffObstacleTypeV1(obstacleType);
+    final isRearCliff = _isRearCliffObstacleTypeV1(obstacleType);
+    final recoveredReason =
+        isRearCliff ? 'rear_cliff_recovered' : 'front_cliff_recovered';
     final angleText =
         interruptedAngleDeg == null ? '' : ' angle=$interruptedAngleDeg';
     final distanceText = interruptedDistanceMm == null
@@ -2224,46 +2664,47 @@ class EnvironMonitorModule {
       '[ENV_V1_CLIFF] recover start phase=$phase backoffMm=$backoffMm',
     );
 
-    if (!await _safeSendCommandV1('停止', 0)) {
-      _envLogV1(
-          '[ENV_V1_CLIFF] recover failed phase=$phase reason=stop_failed');
-      _markObjectReturnSafetyStopReasonV1('stop_failed');
-      return false;
+    final bluetoothOwnsBackoff =
+        (isFrontCliff && _isFrontCliffAutoBackoffByBluetoothV1()) ||
+            (isRearCliff && _isRearCliffAutoBackoffByBluetoothV1());
+    if (bluetoothOwnsBackoff) {
+      _envLogV1('[ENV_V1_CLIFF] stop_owner=bluetooth_service');
+    } else {
+      if (!await _safeSendCommandV1('停止', 0)) {
+        _envLogV1(
+            '[ENV_V1_CLIFF] recover failed phase=$phase reason=stop_failed');
+        _markObjectReturnSafetyStopReasonV1('stop_failed');
+        return false;
+      }
+      _envLogV1('[ENV_V1_CLIFF] stop sent');
     }
-    _envLogV1('[ENV_V1_CLIFF] stop sent');
 
     var totalBackoffMm = 0;
-    if (_isFrontCliffAutoBackoffByBluetoothV1()) {
+    if (bluetoothOwnsBackoff) {
       _envLogV1('[ENV_V1_CLIFF] backoff_owner=bluetooth_service');
       _envLogV1('[ENV_V1_CLIFF] duplicate_backoff_prevented=true');
-      totalBackoffMm += _frontCliffBtAutoBackoffMmV1;
-      _envLogV1(
-        '[ENV_V1_CLIFF] supplemental_backoff start '
-        'mm=$_frontCliffSupplementalBackoffMmV1 '
-        'reason=bt_backoff_may_be_insufficient',
+      final btRecoverIdle = await _waitForBluetoothSafetyRecoverIdleV1(
+        obstacleType: obstacleType,
       );
-      final supplemented = await _sendFrontCliffBackoffSafeV1(
-        phase: phase,
-        mm: _frontCliffSupplementalBackoffMmV1,
-        failureReason: 'backoff_not_safe',
-      );
-      if (!supplemented) {
-        _envLogV1(
-          '[ENV_V1_CLIFF] supplemental_backoff skipped reason=rear_not_safe',
+      if (!btRecoverIdle || _isBluetoothEdgeRiskHighV1()) {
+        await _markEdgeRiskSafeStopV1(
+          reason: 'wheel_may_be_off_table',
+          phase: phase,
         );
         return false;
       }
-      totalBackoffMm += _frontCliffSupplementalBackoffMmV1;
-      _envLogV1(
-        '[ENV_V1_CLIFF] supplemental_backoff done '
-        'mm=$_frontCliffSupplementalBackoffMmV1',
-      );
+      totalBackoffMm += isRearCliff
+          ? MyBluetoothService.kRearSafetyRecoverDistanceMm
+          : _frontCliffBtAutoBackoffMmV1;
     } else {
       _envLogV1('[ENV_V1_CLIFF] backoff_owner=env_v1');
-      final backedOff = await _sendFrontCliffBackoffSafeV1(
+      final backedOff = await _sendCliffBackoffSafeV1(
         phase: phase,
+        command: isRearCliff ? '前进' : '后退',
         mm: backoffMm,
-        failureReason: 'front_cliff_recover_failed',
+        failureReason: isRearCliff
+            ? 'rear_cliff_recover_failed'
+            : 'front_cliff_recover_failed',
       );
       if (!backedOff) {
         return false;
@@ -2282,11 +2723,14 @@ class EnvironMonitorModule {
       '[ENV_V1_CLIFF] recover settleMs=$_frontCliffRecoverSettleMsV1',
     );
     _envLogV1('[ENV_V1_CLIFF] recover done phase=$phase');
+    _enterEdgeCautiousModeV1(reason: recoveredReason);
+    _logContinueAfterEdgeRecoverV1(phase);
     return true;
   }
 
-  Future<bool> _sendFrontCliffBackoffSafeV1({
+  Future<bool> _sendCliffBackoffSafeV1({
     required String phase,
+    required String command,
     required int mm,
     required String failureReason,
   }) async {
@@ -2301,7 +2745,7 @@ class EnvironMonitorModule {
     }
 
     final feedback = await service.sendLinearMotionAndAwaitFeedback(
-      '后退',
+      command,
       mm,
       timeout: const Duration(seconds: 8),
     );
@@ -2311,7 +2755,7 @@ class EnvironMonitorModule {
 
     if (feedback.kind == LinearMotionEndKind.interrupted &&
         _isCliffObstacleTypeV1(feedback.obstacleType)) {
-      _envLogV1('[ENV_V1_CLIFF] backward_interrupted phase=$phase');
+      _envLogV1('[ENV_V1_CLIFF] backoff_interrupted phase=$phase');
       _markObjectReturnSafetyStopReasonV1('backoff_not_safe');
       await _safeSendCommandV1('停止', 0);
       return false;
@@ -2438,28 +2882,350 @@ class EnvironMonitorModule {
     }
   }
 
+  _ObjectProbeDecisionV1 _decideObjectProbeCandidateV1({
+    required DetectedDesktopObject? snapshotObject,
+    required _RealtimeObjectProbeAnalysisV1 realtimeAnalysis,
+  }) {
+    if (snapshotObject != null &&
+        _isSpecificObjectSpeechCandidateV1(snapshotObject)) {
+      final snapshotPolicy = _objectPolicyForV1(snapshotObject);
+      _logObjectLabelPolicyV1(snapshotObject, snapshotPolicy);
+      return _ObjectProbeDecisionV1(
+        object: snapshotObject,
+        source: 'snapshot_specific',
+        speechMode: _ObjectSpeechModeV1.specific,
+        reason: 'snapshot_high_confidence_specific',
+        realtimeHits: realtimeAnalysis.bestHits,
+        policy: snapshotPolicy,
+      );
+    }
+
+    if (snapshotObject != null) {
+      final snapshotPolicy = _objectPolicyForV1(snapshotObject);
+      _logObjectLabelPolicyV1(snapshotObject, snapshotPolicy);
+      if (_isObjectPolicyInteractiveV1(snapshotPolicy) &&
+          snapshotObject.confidence >= _objectSnapshotWeakScoreV1) {
+        if (_isObjectAreaTooLargeForSpecificSpeechV1(snapshotObject)) {
+          _envLogV1(
+            '[ENV_V1_OBJECT] office_label_area_too_large_generic_only '
+            'label=${snapshotObject.label} area=${_f(snapshotObject.areaRatio)}',
+          );
+        }
+        return _ObjectProbeDecisionV1(
+          object: snapshotObject,
+          source: 'snapshot_generic',
+          speechMode: _ObjectSpeechModeV1.generic,
+          reason: _isObjectAreaTooLargeForSpecificSpeechV1(snapshotObject)
+              ? 'office_label_area_too_large_generic_only'
+              : 'snapshot_weak_confirm',
+          realtimeHits: realtimeAnalysis.bestHits,
+          policy: snapshotPolicy,
+        );
+      }
+    }
+
+    final realtimeCandidate =
+        realtimeAnalysis.stableCandidate ?? realtimeAnalysis.bestLowCandidate;
+    if (realtimeCandidate != null) {
+      final realtimePolicy =
+          realtimeAnalysis.bestPolicy ?? _objectPolicyForV1(realtimeCandidate);
+      _logObjectLabelPolicyV1(realtimeCandidate, realtimePolicy);
+      if (_isRealtimeGenericCandidateV1(realtimeCandidate, realtimePolicy)) {
+        final snapshotPolicy =
+            snapshotObject == null ? null : _objectPolicyForV1(snapshotObject);
+        if (snapshotObject != null &&
+            snapshotPolicy != null &&
+            !_isObjectPolicyInteractiveV1(snapshotPolicy)) {
+          _logIgnoredObjectV1(snapshotObject, snapshotPolicy);
+          _envLogV1(
+            '[ENV_V1_OBJECT_PROBE] snapshot_ignored '
+            'label=${snapshotObject.label} '
+            'policy=${_objectPolicyNameV1(snapshotPolicy)} '
+            'keep_realtime_candidate=${realtimeCandidate.label}',
+          );
+        }
+        if (_isObjectAreaTooLargeForSpecificSpeechV1(realtimeCandidate)) {
+          _envLogV1(
+            '[ENV_V1_OBJECT] office_label_area_too_large_generic_only '
+            'label=${realtimeCandidate.label} '
+            'area=${_f(realtimeCandidate.areaRatio)}',
+          );
+        }
+        final reason = realtimeAnalysis.stableCandidate == null
+            ? 'office_interactable_single_hit_generic'
+            : 'office_interactable_realtime_generic';
+        return _ObjectProbeDecisionV1(
+          object: realtimeCandidate,
+          source: 'realtime_generic',
+          speechMode: _ObjectSpeechModeV1.generic,
+          reason: reason,
+          realtimeHits: realtimeAnalysis.bestHits,
+          policy: realtimePolicy,
+        );
+      }
+      if (!_isObjectPolicyInteractiveV1(realtimePolicy)) {
+        _logIgnoredObjectV1(realtimeCandidate, realtimePolicy);
+      }
+    }
+
+    if (snapshotObject != null) {
+      final snapshotPolicy = _objectPolicyForV1(snapshotObject);
+      if (!_isObjectPolicyInteractiveV1(snapshotPolicy)) {
+        _logIgnoredObjectV1(snapshotObject, snapshotPolicy);
+        return _ObjectProbeDecisionV1(
+          object: null,
+          source: _blockedObjectSourceForPolicyV1(snapshotPolicy),
+          speechMode: _ObjectSpeechModeV1.none,
+          reason: _objectDecisionReasonForPolicyV1(snapshotPolicy),
+          realtimeHits: realtimeAnalysis.bestHits,
+          rejectedObject: snapshotObject,
+          policy: snapshotPolicy,
+        );
+      }
+    }
+
+    if (realtimeCandidate != null) {
+      final realtimePolicy =
+          realtimeAnalysis.bestPolicy ?? _objectPolicyForV1(realtimeCandidate);
+      return _ObjectProbeDecisionV1(
+        object: null,
+        source: 'realtime_low_only',
+        speechMode: _ObjectSpeechModeV1.none,
+        reason: _isObjectPolicyInteractiveV1(realtimePolicy)
+            ? 'not_stable_or_low_score'
+            : _objectDecisionReasonForPolicyV1(realtimePolicy),
+        realtimeHits: realtimeAnalysis.bestHits,
+        rejectedObject: realtimeCandidate,
+        policy: realtimePolicy,
+      );
+    }
+
+    return _ObjectProbeDecisionV1(
+      object: null,
+      source: 'none',
+      speechMode: _ObjectSpeechModeV1.none,
+      reason: 'no_object',
+      realtimeHits: realtimeAnalysis.bestHits,
+    );
+  }
+
+  bool _isSpecificObjectSpeechCandidateV1(DetectedDesktopObject object) {
+    return _isObjectEligibleForSpecificSpeechV1(object) &&
+        object.confidence >= _objectSpecificSpeechScoreV1 &&
+        !_isObjectAreaTooLargeForSpecificSpeechV1(object);
+  }
+
+  EnvV1ObjectPolicy _objectPolicyForV1(DetectedDesktopObject object) {
+    final label = _normalizeObjectLabelV1(object.label);
+    if (_officeImpossibleObjectLabelsV1.contains(label)) {
+      return EnvV1ObjectPolicy.officeImpossible;
+    }
+    if (_officeAnimalLabelsV1.contains(label)) {
+      return EnvV1ObjectPolicy.officeAnimal;
+    }
+    if (_officeLargeBackgroundLabelsV1.contains(label)) {
+      return EnvV1ObjectPolicy.largeBackground;
+    }
+    if (_toyLikeObjectLabelsV1.contains(label)) {
+      return EnvV1ObjectPolicy.toyLike;
+    }
+    if (_officeInteractableObjectLabelsV1.contains(label)) {
+      return EnvV1ObjectPolicy.officeInteractable;
+    }
+    return EnvV1ObjectPolicy.unknown;
+  }
+
+  bool _isOfficeInteractableObjectV1(String label) {
+    final normalized = _normalizeObjectLabelV1(label);
+    return _officeInteractableObjectLabelsV1.contains(normalized) ||
+        _toyLikeObjectLabelsV1.contains(normalized);
+  }
+
+  bool _isObjectEligibleForObjectLookV1(
+    DetectedDesktopObject object,
+    EnvV1ObjectPolicy policy,
+  ) {
+    return _isObjectPolicyInteractiveV1(policy) &&
+        _isOfficeInteractableObjectV1(object.label) &&
+        object.areaRatio >= _objectSmallAreaMinV1;
+  }
+
+  bool _isObjectPolicyInteractiveV1(EnvV1ObjectPolicy policy) {
+    return policy == EnvV1ObjectPolicy.officeInteractable ||
+        policy == EnvV1ObjectPolicy.toyLike;
+  }
+
+  bool _isRealtimeGenericCandidateV1(
+    DetectedDesktopObject object,
+    EnvV1ObjectPolicy policy,
+  ) {
+    return _isObjectPolicyInteractiveV1(policy) &&
+        object.confidence >= _objectRealtimeSingleHitGenericScoreV1 &&
+        object.areaRatio >= _objectSmallAreaMinV1;
+  }
+
+  bool _isObjectAreaTooLargeForSpecificSpeechV1(
+    DetectedDesktopObject object,
+  ) {
+    return object.areaRatio > _objectSmallAreaMaxV1 ||
+        object.areaRatio > _objectLargeAreaThresholdV1;
+  }
+
+  bool _isObjectEligibleForGenericSpeechV1(DetectedDesktopObject object) {
+    return _isObjectEligibleForObjectLookV1(
+      object,
+      _objectPolicyForV1(object),
+    );
+  }
+
+  bool _isObjectEligibleForSpecificSpeechV1(DetectedDesktopObject object) {
+    return _isObjectEligibleForGenericSpeechV1(object) &&
+        _objectSpecificSpeechLabelsV1
+            .contains(_normalizeObjectLabelV1(object.label));
+  }
+
+  void _logObjectLabelPolicyV1(
+    DetectedDesktopObject object,
+    EnvV1ObjectPolicy policy,
+  ) {
+    final action = _objectPolicyActionV1(policy);
+    final areaTooLarge = _isObjectPolicyInteractiveV1(policy) &&
+        _isObjectAreaTooLargeForSpecificSpeechV1(object);
+    _envLogV1(
+      '[ENV_V1_OBJECT] label_policy label=${object.label} '
+      'policy=${_objectPolicyNameV1(policy)} '
+      'action=$action '
+      'score=${_f(object.confidence)} area=${_f(object.areaRatio)}'
+      '${areaTooLarge ? ' areaTooLarge=true' : ''}',
+    );
+  }
+
+  void _logIgnoredObjectV1(
+    DetectedDesktopObject object,
+    EnvV1ObjectPolicy policy,
+  ) {
+    final reason = _objectDecisionReasonForPolicyV1(policy);
+    _envLogV1(
+      '[ENV_V1_OBJECT] ignored_object label=${object.label} '
+      'policy=${_objectPolicyNameV1(policy)} '
+      'score=${_f(object.confidence)} area=${_f(object.areaRatio)} '
+      'reason=$reason',
+    );
+  }
+
+  String _objectPolicyNameV1(EnvV1ObjectPolicy policy) {
+    switch (policy) {
+      case EnvV1ObjectPolicy.officeInteractable:
+        return 'office_interactable';
+      case EnvV1ObjectPolicy.toyLike:
+        return 'toy_like';
+      case EnvV1ObjectPolicy.largeBackground:
+        return 'large_background';
+      case EnvV1ObjectPolicy.officeImpossible:
+        return 'office_impossible';
+      case EnvV1ObjectPolicy.officeAnimal:
+        return 'office_animal';
+      case EnvV1ObjectPolicy.unknown:
+        return 'unknown';
+    }
+  }
+
+  String _objectPolicyActionV1(EnvV1ObjectPolicy policy) {
+    switch (policy) {
+      case EnvV1ObjectPolicy.officeInteractable:
+      case EnvV1ObjectPolicy.toyLike:
+        return 'allow';
+      case EnvV1ObjectPolicy.largeBackground:
+        return 'log_only';
+      case EnvV1ObjectPolicy.officeImpossible:
+      case EnvV1ObjectPolicy.officeAnimal:
+        return 'hard_block';
+      case EnvV1ObjectPolicy.unknown:
+        return 'ignored';
+    }
+  }
+
+  String _objectDecisionReasonForPolicyV1(EnvV1ObjectPolicy policy) {
+    switch (policy) {
+      case EnvV1ObjectPolicy.officeInteractable:
+      case EnvV1ObjectPolicy.toyLike:
+        return 'not_stable_or_low_score';
+      case EnvV1ObjectPolicy.largeBackground:
+        return 'large_background';
+      case EnvV1ObjectPolicy.officeImpossible:
+        return 'office_impossible';
+      case EnvV1ObjectPolicy.officeAnimal:
+        return 'office_animal';
+      case EnvV1ObjectPolicy.unknown:
+        return 'unknown_label';
+    }
+  }
+
+  String _blockedObjectSourceForPolicyV1(EnvV1ObjectPolicy policy) {
+    switch (policy) {
+      case EnvV1ObjectPolicy.largeBackground:
+        return 'log_only';
+      case EnvV1ObjectPolicy.officeImpossible:
+      case EnvV1ObjectPolicy.officeAnimal:
+        return 'hard_block';
+      case EnvV1ObjectPolicy.unknown:
+        return 'ignored';
+      case EnvV1ObjectPolicy.officeInteractable:
+      case EnvV1ObjectPolicy.toyLike:
+        return 'interactive';
+    }
+  }
+
   DetectedDesktopObject? _firstNonPersonObjectV1(
     ObjectDetectionSnapshotResult result,
   ) {
+    DetectedDesktopObject? firstNonPerson;
     for (final object in result.objects) {
       if (!_isPersonObjectLabelV1(object.label)) {
-        return object;
+        firstNonPerson ??= object;
+        final policy = _objectPolicyForV1(object);
+        if (_isObjectEligibleForObjectLookV1(object, policy)) {
+          return object;
+        }
       }
     }
-    return null;
+    return firstNonPerson;
   }
 
-  Future<void> _speakObjectObservationV1(
-    DetectedDesktopObject? object,
-  ) async {
+  Future<_ObjectSpeechModeV1> _speakObjectObservationV1(
+    _ObjectProbeDecisionV1 decision, {
+    required int probeIndex,
+    required int sessionGenericSpeechCount,
+    required int sessionSpecificSpeechCount,
+    required int probeSpeechCount,
+  }) async {
     if (!_enableWeakObjectSpeechV1) {
       _envLogV1(
           '[ENV_V1_OBJECT] object_speech skipped reason=feature_disabled');
-      return;
+      return _ObjectSpeechModeV1.none;
     }
+    final object = decision.object;
     if (object == null) {
-      _envLogV1('[ENV_V1_OBJECT] object_speech skipped reason=no_object');
-      return;
+      final rejected = decision.rejectedObject;
+      final reason = decision.source == 'realtime_low_only' &&
+              _isObjectPolicyInteractiveV1(decision.policy)
+          ? 'realtime_low_candidate_not_stable'
+          : decision.reason;
+      _envLogV1(
+        '[ENV_V1_OBJECT] object_speech skipped reason=$reason '
+        'label=${rejected?.label ?? 'none'} '
+        'policy=${_objectPolicyNameV1(decision.policy)} '
+        'source=${decision.source} probe=$probeIndex',
+      );
+      return _ObjectSpeechModeV1.none;
+    }
+    if (probeSpeechCount >= _objectPerProbeMaxSpeechCountV1) {
+      _envLogV1(
+        '[ENV_V1_OBJECT] object_speech skipped '
+        'reason=probe_speech_limit_reached index=$probeIndex '
+        'count=$probeSpeechCount',
+      );
+      return _ObjectSpeechModeV1.none;
     }
 
     final label = object.label.trim();
@@ -2470,27 +3236,71 @@ class EnvironMonitorModule {
         '[ENV_V1_OBJECT] object_speech skipped '
         'reason=person label=$label score=${_f(score)}',
       );
-      return;
+      return _ObjectSpeechModeV1.none;
     }
-    final isSafeLabel = _objectSpeechSafeLabelsV1.contains(normalizedLabel);
-    if (isSafeLabel && score >= _objectSpeechSpecificConfidenceV1) {
+    final policy = _objectPolicyForV1(object);
+    if (!_isObjectPolicyInteractiveV1(policy)) {
+      final reason = _objectDecisionReasonForPolicyV1(policy);
+      _envLogV1(
+        '[ENV_V1_OBJECT] object_speech skipped '
+        'reason=$reason label=$label '
+        'policy=${_objectPolicyNameV1(policy)} area=${_f(object.areaRatio)}',
+      );
+      return _ObjectSpeechModeV1.none;
+    }
+
+    if (decision.speechMode == _ObjectSpeechModeV1.specific &&
+        _objectSpecificSpeechLabelsV1.contains(normalizedLabel) &&
+        score >= _objectSpecificSpeechScoreV1 &&
+        !_isObjectAreaTooLargeForSpecificSpeechV1(object)) {
+      if (sessionSpecificSpeechCount >= _objectSpecificSpeechMaxPerSessionV1) {
+        _envLogV1(
+          '[ENV_V1_OBJECT] object_speech skipped '
+          'reason=specific_speech_limit_reached '
+          'count=$sessionSpecificSpeechCount',
+        );
+        return _ObjectSpeechModeV1.none;
+      }
       final spokenLabel = _objectSpeechLabelTextV1(label);
-      final text = '我好像看到一个$spokenLabel。';
+      final measure = normalizedLabel == 'book' ? '本' : '个';
+      final text = '我好像看到一$measure$spokenLabel。';
       _envLogV1(
         '[ENV_V1_OBJECT] object_speech mode=specific '
         'label=$label score=${_f(score)} text=$text',
       );
       await speakWithInterruptProtection(text);
-      return;
+      return _ObjectSpeechModeV1.specific;
     }
 
-    const reason = 'low_confidence_or_not_whitelisted';
-    const text = '我好像看到一个小东西。';
+    if (decision.speechMode != _ObjectSpeechModeV1.generic) {
+      _envLogV1(
+        '[ENV_V1_OBJECT] object_speech skipped '
+        'reason=${decision.reason} source=${decision.source} probe=$probeIndex',
+      );
+      return _ObjectSpeechModeV1.none;
+    }
+    if (sessionGenericSpeechCount >= _objectGenericSpeechMaxPerSessionV1) {
+      _envLogV1(
+        '[ENV_V1_OBJECT] object_speech skipped '
+        'reason=generic_speech_already_spoken probe=$probeIndex',
+      );
+      return _ObjectSpeechModeV1.none;
+    }
+
+    const text = '嗯？那边好像有东西，我看看。';
     _envLogV1(
-      '[ENV_V1_OBJECT] object_speech mode=fallback '
-      'reason=$reason label=$label score=${_f(score)}',
+      '[ENV_V1_OBJECT] object_speech mode=generic '
+      'reason=${decision.reason} label=$label score=${_f(score)} text=$text',
     );
     await speakWithInterruptProtection(text);
+    return _ObjectSpeechModeV1.generic;
+  }
+
+  bool _shouldSilentObserveObjectDecisionV1(
+    _ObjectProbeDecisionV1 decision,
+  ) {
+    return decision.speechMode == _ObjectSpeechModeV1.generic &&
+        _objectGenericSpeechCountV1 >= _objectGenericSpeechMaxPerSessionV1;
   }
 
   String _normalizeObjectLabelV1(String label) {
@@ -3520,13 +4330,18 @@ class EnvironMonitorModule {
       return '我和小车断开连接了，我先停在这里。';
     }
     if (reason == 'front_cliff_recover_failed' ||
+        reason == 'rear_cliff_recover_failed' ||
         reason == 'cliff_recover_failed' ||
         reason == 'repeated_front_cliff' ||
         reason == 'backoff_not_safe' ||
         reason == 'backward_interrupted_by_cliff' ||
         reason == 'cliff_repeated_during_turn' ||
-        reason == 'repeated_cliff') {
-      return '主人，前面好像不太安全，我先停住等你。';
+        reason == 'repeated_cliff' ||
+        reason == 'wheel_may_be_off_table' ||
+        reason == 'edge_risk_high' ||
+        reason == 'safety_recover_interrupted' ||
+        reason == 'unknown_obstacle_after_cliff_recover') {
+      return '主人，边上好像不太安全，我先停住等你。';
     }
     return '主人，我有点找不准你了，我先停住等你。';
   }
@@ -3875,6 +4690,247 @@ class EnvironMonitorModule {
     }
   }
 
+  Future<void> _startRealtimeObjectDetectionForEnvV1() async {
+    if (_envRealtimeObjectRunning) {
+      _envLogV1('[ENV_V1_RT_OBJECT] start skipped reason=already_running');
+      return;
+    }
+
+    _envLogV1('[ENV_V1_RT_OBJECT] start requested');
+    final camera = _cameraService;
+    if (camera == null) {
+      _envLogV1('[ENV_V1_RT_OBJECT] start failed error=camera_unavailable');
+      return;
+    }
+
+    try {
+      final stream = await camera.startRealTimeDetection();
+      await _envRealtimeObjectSubscription?.cancel();
+      _envRealtimeObjectSubscription = stream.listen(
+        (recognitions) {
+          final object = _extractBestRealtimeObjectCandidateV1(recognitions);
+          if (object == null) {
+            _envLogV1('[ENV_V1_RT_OBJECT] update hasObject=false');
+            return;
+          }
+          final policy = _objectPolicyForV1(object);
+          if (_isObjectEligibleForObjectLookV1(object, policy)) {
+            _cacheRealtimeObjectV1(object);
+          } else {
+            _recentIgnoredRealtimeObject = object;
+            _logObjectLabelPolicyV1(object, policy);
+            _logIgnoredObjectV1(object, policy);
+          }
+          _envLogV1(
+            '[ENV_V1_RT_OBJECT] update hasObject=true '
+            'label=${object.label} conf=${_f(object.confidence)} '
+            'area=${_f(object.areaRatio)} cx=${_f(object.centerX)} '
+            'policy=${_objectPolicyNameV1(policy)}',
+          );
+        },
+        onError: (Object error) {
+          _envLogV1('[ENV_V1_RT_OBJECT] update failed error=$error');
+        },
+      );
+      _envRealtimeObjectRunning = true;
+      _envLogV1('[ENV_V1_RT_OBJECT] start success');
+    } catch (e) {
+      _envRealtimeObjectRunning = false;
+      _envLogV1('[ENV_V1_RT_OBJECT] start failed error=$e');
+    }
+  }
+
+  Future<void> _stopRealtimeObjectDetectionForEnvV1({
+    String reason = 'unknown',
+  }) async {
+    _envLogV1('[ENV_V1_RT_OBJECT] stop requested reason=$reason');
+    if (!_envRealtimeObjectRunning &&
+        _envRealtimeObjectSubscription == null &&
+        _recentRealtimeObject == null &&
+        _recentRealtimeObjectSamplesV1.isEmpty) {
+      _envLogV1('[ENV_V1_RT_OBJECT] stop success');
+      return;
+    }
+
+    try {
+      await _envRealtimeObjectSubscription?.cancel();
+      _envRealtimeObjectSubscription = null;
+      if (!_envRealtimeHumanRunning) {
+        _cameraService?.stopRealTimeDetection();
+      }
+      _envLogV1('[ENV_V1_RT_OBJECT] stop success');
+    } catch (e) {
+      _envLogV1('[ENV_V1_RT_OBJECT] stop failed error=$e');
+    } finally {
+      _envRealtimeObjectRunning = false;
+      _recentRealtimeObject = null;
+      _recentIgnoredRealtimeObject = null;
+      _recentRealtimeObjectSamplesV1.clear();
+    }
+  }
+
+  Future<_RealtimeObjectProbeAnalysisV1>
+      _collectRealtimeObjectCandidateForProbeV1({
+    required String phase,
+    required Duration timeout,
+  }) async {
+    if (!_envRealtimeObjectRunning) {
+      _envLogV1(
+        '[ENV_V1_RT_OBJECT] phase=$phase wait skipped reason=not_running',
+      );
+      return const _RealtimeObjectProbeAnalysisV1();
+    }
+
+    final deadline = DateTime.now().add(timeout);
+    while (_isEnvironmentMonitoring && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+    }
+
+    final analysis = _analyzeRealtimeObjectSamplesV1();
+    final bestLow = analysis.bestLowCandidate;
+    if (bestLow == null) {
+      final ignored = _recentIgnoredRealtimeObject;
+      if (ignored != null) {
+        final policy = _objectPolicyForV1(ignored);
+        return _RealtimeObjectProbeAnalysisV1(
+          bestLowCandidate: ignored,
+          bestHits: 0,
+          bestPolicy: policy,
+        );
+      }
+      _envLogV1('[ENV_V1_RT_OBJECT] phase=$phase wait timeout no_candidate');
+      return analysis;
+    }
+    if (analysis.stableCandidate != null) {
+      final stable = analysis.stableCandidate!;
+      _envLogV1(
+        '[ENV_V1_OBJECT_PROBE] realtime_candidate stable '
+        'hits=${analysis.bestHits} label=${stable.label} '
+        'bestScore=${_f(stable.confidence)} area=${_f(stable.areaRatio)} '
+        'speechEligible=true',
+      );
+      return analysis;
+    }
+    final bestLowPolicy = _objectPolicyForV1(bestLow);
+    if (_isRealtimeGenericCandidateV1(bestLow, bestLowPolicy)) {
+      _envLogV1(
+        '[ENV_V1_OBJECT_PROBE] realtime_candidate '
+        'label=${bestLow.label} score=${_f(bestLow.confidence)} '
+        'area=${_f(bestLow.areaRatio)} '
+        'policy=${_objectPolicyNameV1(bestLowPolicy)} '
+        'speechEligible=true '
+        'reason=office_interactable_single_hit_generic',
+      );
+      return analysis;
+    }
+    final reason = bestLow.confidence < _objectRealtimeSpeechScoreV1 ||
+            bestLow.areaRatio < _objectRealtimeSpeechAreaV1
+        ? 'low_score_or_area'
+        : 'not_stable';
+    _envLogV1(
+      '[ENV_V1_OBJECT_PROBE] realtime_candidate low '
+      'label=${bestLow.label} score=${_f(bestLow.confidence)} '
+      'area=${_f(bestLow.areaRatio)} '
+      'policy=${_objectPolicyNameV1(bestLowPolicy)} '
+      'speechEligible=false reason=$reason',
+    );
+    return analysis;
+  }
+
+  _RealtimeObjectProbeAnalysisV1 _analyzeRealtimeObjectSamplesV1() {
+    final now = DateTime.now();
+    final cutoff = now.subtract(
+        const Duration(milliseconds: _objectRealtimeStableWindowMsV1));
+    final samples = _recentRealtimeObjectSamplesV1
+        .where((sample) => !sample.observedAt.isBefore(cutoff))
+        .toList(growable: false);
+    if (samples.isEmpty) {
+      return const _RealtimeObjectProbeAnalysisV1();
+    }
+
+    final bestLowSample = samples.reduce((a, b) {
+      final aScore = a.object.confidence * (0.5 + a.object.areaRatio);
+      final bScore = b.object.confidence * (0.5 + b.object.areaRatio);
+      return aScore >= bScore ? a : b;
+    });
+    final byLabel = <String, List<_RealtimeObjectSampleV1>>{};
+    for (final sample in samples) {
+      final key = _normalizeObjectLabelV1(sample.object.label);
+      byLabel.putIfAbsent(key, () => <_RealtimeObjectSampleV1>[]).add(sample);
+    }
+
+    List<_RealtimeObjectSampleV1> bestGroup = const <_RealtimeObjectSampleV1>[];
+    for (final group in byLabel.values) {
+      if (group.length > bestGroup.length) {
+        bestGroup = group;
+      } else if (group.length == bestGroup.length && group.isNotEmpty) {
+        final currentBestScore = bestGroup.isEmpty
+            ? 0.0
+            : bestGroup
+                .map((sample) => sample.object.confidence)
+                .reduce((a, b) => a > b ? a : b);
+        final groupBestScore = group
+            .map((sample) => sample.object.confidence)
+            .reduce((a, b) => a > b ? a : b);
+        if (groupBestScore > currentBestScore) bestGroup = group;
+      }
+    }
+
+    final stableCandidate = _stableRealtimeObjectFromGroupV1(bestGroup);
+    return _RealtimeObjectProbeAnalysisV1(
+      bestLowCandidate: bestLowSample.object,
+      stableCandidate: stableCandidate,
+      bestHits: bestGroup.length,
+    );
+  }
+
+  DetectedDesktopObject? _stableRealtimeObjectFromGroupV1(
+    List<_RealtimeObjectSampleV1> group,
+  ) {
+    if (group.length < _objectRealtimeStableMinHitsV1) return null;
+    final bestSample = group.reduce((a, b) {
+      final aScore = a.object.confidence * (0.5 + a.object.areaRatio);
+      final bScore = b.object.confidence * (0.5 + b.object.areaRatio);
+      return aScore >= bScore ? a : b;
+    });
+    final object = bestSample.object;
+    if (object.confidence < _objectRealtimeSpeechScoreV1 ||
+        object.areaRatio < _objectRealtimeSpeechAreaV1) {
+      return null;
+    }
+    final avgCenterX =
+        group.map((sample) => sample.object.centerX).reduce((a, b) => a + b) /
+            group.length;
+    final avgArea =
+        group.map((sample) => sample.object.areaRatio).reduce((a, b) => a + b) /
+            group.length;
+    final centerStable = (object.centerX - avgCenterX).abs() <= 0.18;
+    final areaStable =
+        avgArea <= 0 || (object.areaRatio - avgArea).abs() <= avgArea * 0.9;
+    if (!centerStable || !areaStable) return null;
+    return object;
+  }
+
+  void _cacheRealtimeObjectV1(DetectedDesktopObject object) {
+    if (!_isReliableRealtimeObjectCandidateV1(object)) return;
+    final now = DateTime.now();
+    _recentRealtimeObject = object;
+    _recentRealtimeObjectSamplesV1.add(
+      _RealtimeObjectSampleV1(object: object, observedAt: now),
+    );
+    final cutoff = now.subtract(
+      const Duration(milliseconds: _objectRealtimeStableWindowMsV1),
+    );
+    _recentRealtimeObjectSamplesV1
+        .removeWhere((sample) => sample.observedAt.isBefore(cutoff));
+  }
+
+  void _clearRealtimeObjectCandidateV1() {
+    _recentRealtimeObject = null;
+    _recentIgnoredRealtimeObject = null;
+    _recentRealtimeObjectSamplesV1.clear();
+  }
+
   HumanObservation? _getFreshRealtimeHumanV1() {
     final observation = _recentRealtimeHuman;
     final observedAt = _recentRealtimeHumanAt;
@@ -3947,6 +5003,61 @@ class EnvironMonitorModule {
       heightRatio: height,
       observedAt: DateTime.now(),
     );
+  }
+
+  DetectedDesktopObject? _extractBestRealtimeObjectCandidateV1(
+    List<dynamic> recognitions,
+  ) {
+    DetectedDesktopObject? bestObject;
+    var bestScore = 0.0;
+
+    for (final recognition in recognitions) {
+      if (recognition is! Map) continue;
+
+      final label = (recognition['detectedClass'] ?? '').toString().trim();
+      if (label.isEmpty || _isPersonObjectLabelV1(label)) continue;
+
+      final confidence =
+          (recognition['confidenceInClass'] as num?)?.toDouble() ?? 0;
+      if (confidence < _realtimeObjectCandidateConfidenceV1) continue;
+
+      final rect = recognition['rect'];
+      if (rect is! Map) continue;
+      final x = (rect['x'] as num?)?.toDouble() ?? 0;
+      final y = (rect['y'] as num?)?.toDouble() ?? 0;
+      final width = (rect['w'] as num?)?.toDouble() ?? 0;
+      final height = (rect['h'] as num?)?.toDouble() ?? 0;
+      final area = width * height;
+      final object = DetectedDesktopObject(
+        label: label,
+        confidence: confidence,
+        centerX: x + width / 2,
+        centerY: y + height / 2,
+        width: width,
+        height: height,
+        areaRatio: area,
+      );
+      if (!_isReliableRealtimeObjectCandidateV1(object)) continue;
+
+      final score = confidence * (0.5 + area);
+      if (score > bestScore) {
+        bestScore = score;
+        bestObject = object;
+      }
+    }
+
+    return bestObject;
+  }
+
+  bool _isReliableRealtimeObjectCandidateV1(DetectedDesktopObject object) {
+    return !_isPersonObjectLabelV1(object.label) &&
+        object.confidence >= _realtimeObjectCandidateConfidenceV1 &&
+        object.areaRatio >= _realtimeObjectCandidateMinAreaRatioV1 &&
+        object.areaRatio <= _realtimeObjectCandidateMaxAreaRatioV1 &&
+        object.centerX >= 0.03 &&
+        object.centerX <= 0.97 &&
+        object.centerY >= 0.03 &&
+        object.centerY <= 0.97;
   }
 
   Future<HumanObservation> _detectHumanObservationSafe({
@@ -4048,17 +5159,20 @@ class EnvironMonitorModule {
     try {
       _envV1MotionCommandInFlight = true;
       if (command == '左转' || command == '右转') {
+        final effectiveValue = _edgeCautiousTurnAngleV1(value, phase: phase);
         _envLogV1(
-          '[BT_TURN] command=$command angleDeg=$value source=ENV_V1',
+          '[BT_TURN] command=$command angleDeg=$effectiveValue source=ENV_V1',
         );
         return _sendTurnCommandWithFrontCliffResumeV1(
           service,
           command,
-          value,
+          effectiveValue,
           phase: phase,
         );
       } else if (command == '停止') {
         _envLogV1('[ENV_V1_CHASSIS] send_stop source=ENV_V1');
+      } else if (command == '前进' || command == '后退') {
+        value = _edgeCautiousLinearDistanceV1(value, phase: phase);
       }
       await service.sendCommand(command, value);
       if (command == '左转' || command == '右转') {
@@ -4115,7 +5229,7 @@ class EnvironMonitorModule {
     final sub = service.responseStream.listen((event) {
       if (event is MotionInterruptedEvent &&
           event.command == commandCode &&
-          _isFrontCliffObstacleTypeV1(event.obstacleType)) {
+          _isCliffObstacleTypeV1(event.obstacleType)) {
         interrupted ??= event;
       }
     });
@@ -4162,7 +5276,10 @@ class EnvironMonitorModule {
       return false;
     }
 
-    final retryAngle = _frontCliffResumeAngleDegV1(angleDeg);
+    final retryAngle = _edgeCautiousTurnAngleV1(
+      _frontCliffResumeAngleDegV1(angleDeg),
+      phase: phase,
+    );
     _envLogV1(
       '[ENV_V1_CLIFF] resume_turn direction=$command '
       'originalAngle=$angleDeg resumeAngle=$retryAngle '
@@ -4196,6 +5313,7 @@ class EnvironMonitorModule {
 
   Future<void> _handleIdleRecenterFrontCliffInterruptV1() async {
     _envLogV1('[ENV_V1_CLIFF] idle_recenter_cliff stop_no_resume');
+    _envLogV1('[ENV_V1_IDLE_RECENTER] stop_no_resume reason=edge_risk');
     _lastFrontCliffRecoveredTurnPhaseV1 = null;
     _clearFrontCliffInterruptsV1('idle_recenter');
 
@@ -4305,10 +5423,14 @@ class EnvironMonitorModule {
     _ownerAlignmentActiveV1 = false;
     _objectLookAroundRunningV1 = false;
     _objectReturnSafeStopWaitingV1 = false;
+    _objectGenericSpeechCountV1 = 0;
+    _objectSpecificSpeechCountV1 = 0;
     _objectReturnPendingSafeStopReasonV1 = null;
     _lastFrontCliffRecoveredTurnPhaseV1 = null;
     _frontCliffInterruptsByPhaseV1.clear();
     _envV1MotionCommandInFlight = false;
+    _envV1EdgeCautiousMode = false;
+    _envV1EdgeCautiousUntil = null;
     _monitorStatus = '环境监测已关闭';
     _cancelStatePollTimer();
     _quietCompanionTimer?.cancel();
@@ -4323,6 +5445,7 @@ class EnvironMonitorModule {
       _envLogV1('[ENV_V1_CHASSIS] stop_on_cleanup_failed error=$e');
     }
 
+    await _stopRealtimeObjectDetectionForEnvV1(reason: 'cleanup');
     await _stopRealtimeHumanDetectionForEnvV1();
     await _disposeCameraService();
     _uiModule?.setProgramMode(ProgramMode.idle);
@@ -4401,6 +5524,58 @@ class _ObjectProbePlanV1 {
   final String turnBackCommand;
 }
 
+enum _ObjectSpeechModeV1 {
+  none,
+  generic,
+  specific,
+}
+
+class _RealtimeObjectSampleV1 {
+  const _RealtimeObjectSampleV1({
+    required this.object,
+    required this.observedAt,
+  });
+
+  final DetectedDesktopObject object;
+  final DateTime observedAt;
+}
+
+class _RealtimeObjectProbeAnalysisV1 {
+  const _RealtimeObjectProbeAnalysisV1({
+    this.bestLowCandidate,
+    this.stableCandidate,
+    this.bestHits = 0,
+    this.bestPolicy,
+  });
+
+  final DetectedDesktopObject? bestLowCandidate;
+  final DetectedDesktopObject? stableCandidate;
+  final int bestHits;
+  final EnvV1ObjectPolicy? bestPolicy;
+}
+
+class _ObjectProbeDecisionV1 {
+  const _ObjectProbeDecisionV1({
+    required this.object,
+    required this.source,
+    required this.speechMode,
+    required this.reason,
+    this.realtimeHits = 0,
+    this.rejectedObject,
+    this.policy = EnvV1ObjectPolicy.unknown,
+  });
+
+  final DetectedDesktopObject? object;
+  final String source;
+  final _ObjectSpeechModeV1 speechMode;
+  final String reason;
+  final int realtimeHits;
+  final DetectedDesktopObject? rejectedObject;
+  final EnvV1ObjectPolicy policy;
+
+  DetectedDesktopObject? get logObject => object ?? rejectedObject;
+}
+
 class _ObjectProbeRunResultV1 {
   const _ObjectProbeRunResultV1({
     required this.restoredToAnchor,
@@ -4409,6 +5584,8 @@ class _ObjectProbeRunResultV1 {
     this.bestObject,
     this.bestSource,
     this.usedMicroApproach = false,
+    this.genericSpeechCountDelta = 0,
+    this.specificSpeechCountDelta = 0,
   });
 
   final bool restoredToAnchor;
@@ -4417,6 +5594,8 @@ class _ObjectProbeRunResultV1 {
   final DetectedDesktopObject? bestObject;
   final String? bestSource;
   final bool usedMicroApproach;
+  final int genericSpeechCountDelta;
+  final int specificSpeechCountDelta;
 }
 
 class _ObjectMicroConfirmResultV1 {

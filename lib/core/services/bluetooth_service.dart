@@ -60,10 +60,17 @@ class LinearMotionFeedback {
 
 class MyBluetoothService extends ChangeNotifier {
   static const bool kEnableFrontSafetyRecover = true;
-  static const bool kEnableRearSafetyRecover = false;
-  static const int kFrontSafetyRecoverDistanceMm = 30;
+  static const bool kEnableRearSafetyRecover = true;
+  static const int _frontSafetyBackoffTotalMm = 50;
+  static const List<int> _frontSafetyBackoffStepsMm = <int>[20, 20, 10];
+  static const int _rearSafetyBackoffTotalMm = 50;
+  static const List<int> _rearSafetyBackoffStepsMm = <int>[20, 20, 10];
+  static const int kFrontSafetyRecoverDistanceMm = _frontSafetyBackoffTotalMm;
+  static const int kRearSafetyRecoverDistanceMm = _rearSafetyBackoffTotalMm;
   static const Duration kFrontSafetyRecoverSettleDelay =
       Duration(milliseconds: 150);
+  static const Duration _safetyRecoverStepTimeout = Duration(seconds: 4);
+  static const int _repeatedCliffWindowMs = 1000;
   static const int _rotationValueScale = 4;
   static const int _rotationPacketMaxValue = 180;
 
@@ -96,8 +103,21 @@ class MyBluetoothService extends ChangeNotifier {
   // 记录当前命令类型
   int? _currentCommand;
   bool _isAutoRecoveringFromObstacle = false;
+  bool _edgeRiskHigh = false;
+  bool _wheelMayBeOffTable = false;
+  bool _lastSafetyRecoverFailed = false;
+  int? _lastSafetyRecoverObstacleType;
+  DateTime? _lastSafetyRecoverAt;
+  final List<DateTime> _recentCliffInterrupts = <DateTime>[];
   Timer? _autoReconnectTimer;
   Timer? _retryConnectTimer;
+
+  bool get isSafetyRecovering => _isAutoRecoveringFromObstacle;
+  bool get edgeRiskHigh => _edgeRiskHigh;
+  bool get wheelMayBeOffTable => _wheelMayBeOffTable;
+  bool get lastSafetyRecoverFailed => _lastSafetyRecoverFailed;
+  int? get lastSafetyRecoverObstacleType => _lastSafetyRecoverObstacleType;
+  DateTime? get lastSafetyRecoverAt => _lastSafetyRecoverAt;
 
   // 连接设备
   Future<void> connect(String deviceName) async {
@@ -223,6 +243,9 @@ class MyBluetoothService extends ChangeNotifier {
           "obstacleType=0x${byte3.toRadixString(16).toUpperCase()} "
           "obstacleDescription=$obstacleInfo",
         );
+        if (_isCliffObstacleType(byte3)) {
+          _registerCliffInterrupt();
+        }
         if (byte3 >= 0x01 && byte3 <= 0x04) {
           unawaited(_autoRecoverFromObstacle(byte3));
         }
@@ -322,6 +345,36 @@ class MyBluetoothService extends ChangeNotifier {
       default:
         return 'unknown';
     }
+  }
+
+  bool _isCliffObstacleType(int obstacleType) {
+    return obstacleType == 0x03 || obstacleType == 0x04;
+  }
+
+  void _registerCliffInterrupt() {
+    final now = DateTime.now();
+    _recentCliffInterrupts.removeWhere(
+      (time) => now.difference(time).inMilliseconds > _repeatedCliffWindowMs,
+    );
+    _recentCliffInterrupts.add(now);
+    if (_recentCliffInterrupts.length >= 2) {
+      print(
+        "[BT_SAFE] repeated_cliff_detected "
+        "count=${_recentCliffInterrupts.length} "
+        "withinMs=$_repeatedCliffWindowMs",
+      );
+      _markWheelMayBeOffTable(reason: 'repeated_cliff');
+    }
+  }
+
+  void _markWheelMayBeOffTable({required String reason}) {
+    _edgeRiskHigh = true;
+    _wheelMayBeOffTable = true;
+    print("[BT_SAFE] wheel_may_be_off_table=true reason=$reason");
+  }
+
+  String _formatSafetyRecoverSteps(List<int> steps) {
+    return '[${steps.join(',')}]';
   }
 
   // 发送命令
@@ -465,14 +518,45 @@ class MyBluetoothService extends ChangeNotifier {
     if (!_isConnected || _rxCharacteristic == null) return;
     if (_isAutoRecoveringFromObstacle) return;
     _isAutoRecoveringFromObstacle = true;
+    _lastSafetyRecoverObstacleType = obstacleType;
+    _lastSafetyRecoverAt = DateTime.now();
+    _lastSafetyRecoverFailed = false;
     try {
       // 先下发停止，确保恢复动作从静止开始。
-      final stop = Uint8List.fromList([0x66, 0x00, 0, 0, 0xFE]);
-      await _rxCharacteristic!.write(stop);
+      await _writeStopPacket();
       await Future<void>.delayed(const Duration(milliseconds: 120));
 
       final obstacleTag = _obstacleTypeTag(obstacleType);
-      if (obstacleType == 0x02 || obstacleType == 0x04) {
+      if (_edgeRiskHigh && _isCliffObstacleType(obstacleType)) {
+        _lastSafetyRecoverFailed = true;
+        return;
+      }
+
+      if (obstacleType == 0x01 || obstacleType == 0x03) {
+        if (!kEnableFrontSafetyRecover) {
+          print(
+              "[BT_SAFE] front_safety_recover_disabled obstacle=$obstacleTag");
+          return;
+        }
+
+        final recovered = await _runSegmentedSafetyRecover(
+          label: 'front_safety_recover',
+          command: '后退',
+          totalMm: _frontSafetyBackoffTotalMm,
+          steps: _frontSafetyBackoffStepsMm,
+          obstacleType: obstacleType,
+          reason: obstacleTag,
+        );
+        if (recovered) {
+          _edgeRiskHigh = false;
+          _wheelMayBeOffTable = false;
+          _lastSafetyRecoverFailed = false;
+          _lastSafetyRecoverAt = DateTime.now();
+        }
+        return;
+      }
+
+      if (obstacleType == 0x04) {
         if (!kEnableRearSafetyRecover) {
           print(
             "[BT_SAFE] rear_recover_disabled "
@@ -480,9 +564,25 @@ class MyBluetoothService extends ChangeNotifier {
           );
           return;
         }
+
+        final recovered = await _runSegmentedSafetyRecover(
+          label: 'rear_safety_recover',
+          command: '前进',
+          totalMm: _rearSafetyBackoffTotalMm,
+          steps: _rearSafetyBackoffStepsMm,
+          obstacleType: obstacleType,
+          reason: obstacleTag,
+        );
+        if (recovered) {
+          _edgeRiskHigh = false;
+          _wheelMayBeOffTable = false;
+          _lastSafetyRecoverFailed = false;
+          _lastSafetyRecoverAt = DateTime.now();
+        }
+        return;
       }
 
-      if (obstacleType != 0x01 && obstacleType != 0x03) {
+      if (obstacleType == 0x02) {
         print(
           "[BT_SAFE] rear_recover_disabled "
           "obstacle=$obstacleTag no_forward_recovery",
@@ -490,25 +590,79 @@ class MyBluetoothService extends ChangeNotifier {
         return;
       }
 
-      if (!kEnableFrontSafetyRecover) {
-        print("[BT_SAFE] front_safety_recover_disabled obstacle=$obstacleTag");
-        return;
-      }
-
-      await _writeForwardBackwardMm(0x02, kFrontSafetyRecoverDistanceMm);
       print(
-        "[BT_SAFE] front_safety_recover "
-        "action=backward "
-        "distanceMm=$kFrontSafetyRecoverDistanceMm "
-        "reason=$obstacleTag",
+        "[BT_SAFE] safety_recover_ignored obstacle=$obstacleTag",
       );
-      await _rxCharacteristic!.write(stop);
-      await Future<void>.delayed(kFrontSafetyRecoverSettleDelay);
     } catch (e) {
+      _lastSafetyRecoverFailed = true;
       print('⚠️ 自动脱困失败: $e');
     } finally {
       _isAutoRecoveringFromObstacle = false;
     }
+  }
+
+  Future<bool> _runSegmentedSafetyRecover({
+    required String label,
+    required String command,
+    required int totalMm,
+    required List<int> steps,
+    required int obstacleType,
+    required String reason,
+  }) async {
+    print(
+      "[BT_SAFE] $label start "
+      "totalMm=$totalMm "
+      "steps=${_formatSafetyRecoverSteps(steps)} "
+      "reason=$reason",
+    );
+
+    for (var i = 0; i < steps.length; i++) {
+      final stepMm = steps[i];
+      print(
+        "[BT_SAFE] $label step=${i + 1}/${steps.length} "
+        "distanceMm=$stepMm",
+      );
+      final feedback = await sendLinearMotionAndAwaitFeedback(
+        command,
+        stepMm,
+        timeout: _safetyRecoverStepTimeout,
+      );
+      if (feedback.kind != LinearMotionEndKind.completed) {
+        _lastSafetyRecoverFailed = true;
+        _lastSafetyRecoverObstacleType = obstacleType;
+        _lastSafetyRecoverAt = DateTime.now();
+        final interruptedObstacle =
+            feedback.kind == LinearMotionEndKind.interrupted
+                ? '0x${feedback.obstacleType.toRadixString(16).toUpperCase()}'
+                : 'timeout';
+        print(
+          "[BT_SAFE] safety_recover interrupted "
+          "obstacleType=$interruptedObstacle "
+          "step=${i + 1}/${steps.length}",
+        );
+        _markWheelMayBeOffTable(reason: 'recover_interrupted');
+        print(
+          "[BT_SAFE] recovery_failed=true "
+          "edgeRiskHigh=$_edgeRiskHigh "
+          "wheelMayBeOffTable=$_wheelMayBeOffTable",
+        );
+        await _writeStopPacket();
+        await Future<void>.delayed(kFrontSafetyRecoverSettleDelay);
+        return false;
+      }
+
+      await _writeStopPacket();
+      await Future<void>.delayed(kFrontSafetyRecoverSettleDelay);
+    }
+
+    print("[BT_SAFE] $label done totalMm=$totalMm");
+    return true;
+  }
+
+  Future<void> _writeStopPacket() async {
+    final stop = Uint8List.fromList([0x66, 0x00, 0, 0, 0xFE]);
+    await _rxCharacteristic!.write(stop);
+    _clearExecutingCommandTracking();
   }
 
   /// 写入前进(0x01)/后退(0x02)毫米距离包（与 [sendCommand] 内逻辑一致）

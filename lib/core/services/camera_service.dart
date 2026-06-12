@@ -456,6 +456,10 @@ class CameraService {
     await initialize();
     await _ensureModelReady();
 
+    if (_isStreaming && _imageStreamSubscription != null) {
+      return _detectionStreamController.stream;
+    }
+
     _isStreaming = true;
 
     final imageStream =
