@@ -82,8 +82,8 @@ class DesktopObjectDetector {
   static const String defaultLabelsPath =
       'assets/models/efficientdet_coco_labels.txt';
 
-  static const double defaultMinConfidence = 0.40;
-  static const double defaultMinAreaRatio = 0.02;
+  static const double defaultMinConfidence = 0.30;
+  static const double defaultMinAreaRatio = 0.01;
   static const double defaultMaxAreaRatio = 0.45;
   static const int defaultTopK = 3;
 

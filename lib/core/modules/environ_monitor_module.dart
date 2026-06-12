@@ -188,7 +188,7 @@ class EnvironMonitorModule {
   static const Duration _ownerReplyWaitPollIntervalV1 =
       Duration(milliseconds: 250);
   static const double _objectSpeechSpecificConfidenceV1 = 0.65;
-  static const double _objectSpeechFallbackConfidenceV1 = 0.40;
+  static const double _objectSpeechFallbackConfidenceV1 = 0.30;
   static const Set<String> _objectSpeechSafeLabelsV1 = {
     'cup',
     'bottle',
