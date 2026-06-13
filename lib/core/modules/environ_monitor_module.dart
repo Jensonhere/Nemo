@@ -23,6 +23,15 @@ enum EnvV1ObjectPolicy {
   unknown,
 }
 
+enum _ChassisSensorIncidentV1 {
+  none,
+  frontObstacle,
+  rearObstacle,
+  frontCliff,
+  rearCliff,
+  unknown,
+}
+
 class SnapshotAlignStatus {
   SnapshotAlignStatus._();
 
@@ -131,7 +140,6 @@ class EnvironMonitorModule {
   static const int _objectLookProbeCountV1 = 2;
   static const int _objectProbeMaxCountV1 = _objectLookProbeCountV1;
   static const int _objectGenericSpeechMaxPerSessionV1 = 1;
-  static const int _objectSpecificSpeechMaxPerSessionV1 = 2;
   static const int _objectPerProbeMaxSpeechCountV1 = 1;
   static const bool _enableObjectMicroApproachOnFoundV1 = false;
   static const int _objectMicroApproachMmV1 = 25;
@@ -204,25 +212,21 @@ class EnvironMonitorModule {
   static const Duration _ownerReplyWaitTimeoutV1 = Duration(seconds: 8);
   static const Duration _ownerReplyWaitPollIntervalV1 =
       Duration(milliseconds: 250);
-  static const double _objectSpecificSpeechScoreV1 = 0.65;
-  static const double _objectSnapshotWeakScoreV1 = 0.30;
   static const double _objectRealtimeCandidateScoreV1 = 0.18;
   static const double _objectRealtimeCandidateAreaV1 = 0.003;
   static const double _objectRealtimeSpeechScoreV1 = 0.30;
-  static const double _objectRealtimeSingleHitGenericScoreV1 = 0.35;
   static const double _objectRealtimeSpeechAreaV1 = 0.006;
   static const double _objectSmallAreaMinV1 = 0.003;
-  static const double _objectSmallAreaMaxV1 = 0.12;
-  static const double _objectLargeAreaThresholdV1 = 0.15;
-  static const double _objectSpeechSpecificConfidenceV1 =
-      _objectSpecificSpeechScoreV1;
+  static const double _objectGenericVisualPresenceScoreV1 = 0.25;
+  static const double _objectGenericVisualPresenceMinAreaV1 = 0.003;
+  static const double _objectGenericVisualPresenceMaxAreaV1 = 0.60;
   static const double _objectSpeechFallbackConfidenceV1 =
       _objectRealtimeSpeechScoreV1;
   static const double _realtimeObjectCandidateConfidenceV1 =
       _objectRealtimeCandidateScoreV1;
   static const double _realtimeObjectCandidateMinAreaRatioV1 =
       _objectRealtimeCandidateAreaV1;
-  static const double _realtimeObjectCandidateMaxAreaRatioV1 = 0.65;
+  static const double _realtimeObjectCandidateMaxAreaRatioV1 = 0.60;
   static const int _objectProbeRealtimeCollectMsV1 = 1200;
   static const int _objectRealtimeStableMinHitsV1 = 3;
   static const int _objectRealtimeStableWindowMsV1 = 1200;
@@ -306,59 +310,6 @@ class EnvironMonitorModule {
     'cat',
     'dog',
   };
-  static const Set<String> _objectSpecificSpeechLabelsV1 = {
-    'bottle',
-    'wine glass',
-    'cup',
-    'bowl',
-    'book',
-    'laptop',
-    'mouse',
-    'keyboard',
-    'cell phone',
-    'remote',
-    'backpack',
-    'handbag',
-    'suitcase',
-    'clock',
-    'vase',
-    'potted plant',
-    'scissors',
-    'toothbrush',
-    'apple',
-    'banana',
-    'orange',
-    'teddy bear',
-  };
-  static const Map<String, String> _officeObjectZhNameV1 = {
-    'bottle': '瓶子',
-    'wine glass': '杯子',
-    'cup': '杯子',
-    'bowl': '碗',
-    'book': '书',
-    'laptop': '电脑',
-    'mouse': '鼠标',
-    'keyboard': '键盘',
-    'cell phone': '手机',
-    'remote': '遥控器',
-    'backpack': '背包',
-    'handbag': '包',
-    'suitcase': '箱子',
-    'clock': '时钟',
-    'vase': '花瓶',
-    'potted plant': '小植物',
-    'scissors': '剪刀',
-    'toothbrush': '牙刷',
-    'apple': '苹果',
-    'banana': '香蕉',
-    'orange': '橙子',
-    'teddy bear': '小熊',
-    'sports ball': '球',
-    'frisbee': '飞盘',
-    'toy': '玩具',
-  };
-  static const Map<String, String> _objectSpeechLabelZhV1 =
-      _officeObjectZhNameV1;
   static const List<_ObjectProbePlanV1> _objectProbePlansV1 = [
     _ObjectProbePlanV1(
       turnCommand: '右转',
@@ -393,7 +344,6 @@ class EnvironMonitorModule {
   bool _envRealtimeHumanRunning = false;
   bool _envRealtimeObjectRunning = false;
   int _objectGenericSpeechCountV1 = 0;
-  int _objectSpecificSpeechCountV1 = 0;
   bool _quietCompanionActiveV1 = false;
   bool _ownerAlignmentActiveV1 = false;
   bool _envV1MotionCommandInFlight = false;
@@ -410,6 +360,9 @@ class EnvironMonitorModule {
   String? _idleRecenterLastDirectionV1;
   String? _objectReturnPendingSafeStopReasonV1;
   String? _lastFrontCliffRecoveredTurnPhaseV1;
+  _ChassisSensorIncidentV1 _lastTurnSensorIncidentV1 =
+      _ChassisSensorIncidentV1.none;
+  String? _lastTurnSensorIncidentPhaseV1;
   DateTime? _envV1EdgeCautiousUntil;
   final Map<String, int> _frontCliffInterruptsByPhaseV1 = <String, int>{};
   HumanObservation? _recentRealtimeHuman;
@@ -462,6 +415,8 @@ class EnvironMonitorModule {
     _objectReturnSafeStopWaitingV1 = false;
     _objectReturnPendingSafeStopReasonV1 = null;
     _lastFrontCliffRecoveredTurnPhaseV1 = null;
+    _lastTurnSensorIncidentV1 = _ChassisSensorIncidentV1.none;
+    _lastTurnSensorIncidentPhaseV1 = null;
     _frontCliffInterruptsByPhaseV1.clear();
     _monitorStatus = '环境监测 V1 启动';
     _quietCompanionTimer?.cancel();
@@ -1737,7 +1692,6 @@ class EnvironMonitorModule {
     var objectLookAborted = false;
     var objectLookFinished = false;
     _objectGenericSpeechCountV1 = 0;
-    _objectSpecificSpeechCountV1 = 0;
     DetectedDesktopObject? bestObject;
     String? bestObjectSource;
     try {
@@ -1765,12 +1719,10 @@ class EnvironMonitorModule {
           forwardMm: forwardMm,
           allowMicroApproach: !microApproachUsed,
           sessionGenericSpeechCount: _objectGenericSpeechCountV1,
-          sessionSpecificSpeechCount: _objectSpecificSpeechCountV1,
         );
         foundAnyObject = foundAnyObject || probeResult.foundObject;
         microApproachUsed = microApproachUsed || probeResult.usedMicroApproach;
         _objectGenericSpeechCountV1 += probeResult.genericSpeechCountDelta;
-        _objectSpecificSpeechCountV1 += probeResult.specificSpeechCountDelta;
 
         final candidate = probeResult.bestObject;
         if (candidate != null &&
@@ -1786,16 +1738,15 @@ class EnvironMonitorModule {
         }
         if (!probeResult.shouldContinue) {
           forceReturnResearch = !probeResult.restoredToAnchor;
-          objectLookAborted = true;
+          objectLookAborted = !probeResult.finishedGracefully;
           break;
         }
 
         if (bestObject != null &&
-            bestObject.confidence >= _objectSpeechSpecificConfidenceV1 &&
             index >= _objectMinProbeCountBeforeEarlyStopV1) {
           _envLogV1(
             '[ENV_V1_OBJECT] early_stop '
-            'reason=high_confidence_after_min_probes',
+            'reason=generic_visual_presence_found',
           );
           break;
         }
@@ -1825,9 +1776,11 @@ class EnvironMonitorModule {
     }
 
     if (!_isEnvironmentMonitoring) return;
-    if (_objectReturnSafetyStopReasonV1() != null) {
-      final finalResult = await _reconfirmOwnerAfterObjectLookV1(
-        forceResearch: true,
+    final safetyReasonAfterObjectLook = _objectReturnSafetyStopReasonV1();
+    if (safetyReasonAfterObjectLook != null) {
+      final finalResult = await _enterObjectReturnSafeStopWaitForOwnerV1(
+        reason: safetyReasonAfterObjectLook,
+        lastResult: SnapshotAlignResult.noTarget(),
       );
       _envLogV1(
         '[ENV_V1_OBJECT] stopped reason=safe_stop_wait_for_owner '
@@ -1885,7 +1838,6 @@ class EnvironMonitorModule {
     required int forwardMm,
     required bool allowMicroApproach,
     required int sessionGenericSpeechCount,
-    required int sessionSpecificSpeechCount,
   }) async {
     _envLogV1(
       '[ENV_V1_OBJECT_PROBE] start index=$index/$total '
@@ -1895,7 +1847,6 @@ class EnvironMonitorModule {
     _clearRealtimeObjectCandidateV1();
     var probeSpeechCount = 0;
     var genericSpeechCountDelta = 0;
-    var specificSpeechCountDelta = 0;
 
     final turnedOut = await _safeSendCommandV1WithPhase(
       plan.turnCommand,
@@ -1903,6 +1854,21 @@ class EnvironMonitorModule {
       phase: 'object_probe_turn_out',
     );
     if (!turnedOut) {
+      if (_consumeTurnSensorIncidentV1(
+        'object_probe_turn_out',
+        logPrefix: '[ENV_V1_OBJECT_PROBE]',
+      )) {
+        await _safeSendCommandV1('停止', 0);
+        _envLogV1(
+          '[ENV_V1_OBJECT_PROBE] object_look_continue '
+          'reason=turn_sensor_interrupt_not_fatal',
+        );
+        return const _ObjectProbeRunResultV1(
+          restoredToAnchor: true,
+          foundObject: false,
+          shouldContinue: true,
+        );
+      }
       await _failObjectProbeV1(
         phase: 'turn_out',
         index: index,
@@ -1923,13 +1889,41 @@ class EnvironMonitorModule {
       index: index,
     );
     if (!movedForward.success) {
-      if (movedForward.cliffDetected) {
-        _envLogV1('[ENV_V1_OBJECT_PROBE] aborted reason=cliff_detected');
-        await _turnBackObjectProbeAfterAbortV1(plan, index: index);
-        return const _ObjectProbeRunResultV1(
+      if (movedForward.safeStopRequired) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_PROBE] motion_paused_keep_monitoring '
+          'phase=forward obstacle=${_sensorIncidentNameV1(movedForward.incident)} '
+          'code=${_sensorIncidentCodeV1(movedForward.incident)}',
+        );
+        return _ObjectProbeRunResultV1(
           restoredToAnchor: false,
           foundObject: false,
           shouldContinue: false,
+          finishedGracefully: true,
+          genericSpeechCountDelta: genericSpeechCountDelta,
+        );
+      }
+      if (_isNonFatalSensorIncidentV1(movedForward.incident)) {
+        return _handleObjectProbeForwardSensorIncidentV1(
+          detector,
+          plan,
+          index: index,
+          incident: movedForward.incident,
+          sessionGenericSpeechCount:
+              sessionGenericSpeechCount + genericSpeechCountDelta,
+          probeSpeechCount: probeSpeechCount,
+          genericSpeechCountDelta: genericSpeechCountDelta,
+        );
+      }
+      if (movedForward.cliffDetected) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_PROBE] motion_paused_keep_monitoring '
+          'phase=forward reason=cliff_detected',
+        );
+        return const _ObjectProbeRunResultV1(
+          restoredToAnchor: false,
+          foundObject: false,
+          shouldContinue: true,
         );
       }
       await _failObjectProbeV1(
@@ -2011,8 +2005,6 @@ class EnvironMonitorModule {
         probeIndex: index,
         sessionGenericSpeechCount:
             sessionGenericSpeechCount + genericSpeechCountDelta,
-        sessionSpecificSpeechCount:
-            sessionSpecificSpeechCount + specificSpeechCountDelta,
         probeSpeechCount: probeSpeechCount,
       );
     }
@@ -2036,16 +2028,12 @@ class EnvironMonitorModule {
         probeIndex: index,
         sessionGenericSpeechCount:
             sessionGenericSpeechCount + genericSpeechCountDelta,
-        sessionSpecificSpeechCount:
-            sessionSpecificSpeechCount + specificSpeechCountDelta,
         probeSpeechCount: probeSpeechCount,
       );
       if (spokenMode != _ObjectSpeechModeV1.none) {
         probeSpeechCount++;
-        if (spokenMode == _ObjectSpeechModeV1.generic) {
+        if (_isGenericObjectSpeechModeV1(spokenMode)) {
           genericSpeechCountDelta++;
-        } else if (spokenMode == _ObjectSpeechModeV1.specific) {
-          specificSpeechCountDelta++;
         }
         await Future<void>.delayed(
           const Duration(milliseconds: _objectFoundPauseAfterSpeechMsV1),
@@ -2070,17 +2058,18 @@ class EnvironMonitorModule {
         );
         usedMicroApproach = microResult.usedMicroApproach;
         if (microResult.cliffDetected) {
-          _envLogV1('[ENV_V1_OBJECT_PROBE] aborted reason=cliff_detected');
-          await _turnBackObjectProbeAfterAbortV1(plan, index: index);
+          _envLogV1(
+            '[ENV_V1_OBJECT_PROBE] motion_paused_keep_monitoring '
+            'phase=micro reason=cliff_detected',
+          );
           return _ObjectProbeRunResultV1(
             restoredToAnchor: false,
             foundObject: foundObject,
-            shouldContinue: false,
+            shouldContinue: true,
             bestObject: bestObject,
             bestSource: bestSource,
             usedMicroApproach: usedMicroApproach,
             genericSpeechCountDelta: genericSpeechCountDelta,
-            specificSpeechCountDelta: specificSpeechCountDelta,
           );
         }
         final confirmedObject = microResult.confirmedObject;
@@ -2109,8 +2098,59 @@ class EnvironMonitorModule {
       index: index,
     );
     if (!movedBackward.success) {
+      if (movedBackward.safeStopRequired) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_PROBE] motion_paused_keep_monitoring '
+          'phase=backward obstacle=${_sensorIncidentNameV1(movedBackward.incident)} '
+          'code=${_sensorIncidentCodeV1(movedBackward.incident)}',
+        );
+        return _ObjectProbeRunResultV1(
+          restoredToAnchor: false,
+          foundObject: foundObject,
+          shouldContinue: false,
+          finishedGracefully: true,
+          bestObject: bestObject,
+          bestSource: bestSource,
+          usedMicroApproach: usedMicroApproach,
+          genericSpeechCountDelta: genericSpeechCountDelta,
+        );
+      }
+      if (_isNonFatalSensorIncidentV1(movedBackward.incident)) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_PROBE] backward_interrupted '
+          'obstacle=${_sensorIncidentNameV1(movedBackward.incident)} '
+          'code=${_sensorIncidentCodeV1(movedBackward.incident)} '
+          'action=stop_keep_monitoring',
+        );
+        _envLogV1(
+          '[ENV_V1_OBJECT_PROBE] anchor_restore_partial '
+          'reason=${_sensorIncidentNameV1(movedBackward.incident)}',
+        );
+        await _safeSendCommandV1('停止', 0);
+        return _ObjectProbeRunResultV1(
+          restoredToAnchor: false,
+          foundObject: foundObject,
+          shouldContinue: true,
+          bestObject: bestObject,
+          bestSource: bestSource,
+          usedMicroApproach: usedMicroApproach,
+          genericSpeechCountDelta: genericSpeechCountDelta,
+        );
+      }
       if (movedBackward.cliffDetected) {
-        _envLogV1('[ENV_V1_OBJECT_PROBE] aborted reason=cliff_detected');
+        _envLogV1(
+          '[ENV_V1_OBJECT_PROBE] motion_paused_keep_monitoring '
+          'phase=backward reason=cliff_detected',
+        );
+        return _ObjectProbeRunResultV1(
+          restoredToAnchor: false,
+          foundObject: foundObject,
+          shouldContinue: true,
+          bestObject: bestObject,
+          bestSource: bestSource,
+          usedMicroApproach: usedMicroApproach,
+          genericSpeechCountDelta: genericSpeechCountDelta,
+        );
       }
       await _failObjectProbeV1(
         phase: 'backward',
@@ -2125,7 +2165,6 @@ class EnvironMonitorModule {
         bestSource: bestSource,
         usedMicroApproach: usedMicroApproach,
         genericSpeechCountDelta: genericSpeechCountDelta,
-        specificSpeechCountDelta: specificSpeechCountDelta,
       );
     }
     _envLogV1(
@@ -2147,7 +2186,6 @@ class EnvironMonitorModule {
         bestSource: bestSource,
         usedMicroApproach: usedMicroApproach,
         genericSpeechCountDelta: genericSpeechCountDelta,
-        specificSpeechCountDelta: specificSpeechCountDelta,
       );
     }
 
@@ -2157,6 +2195,25 @@ class EnvironMonitorModule {
       phase: 'object_probe_turn_back',
     );
     if (!turnedBack) {
+      if (_consumeTurnSensorIncidentV1(
+        'object_probe_turn_back',
+        logPrefix: '[ENV_V1_OBJECT_PROBE]',
+      )) {
+        await _safeSendCommandV1('停止', 0);
+        _envLogV1(
+          '[ENV_V1_OBJECT_PROBE] anchor_restore_partial '
+          'reason=turn_sensor_interrupt',
+        );
+        return _ObjectProbeRunResultV1(
+          restoredToAnchor: false,
+          foundObject: foundObject,
+          shouldContinue: true,
+          bestObject: bestObject,
+          bestSource: bestSource,
+          usedMicroApproach: usedMicroApproach,
+          genericSpeechCountDelta: genericSpeechCountDelta,
+        );
+      }
       await _failObjectProbeV1(
         phase: 'turn_back',
         index: index,
@@ -2170,7 +2227,6 @@ class EnvironMonitorModule {
         bestSource: bestSource,
         usedMicroApproach: usedMicroApproach,
         genericSpeechCountDelta: genericSpeechCountDelta,
-        specificSpeechCountDelta: specificSpeechCountDelta,
       );
     }
     _envLogV1('[ENV_V1_OBJECT_PROBE] turn_back done index=$index');
@@ -2190,7 +2246,6 @@ class EnvironMonitorModule {
         bestSource: bestSource,
         usedMicroApproach: usedMicroApproach,
         genericSpeechCountDelta: genericSpeechCountDelta,
-        specificSpeechCountDelta: specificSpeechCountDelta,
       );
     }
     await Future<void>.delayed(_settleDelay);
@@ -2198,12 +2253,12 @@ class EnvironMonitorModule {
     return _ObjectProbeRunResultV1(
       restoredToAnchor: true,
       foundObject: foundObject,
-      shouldContinue: true,
+      shouldContinue: !foundObject,
+      finishedGracefully: foundObject,
       bestObject: bestObject,
       bestSource: bestSource,
       usedMicroApproach: usedMicroApproach,
       genericSpeechCountDelta: genericSpeechCountDelta,
-      specificSpeechCountDelta: specificSpeechCountDelta,
     );
   }
 
@@ -2241,8 +2296,33 @@ class EnvironMonitorModule {
       phase: 'micro_approach',
     );
     if (!movedForward.success) {
+      if (movedForward.safeStopRequired) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_MICRO] motion_paused_keep_monitoring '
+          'obstacle=${_sensorIncidentNameV1(movedForward.incident)} '
+          'code=${_sensorIncidentCodeV1(movedForward.incident)}',
+        );
+        await _safeSendCommandV1('停止', 0);
+        return const _ObjectMicroConfirmResultV1(
+          usedMicroApproach: true,
+          cliffDetected: true,
+        );
+      }
+      if (_isNonFatalSensorIncidentV1(movedForward.incident)) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_MICRO] interrupted '
+          'obstacle=${_sensorIncidentNameV1(movedForward.incident)} '
+          'code=${_sensorIncidentCodeV1(movedForward.incident)} '
+          'action=skip_micro_keep_monitoring',
+        );
+        await _safeSendCommandV1('停止', 0);
+        return const _ObjectMicroConfirmResultV1(usedMicroApproach: true);
+      }
       if (movedForward.cliffDetected) {
-        _envLogV1('[ENV_V1_OBJECT_MICRO] aborted reason=cliff_detected');
+        _envLogV1(
+          '[ENV_V1_OBJECT_MICRO] motion_paused_keep_monitoring '
+          'reason=cliff_detected',
+        );
         return const _ObjectMicroConfirmResultV1(
           usedMicroApproach: true,
           cliffDetected: true,
@@ -2279,8 +2359,37 @@ class EnvironMonitorModule {
       phase: 'micro_backward',
     );
     if (!movedBackward.success) {
+      if (movedBackward.safeStopRequired) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_MICRO] motion_paused_keep_monitoring '
+          'obstacle=${_sensorIncidentNameV1(movedBackward.incident)} '
+          'code=${_sensorIncidentCodeV1(movedBackward.incident)}',
+        );
+        await _safeSendCommandV1('停止', 0);
+        return _ObjectMicroConfirmResultV1(
+          usedMicroApproach: true,
+          cliffDetected: true,
+          confirmedObject: confirmedObject,
+        );
+      }
+      if (_isNonFatalSensorIncidentV1(movedBackward.incident)) {
+        _envLogV1(
+          '[ENV_V1_OBJECT_MICRO] backward_interrupted '
+          'obstacle=${_sensorIncidentNameV1(movedBackward.incident)} '
+          'code=${_sensorIncidentCodeV1(movedBackward.incident)} '
+          'action=stop_keep_monitoring',
+        );
+        await _safeSendCommandV1('停止', 0);
+        return _ObjectMicroConfirmResultV1(
+          usedMicroApproach: true,
+          confirmedObject: confirmedObject,
+        );
+      }
       if (movedBackward.cliffDetected) {
-        _envLogV1('[ENV_V1_OBJECT_MICRO] aborted reason=cliff_detected');
+        _envLogV1(
+          '[ENV_V1_OBJECT_MICRO] motion_paused_keep_monitoring '
+          'reason=cliff_detected',
+        );
         return _ObjectMicroConfirmResultV1(
           usedMicroApproach: true,
           cliffDetected: true,
@@ -2376,6 +2485,10 @@ class EnvironMonitorModule {
         return const _LinearMotionGuardResultV1(success: true);
       }
       if (feedback.kind == LinearMotionEndKind.interrupted) {
+        final incident = _sensorIncidentFromObstacleTypeV1(
+          feedback.obstacleType,
+        );
+        final obstacle = _sensorIncidentNameV1(incident);
         final cliffDetected = _isCliffObstacleTypeV1(feedback.obstacleType);
         if (cliffDetected) {
           if (command == '后退') {
@@ -2390,8 +2503,9 @@ class EnvironMonitorModule {
                 'backward_interrupted_by_cliff',
               );
               await _safeSendCommandV1('停止', 0);
-              return const _LinearMotionGuardResultV1(
+              return _LinearMotionGuardResultV1(
                 success: false,
+                incident: incident,
                 cliffDetected: true,
                 safeStopRequired: true,
                 error: 'backward_interrupted_by_cliff',
@@ -2409,8 +2523,9 @@ class EnvironMonitorModule {
             _markObjectReturnSafetyStopReasonV1(
               'cliff_recover_failed',
             );
-            return const _LinearMotionGuardResultV1(
+            return _LinearMotionGuardResultV1(
               success: false,
+              incident: incident,
               cliffDetected: true,
               safeStopRequired: true,
               error: 'cliff_recover_failed',
@@ -2422,8 +2537,9 @@ class EnvironMonitorModule {
               'phase=$phase distanceMm=$effectiveMm',
             );
           }
-          return const _LinearMotionGuardResultV1(
+          return _LinearMotionGuardResultV1(
             success: true,
+            incident: incident,
             cliffDetected: true,
             recoverySucceeded: true,
             error: 'cliff_recovered',
@@ -2436,14 +2552,21 @@ class EnvironMonitorModule {
           );
           return _LinearMotionGuardResultV1(
             success: false,
+            incident: incident,
             safeStopRequired: true,
             error:
                 'motion_interrupted_0x${feedback.obstacleType.toRadixString(16)}',
           );
         }
         await _safeSendCommandV1('停止', 0);
+        _envLogV1(
+          '[ENV_V1_CHASSIS] motion_interrupted_nonfatal '
+          'phase=$phase command=$command obstacle=$obstacle '
+          'code=0x${feedback.obstacleType.toRadixString(16)}',
+        );
         return _LinearMotionGuardResultV1(
           success: false,
+          incident: incident,
           error:
               'motion_interrupted_0x${feedback.obstacleType.toRadixString(16)}',
         );
@@ -2479,6 +2602,63 @@ class EnvironMonitorModule {
 
   bool _isRearCliffObstacleTypeV1(int obstacleType) {
     return obstacleType == 0x04;
+  }
+
+  _ChassisSensorIncidentV1 _sensorIncidentFromObstacleTypeV1(
+    int obstacleType,
+  ) {
+    switch (obstacleType) {
+      case 0x01:
+        return _ChassisSensorIncidentV1.frontObstacle;
+      case 0x02:
+        return _ChassisSensorIncidentV1.rearObstacle;
+      case 0x03:
+        return _ChassisSensorIncidentV1.frontCliff;
+      case 0x04:
+        return _ChassisSensorIncidentV1.rearCliff;
+      default:
+        return _ChassisSensorIncidentV1.unknown;
+    }
+  }
+
+  String _sensorIncidentNameV1(_ChassisSensorIncidentV1 incident) {
+    switch (incident) {
+      case _ChassisSensorIncidentV1.frontObstacle:
+        return 'front_obstacle';
+      case _ChassisSensorIncidentV1.rearObstacle:
+        return 'rear_obstacle';
+      case _ChassisSensorIncidentV1.frontCliff:
+        return 'front_cliff';
+      case _ChassisSensorIncidentV1.rearCliff:
+        return 'rear_cliff';
+      case _ChassisSensorIncidentV1.unknown:
+        return 'unknown';
+      case _ChassisSensorIncidentV1.none:
+        return 'none';
+    }
+  }
+
+  String _sensorIncidentCodeV1(_ChassisSensorIncidentV1 incident) {
+    switch (incident) {
+      case _ChassisSensorIncidentV1.frontObstacle:
+        return '0x1';
+      case _ChassisSensorIncidentV1.rearObstacle:
+        return '0x2';
+      case _ChassisSensorIncidentV1.frontCliff:
+        return '0x3';
+      case _ChassisSensorIncidentV1.rearCliff:
+        return '0x4';
+      case _ChassisSensorIncidentV1.unknown:
+      case _ChassisSensorIncidentV1.none:
+        return 'unknown';
+    }
+  }
+
+  bool _isNonFatalSensorIncidentV1(_ChassisSensorIncidentV1 incident) {
+    return incident == _ChassisSensorIncidentV1.frontObstacle ||
+        incident == _ChassisSensorIncidentV1.rearObstacle ||
+        incident == _ChassisSensorIncidentV1.frontCliff ||
+        incident == _ChassisSensorIncidentV1.rearCliff;
   }
 
   bool _isFrontCliffAutoBackoffByBluetoothV1() {
@@ -2608,14 +2788,15 @@ class EnvironMonitorModule {
     required String phase,
   }) async {
     _envLogV1(
-      '[ENV_V1_SAFE_STOP] reason=$reason phase=${_edgePhaseLabelV1(phase)}',
+      '[ENV_V1_SAFE_STOP] reason=$reason '
+      'action=motion_paused_keep_monitoring '
+      'phase=${_edgePhaseLabelV1(phase)}',
     );
     _markObjectReturnSafetyStopReasonV1(reason);
-    if (phase.startsWith('object_probe') || phase.startsWith('probe_')) {
-      _envLogV1('[ENV_V1_OBJECT] aborted reason=edge_risk_high');
-      await _stopRealtimeObjectDetectionForEnvV1(reason: 'edge_risk_high');
-    }
     await _safeSendCommandV1('停止', 0);
+    _envLogV1(
+      '[ENV_V1] keep_alive_after_safe_stop active=$_isEnvironmentMonitoring',
+    );
   }
 
   void _logContinueAfterEdgeRecoverV1(String phase) {
@@ -2650,6 +2831,7 @@ class EnvironMonitorModule {
     final isRearCliff = _isRearCliffObstacleTypeV1(obstacleType);
     final recoveredReason =
         isRearCliff ? 'rear_cliff_recovered' : 'front_cliff_recovered';
+    final cautiousReason = isRearCliff ? 'rear_cliff' : 'front_cliff';
     final angleText =
         interruptedAngleDeg == null ? '' : ' angle=$interruptedAngleDeg';
     final distanceText = interruptedDistanceMm == null
@@ -2723,7 +2905,8 @@ class EnvironMonitorModule {
       '[ENV_V1_CLIFF] recover settleMs=$_frontCliffRecoverSettleMsV1',
     );
     _envLogV1('[ENV_V1_CLIFF] recover done phase=$phase');
-    _enterEdgeCautiousModeV1(reason: recoveredReason);
+    _envLogV1('[ENV_V1_EDGE] $recoveredReason keep_monitoring=true');
+    _enterEdgeCautiousModeV1(reason: cautiousReason);
     _logContinueAfterEdgeRecoverV1(phase);
     return true;
   }
@@ -2769,14 +2952,152 @@ class EnvironMonitorModule {
     return false;
   }
 
-  Future<bool> _turnBackObjectProbeAfterAbortV1(
+  Future<_ObjectProbeRunResultV1> _handleObjectProbeForwardSensorIncidentV1(
+    DesktopObjectDetector detector,
     _ObjectProbePlanV1 plan, {
     required int index,
+    required _ChassisSensorIncidentV1 incident,
+    required int sessionGenericSpeechCount,
+    required int probeSpeechCount,
+    required int genericSpeechCountDelta,
   }) async {
-    _envLogV1('[ENV_V1_OBJECT_PROBE] restore_after_cliff start index=$index');
+    final obstacle = _sensorIncidentNameV1(incident);
+    final code = _sensorIncidentCodeV1(incident);
     _envLogV1(
-      '[ENV_V1_OBJECT_PROBE] restore_after_cliff turn_back '
-      'direction=${plan.turnBackCommand}',
+      '[ENV_V1_OBJECT_PROBE] forward_interrupted '
+      'obstacle=$obstacle code=$code action=skip_forward_keep_monitoring',
+    );
+    await _safeSendCommandV1('停止', 0);
+
+    if (incident == _ChassisSensorIncidentV1.frontObstacle) {
+      final realtimeCandidate = _recentRealtimeObject;
+      if (realtimeCandidate != null) {
+        final policy = _objectPolicyForV1(realtimeCandidate);
+        if (_isRealtimeGenericCandidateV1(realtimeCandidate)) {
+          _logGenericVisualObjectCandidateV1(
+            '[ENV_V1_OBJECT] generic_visual_candidate',
+            realtimeCandidate,
+          );
+          _envLogV1(
+            '[ENV_V1_OBJECT_PROBE] realtime_candidate_on_obstacle '
+            'label=${realtimeCandidate.label} '
+            'policy=${_objectPolicyNameV1(policy)}',
+          );
+          final decision = _ObjectProbeDecisionV1(
+            object: realtimeCandidate,
+            source: 'generic_visual_presence',
+            speechMode: _ObjectSpeechModeV1.genericVisualPresence,
+            reason: 'front_obstacle_with_generic_visual_presence',
+            realtimeHits: _recentRealtimeObjectSamplesV1.length,
+            policy: policy,
+          );
+          _envLogV1(
+            '[ENV_V1_OBJECT_PROBE] merged_result found=true '
+            'source=${decision.source} label=${realtimeCandidate.label}',
+          );
+          final spokenMode = await _speakObjectObservationV1(
+            decision,
+            probeIndex: index,
+            sessionGenericSpeechCount: sessionGenericSpeechCount,
+            probeSpeechCount: probeSpeechCount,
+          );
+          var nextGenericDelta = genericSpeechCountDelta;
+          if (_isGenericObjectSpeechModeV1(spokenMode)) {
+            nextGenericDelta++;
+          }
+
+          final restored = await _turnBackObjectProbeAfterSensorIncidentV1(
+            plan,
+            index: index,
+            reason: 'front_obstacle_candidate',
+          );
+          return _ObjectProbeRunResultV1(
+            restoredToAnchor: restored,
+            foundObject: true,
+            shouldContinue: false,
+            finishedGracefully: true,
+            bestObject: realtimeCandidate,
+            bestSource: decision.source,
+            genericSpeechCountDelta: nextGenericDelta,
+          );
+        }
+      }
+
+      final snapshot = await _captureAndDetectObjectProbeSnapshotV1(detector);
+      final snapshotObject =
+          snapshot == null ? null : _firstNonPersonObjectV1(snapshot);
+      if (snapshotObject != null) {
+        final policy = _objectPolicyForV1(snapshotObject);
+        if (_isGenericVisualObjectPresenceV1(snapshotObject)) {
+          _logGenericVisualObjectCandidateV1(
+            '[ENV_V1_OBJECT_PROBE] snapshot_generic_visual_candidate',
+            snapshotObject,
+          );
+          final decision = _ObjectProbeDecisionV1(
+            object: snapshotObject,
+            source: 'generic_visual_presence',
+            speechMode: _ObjectSpeechModeV1.genericVisualPresence,
+            reason: '${obstacle}_with_generic_visual_presence',
+            policy: policy,
+          );
+          _envLogV1(
+            '[ENV_V1_OBJECT_PROBE] merged_result found=true '
+            'source=${decision.source} label=${snapshotObject.label}',
+          );
+          final spokenMode = await _speakObjectObservationV1(
+            decision,
+            probeIndex: index,
+            sessionGenericSpeechCount: sessionGenericSpeechCount,
+            probeSpeechCount: probeSpeechCount,
+          );
+          var nextGenericDelta = genericSpeechCountDelta;
+          if (_isGenericObjectSpeechModeV1(spokenMode)) {
+            nextGenericDelta++;
+          }
+
+          final restored = await _turnBackObjectProbeAfterSensorIncidentV1(
+            plan,
+            index: index,
+            reason: 'forward_interrupt_candidate',
+          );
+          return _ObjectProbeRunResultV1(
+            restoredToAnchor: restored,
+            foundObject: true,
+            shouldContinue: false,
+            finishedGracefully: true,
+            bestObject: snapshotObject,
+            bestSource: decision.source,
+            genericSpeechCountDelta: nextGenericDelta,
+          );
+        }
+      }
+    }
+
+    _envLogV1(
+      '[ENV_V1_OBJECT_PROBE] object_look_continue '
+      'reason=${obstacle}_not_fatal',
+    );
+    final restored = await _turnBackObjectProbeAfterSensorIncidentV1(
+      plan,
+      index: index,
+      reason: obstacle,
+    );
+    return _ObjectProbeRunResultV1(
+      restoredToAnchor: restored,
+      foundObject: false,
+      shouldContinue: true,
+      genericSpeechCountDelta: genericSpeechCountDelta,
+    );
+  }
+
+  Future<bool> _turnBackObjectProbeAfterSensorIncidentV1(
+    _ObjectProbePlanV1 plan, {
+    required int index,
+    required String reason,
+  }) async {
+    _envLogV1(
+      '[ENV_V1_OBJECT_PROBE] restore_after_sensor_incident '
+      'start index=$index reason=$reason',
     );
     final turnedBack = await _safeSendCommandV1WithPhase(
       plan.turnBackCommand,
@@ -2785,14 +3106,15 @@ class EnvironMonitorModule {
     );
     if (!turnedBack) {
       _envLogV1(
-        '[ENV_V1_OBJECT_PROBE] restore_after_cliff failed '
-        'reason=turn_back_interrupted_by_cliff index=$index',
+        '[ENV_V1_OBJECT_PROBE] anchor_restore_partial '
+        'reason=$reason',
       );
       await _safeSendCommandV1('停止', 0);
       return false;
     }
-    _envLogV1('[ENV_V1_OBJECT_PROBE] restore_after_cliff done index=$index');
     await _safeSendCommandV1('停止', 0);
+    await Future<void>.delayed(_settleDelay);
+    _envLogV1('[ENV_V1_OBJECT_PROBE] restored_to_anchor index=$index');
     return true;
   }
 
@@ -2886,38 +3208,19 @@ class EnvironMonitorModule {
     required DetectedDesktopObject? snapshotObject,
     required _RealtimeObjectProbeAnalysisV1 realtimeAnalysis,
   }) {
-    if (snapshotObject != null &&
-        _isSpecificObjectSpeechCandidateV1(snapshotObject)) {
-      final snapshotPolicy = _objectPolicyForV1(snapshotObject);
-      _logObjectLabelPolicyV1(snapshotObject, snapshotPolicy);
-      return _ObjectProbeDecisionV1(
-        object: snapshotObject,
-        source: 'snapshot_specific',
-        speechMode: _ObjectSpeechModeV1.specific,
-        reason: 'snapshot_high_confidence_specific',
-        realtimeHits: realtimeAnalysis.bestHits,
-        policy: snapshotPolicy,
-      );
-    }
-
     if (snapshotObject != null) {
       final snapshotPolicy = _objectPolicyForV1(snapshotObject);
       _logObjectLabelPolicyV1(snapshotObject, snapshotPolicy);
-      if (_isObjectPolicyInteractiveV1(snapshotPolicy) &&
-          snapshotObject.confidence >= _objectSnapshotWeakScoreV1) {
-        if (_isObjectAreaTooLargeForSpecificSpeechV1(snapshotObject)) {
-          _envLogV1(
-            '[ENV_V1_OBJECT] office_label_area_too_large_generic_only '
-            'label=${snapshotObject.label} area=${_f(snapshotObject.areaRatio)}',
-          );
-        }
+      if (_isGenericVisualObjectPresenceV1(snapshotObject)) {
+        _logGenericVisualObjectCandidateV1(
+          '[ENV_V1_OBJECT_PROBE] snapshot_generic_visual_candidate',
+          snapshotObject,
+        );
         return _ObjectProbeDecisionV1(
           object: snapshotObject,
-          source: 'snapshot_generic',
-          speechMode: _ObjectSpeechModeV1.generic,
-          reason: _isObjectAreaTooLargeForSpecificSpeechV1(snapshotObject)
-              ? 'office_label_area_too_large_generic_only'
-              : 'snapshot_weak_confirm',
+          source: 'generic_visual_presence',
+          speechMode: _ObjectSpeechModeV1.genericVisualPresence,
+          reason: 'non_person_visual_presence',
           realtimeHits: realtimeAnalysis.bestHits,
           policy: snapshotPolicy,
         );
@@ -2930,58 +3233,34 @@ class EnvironMonitorModule {
       final realtimePolicy =
           realtimeAnalysis.bestPolicy ?? _objectPolicyForV1(realtimeCandidate);
       _logObjectLabelPolicyV1(realtimeCandidate, realtimePolicy);
-      if (_isRealtimeGenericCandidateV1(realtimeCandidate, realtimePolicy)) {
-        final snapshotPolicy =
-            snapshotObject == null ? null : _objectPolicyForV1(snapshotObject);
-        if (snapshotObject != null &&
-            snapshotPolicy != null &&
-            !_isObjectPolicyInteractiveV1(snapshotPolicy)) {
-          _logIgnoredObjectV1(snapshotObject, snapshotPolicy);
-          _envLogV1(
-            '[ENV_V1_OBJECT_PROBE] snapshot_ignored '
-            'label=${snapshotObject.label} '
-            'policy=${_objectPolicyNameV1(snapshotPolicy)} '
-            'keep_realtime_candidate=${realtimeCandidate.label}',
-          );
-        }
-        if (_isObjectAreaTooLargeForSpecificSpeechV1(realtimeCandidate)) {
-          _envLogV1(
-            '[ENV_V1_OBJECT] office_label_area_too_large_generic_only '
-            'label=${realtimeCandidate.label} '
-            'area=${_f(realtimeCandidate.areaRatio)}',
-          );
-        }
-        final reason = realtimeAnalysis.stableCandidate == null
-            ? 'office_interactable_single_hit_generic'
-            : 'office_interactable_realtime_generic';
+      if (_isRealtimeGenericCandidateV1(realtimeCandidate)) {
+        _logGenericVisualObjectCandidateV1(
+          '[ENV_V1_OBJECT] generic_visual_candidate',
+          realtimeCandidate,
+        );
         return _ObjectProbeDecisionV1(
           object: realtimeCandidate,
-          source: 'realtime_generic',
-          speechMode: _ObjectSpeechModeV1.generic,
-          reason: reason,
+          source: 'generic_visual_presence',
+          speechMode: _ObjectSpeechModeV1.genericVisualPresence,
+          reason: 'non_person_visual_presence',
           realtimeHits: realtimeAnalysis.bestHits,
           policy: realtimePolicy,
         );
-      }
-      if (!_isObjectPolicyInteractiveV1(realtimePolicy)) {
-        _logIgnoredObjectV1(realtimeCandidate, realtimePolicy);
       }
     }
 
     if (snapshotObject != null) {
       final snapshotPolicy = _objectPolicyForV1(snapshotObject);
-      if (!_isObjectPolicyInteractiveV1(snapshotPolicy)) {
-        _logIgnoredObjectV1(snapshotObject, snapshotPolicy);
-        return _ObjectProbeDecisionV1(
-          object: null,
-          source: _blockedObjectSourceForPolicyV1(snapshotPolicy),
-          speechMode: _ObjectSpeechModeV1.none,
-          reason: _objectDecisionReasonForPolicyV1(snapshotPolicy),
-          realtimeHits: realtimeAnalysis.bestHits,
-          rejectedObject: snapshotObject,
-          policy: snapshotPolicy,
-        );
-      }
+      _logIgnoredObjectV1(snapshotObject, snapshotPolicy);
+      return _ObjectProbeDecisionV1(
+        object: null,
+        source: 'no_object_found',
+        speechMode: _ObjectSpeechModeV1.none,
+        reason: 'no_generic_visual_presence',
+        realtimeHits: realtimeAnalysis.bestHits,
+        rejectedObject: snapshotObject,
+        policy: snapshotPolicy,
+      );
     }
 
     if (realtimeCandidate != null) {
@@ -2989,11 +3268,9 @@ class EnvironMonitorModule {
           realtimeAnalysis.bestPolicy ?? _objectPolicyForV1(realtimeCandidate);
       return _ObjectProbeDecisionV1(
         object: null,
-        source: 'realtime_low_only',
+        source: 'no_object_found',
         speechMode: _ObjectSpeechModeV1.none,
-        reason: _isObjectPolicyInteractiveV1(realtimePolicy)
-            ? 'not_stable_or_low_score'
-            : _objectDecisionReasonForPolicyV1(realtimePolicy),
+        reason: 'no_generic_visual_presence',
         realtimeHits: realtimeAnalysis.bestHits,
         rejectedObject: realtimeCandidate,
         policy: realtimePolicy,
@@ -3007,12 +3284,6 @@ class EnvironMonitorModule {
       reason: 'no_object',
       realtimeHits: realtimeAnalysis.bestHits,
     );
-  }
-
-  bool _isSpecificObjectSpeechCandidateV1(DetectedDesktopObject object) {
-    return _isObjectEligibleForSpecificSpeechV1(object) &&
-        object.confidence >= _objectSpecificSpeechScoreV1 &&
-        !_isObjectAreaTooLargeForSpecificSpeechV1(object);
   }
 
   EnvV1ObjectPolicy _objectPolicyForV1(DetectedDesktopObject object) {
@@ -3035,19 +3306,10 @@ class EnvironMonitorModule {
     return EnvV1ObjectPolicy.unknown;
   }
 
-  bool _isOfficeInteractableObjectV1(String label) {
-    final normalized = _normalizeObjectLabelV1(label);
-    return _officeInteractableObjectLabelsV1.contains(normalized) ||
-        _toyLikeObjectLabelsV1.contains(normalized);
-  }
-
   bool _isObjectEligibleForObjectLookV1(
     DetectedDesktopObject object,
-    EnvV1ObjectPolicy policy,
   ) {
-    return _isObjectPolicyInteractiveV1(policy) &&
-        _isOfficeInteractableObjectV1(object.label) &&
-        object.areaRatio >= _objectSmallAreaMinV1;
+    return _isGenericVisualObjectPresenceV1(object);
   }
 
   bool _isObjectPolicyInteractiveV1(EnvV1ObjectPolicy policy) {
@@ -3057,46 +3319,42 @@ class EnvironMonitorModule {
 
   bool _isRealtimeGenericCandidateV1(
     DetectedDesktopObject object,
-    EnvV1ObjectPolicy policy,
   ) {
-    return _isObjectPolicyInteractiveV1(policy) &&
-        object.confidence >= _objectRealtimeSingleHitGenericScoreV1 &&
-        object.areaRatio >= _objectSmallAreaMinV1;
-  }
-
-  bool _isObjectAreaTooLargeForSpecificSpeechV1(
-    DetectedDesktopObject object,
-  ) {
-    return object.areaRatio > _objectSmallAreaMaxV1 ||
-        object.areaRatio > _objectLargeAreaThresholdV1;
-  }
-
-  bool _isObjectEligibleForGenericSpeechV1(DetectedDesktopObject object) {
-    return _isObjectEligibleForObjectLookV1(
+    return _isGenericVisualObjectPresenceV1(
       object,
-      _objectPolicyForV1(object),
+      minConfidence: _objectGenericVisualPresenceScoreV1,
     );
   }
 
-  bool _isObjectEligibleForSpecificSpeechV1(DetectedDesktopObject object) {
-    return _isObjectEligibleForGenericSpeechV1(object) &&
-        _objectSpecificSpeechLabelsV1
-            .contains(_normalizeObjectLabelV1(object.label));
+  bool _isGenericVisualObjectPresenceV1(
+    DetectedDesktopObject object, {
+    double minConfidence = _objectGenericVisualPresenceScoreV1,
+  }) {
+    return !_isPersonObjectLabelV1(object.label) &&
+        object.confidence >= minConfidence &&
+        object.width > 0 &&
+        object.height > 0 &&
+        object.areaRatio >= _objectGenericVisualPresenceMinAreaV1 &&
+        object.areaRatio <= _objectGenericVisualPresenceMaxAreaV1 &&
+        object.centerX >= 0.0 &&
+        object.centerX <= 1.0 &&
+        object.centerY >= 0.0 &&
+        object.centerY <= 1.0;
   }
 
   void _logObjectLabelPolicyV1(
     DetectedDesktopObject object,
     EnvV1ObjectPolicy policy,
   ) {
-    final action = _objectPolicyActionV1(policy);
-    final areaTooLarge = _isObjectPolicyInteractiveV1(policy) &&
-        _isObjectAreaTooLargeForSpecificSpeechV1(object);
+    final genericVisualPresence = _isGenericVisualObjectPresenceV1(object);
+    final action = genericVisualPresence
+        ? 'generic_visual_presence'
+        : _objectPolicyActionV1(policy);
     _envLogV1(
       '[ENV_V1_OBJECT] label_policy label=${object.label} '
       'policy=${_objectPolicyNameV1(policy)} '
       'action=$action '
-      'score=${_f(object.confidence)} area=${_f(object.areaRatio)}'
-      '${areaTooLarge ? ' areaTooLarge=true' : ''}',
+      'score=${_f(object.confidence)} area=${_f(object.areaRatio)}',
     );
   }
 
@@ -3110,6 +3368,16 @@ class EnvironMonitorModule {
       'policy=${_objectPolicyNameV1(policy)} '
       'score=${_f(object.confidence)} area=${_f(object.areaRatio)} '
       'reason=$reason',
+    );
+  }
+
+  void _logGenericVisualObjectCandidateV1(
+    String prefix,
+    DetectedDesktopObject object,
+  ) {
+    _envLogV1(
+      '$prefix label=${object.label} score=${_f(object.confidence)} '
+      'area=${_f(object.areaRatio)} reason=non_person_visual_presence',
     );
   }
 
@@ -3161,21 +3429,6 @@ class EnvironMonitorModule {
     }
   }
 
-  String _blockedObjectSourceForPolicyV1(EnvV1ObjectPolicy policy) {
-    switch (policy) {
-      case EnvV1ObjectPolicy.largeBackground:
-        return 'log_only';
-      case EnvV1ObjectPolicy.officeImpossible:
-      case EnvV1ObjectPolicy.officeAnimal:
-        return 'hard_block';
-      case EnvV1ObjectPolicy.unknown:
-        return 'ignored';
-      case EnvV1ObjectPolicy.officeInteractable:
-      case EnvV1ObjectPolicy.toyLike:
-        return 'interactive';
-    }
-  }
-
   DetectedDesktopObject? _firstNonPersonObjectV1(
     ObjectDetectionSnapshotResult result,
   ) {
@@ -3183,8 +3436,7 @@ class EnvironMonitorModule {
     for (final object in result.objects) {
       if (!_isPersonObjectLabelV1(object.label)) {
         firstNonPerson ??= object;
-        final policy = _objectPolicyForV1(object);
-        if (_isObjectEligibleForObjectLookV1(object, policy)) {
+        if (_isObjectEligibleForObjectLookV1(object)) {
           return object;
         }
       }
@@ -3196,7 +3448,6 @@ class EnvironMonitorModule {
     _ObjectProbeDecisionV1 decision, {
     required int probeIndex,
     required int sessionGenericSpeechCount,
-    required int sessionSpecificSpeechCount,
     required int probeSpeechCount,
   }) async {
     if (!_enableWeakObjectSpeechV1) {
@@ -3229,7 +3480,6 @@ class EnvironMonitorModule {
     }
 
     final label = object.label.trim();
-    final normalizedLabel = _normalizeObjectLabelV1(label);
     final score = object.confidence;
     if (_isPersonObjectLabelV1(label)) {
       _envLogV1(
@@ -3238,69 +3488,48 @@ class EnvironMonitorModule {
       );
       return _ObjectSpeechModeV1.none;
     }
-    final policy = _objectPolicyForV1(object);
-    if (!_isObjectPolicyInteractiveV1(policy)) {
-      final reason = _objectDecisionReasonForPolicyV1(policy);
-      _envLogV1(
-        '[ENV_V1_OBJECT] object_speech skipped '
-        'reason=$reason label=$label '
-        'policy=${_objectPolicyNameV1(policy)} area=${_f(object.areaRatio)}',
-      );
-      return _ObjectSpeechModeV1.none;
-    }
 
-    if (decision.speechMode == _ObjectSpeechModeV1.specific &&
-        _objectSpecificSpeechLabelsV1.contains(normalizedLabel) &&
-        score >= _objectSpecificSpeechScoreV1 &&
-        !_isObjectAreaTooLargeForSpecificSpeechV1(object)) {
-      if (sessionSpecificSpeechCount >= _objectSpecificSpeechMaxPerSessionV1) {
+    if (decision.speechMode == _ObjectSpeechModeV1.genericVisualPresence) {
+      if (sessionGenericSpeechCount >= _objectGenericSpeechMaxPerSessionV1) {
         _envLogV1(
           '[ENV_V1_OBJECT] object_speech skipped '
-          'reason=specific_speech_limit_reached '
-          'count=$sessionSpecificSpeechCount',
+          'reason=generic_speech_already_spoken probe=$probeIndex',
         );
         return _ObjectSpeechModeV1.none;
       }
-      final spokenLabel = _objectSpeechLabelTextV1(label);
-      final measure = normalizedLabel == 'book' ? '本' : '个';
-      final text = '我好像看到一$measure$spokenLabel。';
+      const text = '我好像看到一个小东西。';
       _envLogV1(
-        '[ENV_V1_OBJECT] object_speech mode=specific '
-        'label=$label score=${_f(score)} text=$text',
+        '[ENV_V1_OBJECT] object_speech mode=generic_visual_presence '
+        'reason=${decision.reason} label=$label score=${_f(score)} text=$text',
       );
       await speakWithInterruptProtection(text);
-      return _ObjectSpeechModeV1.specific;
+      _envLogV1(
+        '[ENV_V1_OBJECT] object_interact silent_observe '
+        'ms=$_objectWeakFallbackSilentObserveMsV1 '
+        'reason=generic_visual_presence',
+      );
+      await Future<void>.delayed(
+        const Duration(milliseconds: _objectWeakFallbackSilentObserveMsV1),
+      );
+      return _ObjectSpeechModeV1.genericVisualPresence;
     }
 
-    if (decision.speechMode != _ObjectSpeechModeV1.generic) {
-      _envLogV1(
-        '[ENV_V1_OBJECT] object_speech skipped '
-        'reason=${decision.reason} source=${decision.source} probe=$probeIndex',
-      );
-      return _ObjectSpeechModeV1.none;
-    }
-    if (sessionGenericSpeechCount >= _objectGenericSpeechMaxPerSessionV1) {
-      _envLogV1(
-        '[ENV_V1_OBJECT] object_speech skipped '
-        'reason=generic_speech_already_spoken probe=$probeIndex',
-      );
-      return _ObjectSpeechModeV1.none;
-    }
-
-    const text = '嗯？那边好像有东西，我看看。';
     _envLogV1(
-      '[ENV_V1_OBJECT] object_speech mode=generic '
-      'reason=${decision.reason} label=$label score=${_f(score)} text=$text',
+      '[ENV_V1_OBJECT] object_speech skipped '
+      'reason=${decision.reason} source=${decision.source} probe=$probeIndex',
     );
-    await speakWithInterruptProtection(text);
-    return _ObjectSpeechModeV1.generic;
+    return _ObjectSpeechModeV1.none;
   }
 
   bool _shouldSilentObserveObjectDecisionV1(
     _ObjectProbeDecisionV1 decision,
   ) {
-    return decision.speechMode == _ObjectSpeechModeV1.generic &&
+    return _isGenericObjectSpeechModeV1(decision.speechMode) &&
         _objectGenericSpeechCountV1 >= _objectGenericSpeechMaxPerSessionV1;
+  }
+
+  bool _isGenericObjectSpeechModeV1(_ObjectSpeechModeV1 mode) {
+    return mode == _ObjectSpeechModeV1.genericVisualPresence;
   }
 
   String _normalizeObjectLabelV1(String label) {
@@ -3312,11 +3541,6 @@ class EnvironMonitorModule {
     return normalized == 'person' ||
         normalized == 'people' ||
         normalized == '人';
-  }
-
-  String _objectSpeechLabelTextV1(String label) {
-    final normalized = _normalizeObjectLabelV1(label);
-    return _objectSpeechLabelZhV1[normalized] ?? label.trim();
   }
 
   Future<bool> _returnToOwnerAfterObjectLookV1(
@@ -3476,6 +3700,13 @@ class EnvironMonitorModule {
         phase: 'object_return_full_circle_scan',
       );
       if (!moved) {
+        if (_consumeTurnSensorIncidentV1(
+          'object_return_full_circle_scan',
+          logPrefix: '[ENV_V1_OBJECT_RETURN]',
+        )) {
+          await _safeSendCommandV1('停止', 0);
+          continue;
+        }
         _envLogV1(
           '[ENV_V1_OBJECT_RETURN_SCAN] turn_failed round=$round',
         );
@@ -3907,6 +4138,13 @@ class EnvironMonitorModule {
         phase: 'object_return_candidate_local_search',
       );
       if (!moved) {
+        if (_consumeTurnSensorIncidentV1(
+          'object_return_candidate_local_search',
+          logPrefix: '[ENV_V1_OBJECT_RETURN]',
+        )) {
+          await _safeSendCommandV1('停止', 0);
+          continue;
+        }
         _envLogV1(
           '[ENV_V1_OBJECT_RETURN_LOCAL] failed reason=turn_failed',
         );
@@ -4111,6 +4349,13 @@ class EnvironMonitorModule {
       phase: 'object_return_research_local',
     );
     if (!moved) {
+      if (_consumeTurnSensorIncidentV1(
+        'object_return_research_local',
+        logPrefix: '[ENV_V1_OBJECT_RETURN]',
+      )) {
+        await _safeSendCommandV1('停止', 0);
+        return true;
+      }
       _envLogV1('[ENV_V1_OBJECT_RESEARCH] failed reason=local_turn_failed');
       _markObjectReturnMovementSafetyStopReasonV1();
       return false;
@@ -4160,6 +4405,13 @@ class EnvironMonitorModule {
         phase: 'object_return_research_wide',
       );
       if (!moved) {
+        if (_consumeTurnSensorIncidentV1(
+          'object_return_research_wide',
+          logPrefix: '[ENV_V1_OBJECT_RETURN]',
+        )) {
+          await _safeSendCommandV1('停止', 0);
+          continue;
+        }
         _envLogV1('[ENV_V1_OBJECT_RESEARCH] failed reason=wide_turn_failed');
         _markObjectReturnMovementSafetyStopReasonV1();
         return lastResult;
@@ -4714,8 +4966,12 @@ class EnvironMonitorModule {
             return;
           }
           final policy = _objectPolicyForV1(object);
-          if (_isObjectEligibleForObjectLookV1(object, policy)) {
+          if (_isObjectEligibleForObjectLookV1(object)) {
             _cacheRealtimeObjectV1(object);
+            _logGenericVisualObjectCandidateV1(
+              '[ENV_V1_OBJECT] generic_visual_candidate',
+              object,
+            );
           } else {
             _recentIgnoredRealtimeObject = object;
             _logObjectLabelPolicyV1(object, policy);
@@ -4812,14 +5068,14 @@ class EnvironMonitorModule {
       return analysis;
     }
     final bestLowPolicy = _objectPolicyForV1(bestLow);
-    if (_isRealtimeGenericCandidateV1(bestLow, bestLowPolicy)) {
+    if (_isRealtimeGenericCandidateV1(bestLow)) {
       _envLogV1(
         '[ENV_V1_OBJECT_PROBE] realtime_candidate '
         'label=${bestLow.label} score=${_f(bestLow.confidence)} '
         'area=${_f(bestLow.areaRatio)} '
         'policy=${_objectPolicyNameV1(bestLowPolicy)} '
         'speechEligible=true '
-        'reason=office_interactable_single_hit_generic',
+        'reason=non_person_visual_presence',
       );
       return analysis;
     }
@@ -5205,6 +5461,28 @@ class EnvironMonitorModule {
     _frontCliffInterruptsByPhaseV1.remove(phase);
   }
 
+  bool _consumeTurnSensorIncidentV1(
+    String phase, {
+    required String logPrefix,
+  }) {
+    if (_lastTurnSensorIncidentPhaseV1 != phase ||
+        !_isNonFatalSensorIncidentV1(_lastTurnSensorIncidentV1)) {
+      return false;
+    }
+    final incident = _lastTurnSensorIncidentV1;
+    _lastTurnSensorIncidentV1 = _ChassisSensorIncidentV1.none;
+    _lastTurnSensorIncidentPhaseV1 = null;
+    _envLogV1(
+      '$logPrefix motion_interrupted '
+      'code=${_sensorIncidentCodeV1(incident)} '
+      'action=skip_step_keep_scanning',
+    );
+    _envLogV1(
+      '[ENV_V1_OBJECT_RETURN] keep_monitoring_after_interrupt=true',
+    );
+    return true;
+  }
+
   bool _consumeFrontCliffTurnRecoveryV1(String phase) {
     if (_lastFrontCliffRecoveredTurnPhaseV1 != phase) {
       return false;
@@ -5226,11 +5504,16 @@ class EnvironMonitorModule {
     }
 
     MotionInterruptedEvent? interrupted;
+    _lastTurnSensorIncidentV1 = _ChassisSensorIncidentV1.none;
+    _lastTurnSensorIncidentPhaseV1 = null;
     final sub = service.responseStream.listen((event) {
-      if (event is MotionInterruptedEvent &&
-          event.command == commandCode &&
-          _isCliffObstacleTypeV1(event.obstacleType)) {
-        interrupted ??= event;
+      if (event is MotionInterruptedEvent && event.command == commandCode) {
+        final incident = _sensorIncidentFromObstacleTypeV1(event.obstacleType);
+        _lastTurnSensorIncidentV1 = incident;
+        _lastTurnSensorIncidentPhaseV1 = phase;
+        if (_isCliffObstacleTypeV1(event.obstacleType)) {
+          interrupted ??= event;
+        }
       }
     });
 
@@ -5242,6 +5525,19 @@ class EnvironMonitorModule {
 
     final event = interrupted;
     if (event == null) {
+      if (_lastTurnSensorIncidentPhaseV1 == phase &&
+          _isNonFatalSensorIncidentV1(_lastTurnSensorIncidentV1)) {
+        if (phase.startsWith('object_probe') ||
+            phase.startsWith('object_return')) {
+          return false;
+        }
+        _envLogV1(
+          '[ENV_V1_CHASSIS] turn_interrupted_nonfatal '
+          'phase=$phase obstacle=${_sensorIncidentNameV1(_lastTurnSensorIncidentV1)} '
+          'code=${_sensorIncidentCodeV1(_lastTurnSensorIncidentV1)} '
+          'action=keep_monitoring',
+        );
+      }
       _clearFrontCliffInterruptsV1(phase);
       return true;
     }
@@ -5263,6 +5559,11 @@ class EnvironMonitorModule {
       obstacleType: event.obstacleType,
     );
     if (!recovered) {
+      _envLogV1(
+        '[ENV_V1_OBJECT_RETURN] motion_interrupted '
+        'code=${_sensorIncidentCodeV1(_lastTurnSensorIncidentV1)} '
+        'action=motion_paused_keep_monitoring',
+      );
       return false;
     }
 
@@ -5424,9 +5725,10 @@ class EnvironMonitorModule {
     _objectLookAroundRunningV1 = false;
     _objectReturnSafeStopWaitingV1 = false;
     _objectGenericSpeechCountV1 = 0;
-    _objectSpecificSpeechCountV1 = 0;
     _objectReturnPendingSafeStopReasonV1 = null;
     _lastFrontCliffRecoveredTurnPhaseV1 = null;
+    _lastTurnSensorIncidentV1 = _ChassisSensorIncidentV1.none;
+    _lastTurnSensorIncidentPhaseV1 = null;
     _frontCliffInterruptsByPhaseV1.clear();
     _envV1MotionCommandInFlight = false;
     _envV1EdgeCautiousMode = false;
@@ -5526,8 +5828,7 @@ class _ObjectProbePlanV1 {
 
 enum _ObjectSpeechModeV1 {
   none,
-  generic,
-  specific,
+  genericVisualPresence,
 }
 
 class _RealtimeObjectSampleV1 {
@@ -5581,21 +5882,21 @@ class _ObjectProbeRunResultV1 {
     required this.restoredToAnchor,
     required this.foundObject,
     required this.shouldContinue,
+    this.finishedGracefully = false,
     this.bestObject,
     this.bestSource,
     this.usedMicroApproach = false,
     this.genericSpeechCountDelta = 0,
-    this.specificSpeechCountDelta = 0,
   });
 
   final bool restoredToAnchor;
   final bool foundObject;
   final bool shouldContinue;
+  final bool finishedGracefully;
   final DetectedDesktopObject? bestObject;
   final String? bestSource;
   final bool usedMicroApproach;
   final int genericSpeechCountDelta;
-  final int specificSpeechCountDelta;
 }
 
 class _ObjectMicroConfirmResultV1 {
@@ -5616,6 +5917,7 @@ class _LinearMotionGuardResultV1 {
     this.cliffDetected = false,
     this.recoverySucceeded = false,
     this.safeStopRequired = false,
+    this.incident = _ChassisSensorIncidentV1.none,
     this.error = '',
   });
 
@@ -5623,5 +5925,6 @@ class _LinearMotionGuardResultV1 {
   final bool cliffDetected;
   final bool recoverySucceeded;
   final bool safeStopRequired;
+  final _ChassisSensorIncidentV1 incident;
   final String error;
 }
