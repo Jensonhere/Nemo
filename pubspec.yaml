@@ -1,0 +1,124 @@
+name: voicegpt
+description: A new Flutter project.
+
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=2.19.2 <3.0.0"
+
+dependencies:
+  avatar_glow: ^2.0.2
+  cupertino_icons: ^1.0.2
+  flutter:
+    sdk: flutter
+  tts_plugin:
+    path: plugins/tts_plugin
+  http: ^0.13.5
+  lottie: ^2.2.0
+  provider: ^6.0.5
+  speech_to_text: ^6.1.1
+  flutter_tts: ^3.8.5
+  vosk_flutter: ^0.3.48
+  flutter_blue_plus: ^1.31.3
+  string_similarity: ^2.1.1
+  camera: ^0.10.5+9
+  tflite_flutter: ^0.10.4
+  image: ^4.0.17
+  permission_handler: ^10.4.5
+  wakelock_plus: ^1.1.4
+  just_audio: ^0.9.37
+  audioplayers: ^1.1.1
+  shared_preferences: ^2.2.2
+  sqflite: ^2.3.2
+  sqflite_common_ffi: 2.3.0
+  geolocator: ^11.1.0
+  sherpa_onnx:
+    path: packages/sherpa_onnx
+  mic_stream:
+    path: packages/mic_stream
+  path_provider: ^2.1.3
+  path: ^1.8.3
+  crypto: ^3.0.3
+
+
+dev_dependencies:
+  flutter_lints: ^2.0.0
+  flutter_test:
+    sdk: flutter
+flutter:
+  generate: true
+  uses-material-design: true
+  assets:
+    - assets/animation/
+    - assets/wake_up/
+    - assets/sherpa_kws/
+    - assets/sherpa_speaker/
+    - assets/cn/
+    - assets/face/
+    - assets/emotion/
+    - assets/emotion/face1/
+    - assets/emotion/face2/
+      #这些是为了让表情稳定读取。这已经是穷举出的最有效办法了（哭）。
+    - assets/emotion/face2/KISS/01/
+    - assets/emotion/face2/KISS/02/
+    - assets/emotion/face2/倾听/01/
+    - assets/emotion/face2/倾听/02/
+    - assets/emotion/face2/可爱/01/
+    - assets/emotion/face2/可爱/02/
+    - assets/emotion/face2/坚定/01/
+    - assets/emotion/face2/坚定/02/
+    - assets/emotion/face2/失落/01/
+    - assets/emotion/face2/失落/02/
+    - assets/emotion/face2/委屈/01/
+    - assets/emotion/face2/委屈/02/
+    - assets/emotion/face2/孤独/01/
+    - assets/emotion/face2/孤独/02/
+    - assets/emotion/face2/寻找/01/
+    - assets/emotion/face2/寻找/02/
+    - assets/emotion/face2/开心/01/
+    - assets/emotion/face2/开心/02/
+    - assets/emotion/face2/思考/01/
+    - assets/emotion/face2/思考/02/
+    - assets/emotion/face2/惊喜/01/
+    - assets/emotion/face2/惊喜/02/
+    - assets/emotion/face2/惊讶/01/
+    - assets/emotion/face2/惊讶/02/
+    - assets/emotion/face2/感激/01/
+    - assets/emotion/face2/感激/02/
+    - assets/emotion/face2/愤怒/01/
+    - assets/emotion/face2/愤怒/02/
+    - assets/emotion/face2/晕/01/
+    - assets/emotion/face2/晕/02/
+    - assets/emotion/face2/热切/01/
+    - assets/emotion/face2/热切/02/
+    - assets/emotion/face2/疑惑/01/
+    - assets/emotion/face2/疑惑/02/
+    - assets/emotion/face2/眩晕/01/
+    - assets/emotion/face2/眩晕/02/
+    - assets/emotion/face2/观察/01/
+    - assets/emotion/face2/观察/02/
+    - assets/emotion/face2/说话/01/
+    - assets/emotion/face2/说话/02/
+    - assets/cn/vosk-model-small-cn-0.22/
+    - assets/cn/vosk-model-small-cn-0.22/am/
+    - assets/cn/vosk-model-small-cn-0.22/conf/
+    - assets/cn/vosk-model-small-cn-0.22/graph/
+    - assets/cn/vosk-model-small-cn-0.22/ivector/
+    - assets/models/
+    - assets/images/
+    - assets/music/
+    - assets/animation/look.json
+    - assets/animation/speak1.json
+
+    # fonts:
+    #   - family: Schyler
+    #     fonts:
+    #       - asset: fonts/Schyler-Regular.ttf
+    #       - asset: fonts/Schyler-Italic.ttf
+    #         style: italic
+    #   - family: Trajan Pro
+    #     fonts:
+    #       - asset: fonts/TrajanPro.ttf
+    #       - asset: fonts/TrajanPro_Bold.ttf
+    #         weight: 700
