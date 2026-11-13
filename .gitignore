@@ -37,3 +37,10 @@ assets/models/
 # Local research notes / generated docs
 docs/
 research_experiment_discussion_2026_06_03/
+
+# Local generated files and credentials
+.flutter-plugins
+.flutter-plugins-dependencies
+exports/
+tools/__pycache__/
+/tools/tts_guotaihaitong_open_account.txt

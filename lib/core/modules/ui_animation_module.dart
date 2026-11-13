@@ -39,6 +39,7 @@ enum AnimationType {
   sadEmotion, // 失落 02.json - 负能量情绪
   angryEmotion, // 愤怒 02.json - 愤怒情绪
   surpriseEmotion, // 惊讶 02.json - 惊讶情绪
+  firmEmotion, // 坚定 02.json - 谨慎但坚定
 
   // 功能模块
   commandEager, // 热切 02.json - 动作指令
@@ -80,6 +81,7 @@ class UIAnimationModule extends ChangeNotifier {
     AnimationType.sadEmotion: 'assets/emotion/face2/失落/02/失落 02.json',
     AnimationType.angryEmotion: 'assets/emotion/face2/愤怒/02/愤怒 02.json',
     AnimationType.surpriseEmotion: 'assets/emotion/face2/惊讶/02/惊讶 02.json',
+    AnimationType.firmEmotion: 'assets/emotion/face2/坚定/02/坚定 02.json',
     AnimationType.commandEager: 'assets/emotion/face2/热切/02/热切 02.json',
     AnimationType.observeStage1: 'assets/emotion/face2/观察/01/观察 01.json',
     AnimationType.observeStage2: 'assets/emotion/face2/观察/02/观察 02.json',
@@ -207,6 +209,11 @@ class UIAnimationModule extends ChangeNotifier {
       case '惊讶':
       case 'surprise':
         animationType = AnimationType.surpriseEmotion;
+        break;
+      case '坚定':
+      case '谨慎':
+      case 'firm':
+        animationType = AnimationType.firmEmotion;
         break;
       case '中性':
       case '未知':

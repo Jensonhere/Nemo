@@ -41,6 +41,11 @@ class ConversationController extends ChangeNotifier {
   factory ConversationController() => _instance;
   ConversationController._internal();
 
+  static const String _stockVaDemoFirstReply =
+      '听起来你对这只股票的下跌有些担心。先别急着做决定，短期下跌不一定代表基本面恶化，也可能和大盘情绪、行业消息、资金流出或者短线回调有关。你可以先看一下它下跌的原因，是不是有业绩、政策或者公司公告方面的变化。如果只是市场波动，没必要因为一两天的跌幅就情绪化操作；但如果基本面出现明显问题，也要及时控制风险。';
+  static const String _stockVaDemoSecondReply =
+      '听你的语气，好像是在观察它有没有更合适的入场机会。下跌确实可能带来更低的买入价格，但不能只因为跌了就马上抄底。建议先判断它为什么跌：如果是大盘整体回调，可以继续观察支撑位和成交量；如果是公司自身利空，就要更谨慎。你可以把它放进观察名单，等走势稳定、风险释放后再考虑分批介入。';
+
   // 语音通知器引用（用于启动语音识别）
   dynamic _speechNotifier;
 
@@ -92,6 +97,7 @@ class ConversationController extends ChangeNotifier {
 
   // 对话历史和上下文
   String _lastUserInput = "";
+  int _stockVaDemoQuestionCount = 0;
 
   /// 最近若干轮「用户/小航」文本，供 C 层注入（最多约 4 轮）
   final List<String> _dialogTurnLines = [];
@@ -386,6 +392,7 @@ class ConversationController extends ChangeNotifier {
     print("🎤 进入连续对话模式");
     _isInConversationMode = true;
     _resetContinuousInputGuard();
+    _stockVaDemoQuestionCount = 0;
 
     // 设置UI模式
     _uiModule.setProgramMode(ProgramMode.conversation);
@@ -523,6 +530,10 @@ class ConversationController extends ChangeNotifier {
       }
 
       _pushDialogLine('用户：$userInput');
+
+      if (await _tryHandleStockVaDemoReply(userInput)) {
+        return;
+      }
 
       if (_forceEnglishTeachingMode ||
           InputLanguageGate.isEnglishTeachingScene(userInput)) {
@@ -1960,6 +1971,38 @@ class ConversationController extends ChangeNotifier {
     }
     if (RegExp(r'^[\s\.,;:!?，。！？、…]+$').hasMatch(t)) return true;
     return false;
+  }
+
+  Future<bool> _tryHandleStockVaDemoReply(String userInput) async {
+    if (!_isStockVaDemoQuestion(userInput)) return false;
+    _stockVaDemoQuestionCount += 1;
+    final reply = _stockVaDemoQuestionCount == 1
+        ? _stockVaDemoFirstReply
+        : _stockVaDemoSecondReply;
+    ConversationFlowTracer.step(
+      'stock_va_demo_fixed_reply',
+      'count=$_stockVaDemoQuestionCount',
+    );
+    print('🎬 [VA Demo] 股票问题第 $_stockVaDemoQuestionCount 次，按录制模板回复');
+    final isFirstStockVaDemoReply = _stockVaDemoQuestionCount == 1;
+    await _speakText(
+      reply,
+      ttsExpression: TtsAlignedExpression.emotionSpeaking,
+      emotionUiLabel: isFirstStockVaDemoReply ? '悲伤' : '坚定',
+      recordAssistantForTurns: reply,
+    );
+    _textQAModule.recordRouterDirectTurn(userInput, reply);
+    return true;
+  }
+
+  bool _isStockVaDemoQuestion(String raw) {
+    final t = raw.replaceAll(RegExp(r'\s+'), '');
+    if (t.isEmpty) return false;
+    return t.contains('关注') &&
+        t.contains('股票') &&
+        t.contains('今天') &&
+        t.contains('跌') &&
+        (t.contains('怎么看') || t.contains('怎么想') || t.contains('看法'));
   }
 
   ConversationContextPack _buildContextPack({

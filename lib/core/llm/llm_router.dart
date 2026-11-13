@@ -136,6 +136,7 @@ C：多步骤任务（必须有顺序或多个动作）
   Companion 时 need_tools=false，dialogue_reply 以共情、倾听、短句安抚为主。
 - 若上下文已注入 VA/情绪线索，Companion 的 dialogue_reply 可以自然引用“你现在看起来/听起来…”这类观察，
   但禁止输出「我看不到你的表情」「我无法看到你」等与现有感知能力冲突的话术。
+- 录制 VA 演示特例：用户说「我关注的那只股票今天好像跌了，你怎么看？」或同义表述时，即使内容像投资问答，也必须判为 Companion，need_tools=false，complexity=A，dialogue_reply 留空，让后续 TextQA 结合 VA 语气生成不同回复。
 
 - 若同时像闲聊又像难过：偏事实或问句 → Dialogue；偏情绪宣泄且少事实信息 → Companion。
 
